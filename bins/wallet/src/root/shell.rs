@@ -1,6 +1,7 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::hex;
 use broadcaster_monitor::{EventRx, EventTx, Shared};
 use gpui::ObjectFit;
 use gpui::{
@@ -10,9 +11,10 @@ use gpui::{
     bounce, div, ease_in_out, img, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Icon, IconName, Root, Sizable, TitleBar,
+    Disableable, Icon, IconName, Root, Sizable, TitleBar,
     badge::Badge,
-    button::{Button, ButtonVariants},
+    button::ButtonVariants,
+    progress::Progress as UiProgress,
     resizable::{resizable_panel, v_resizable},
     scroll::ScrollableElement,
     tab::{Tab, TabBar},
@@ -24,6 +26,10 @@ use ui::controls::{app_button, app_button_base};
 use ui::icons;
 use ui::logs::LogStore;
 use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
+use wallet_ops::{
+    PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletNetworkMode, WalletSyncTip,
+};
 
 use crate::assets::{
     HEMATITE_HERO_PATH, HERO_WORDMARK_PATH, LOGO_ICON_PATH, RailgunSocialIcon, WARM_GLOW_PATH,
@@ -31,8 +37,9 @@ use crate::assets::{
 
 use super::actions::register_wallet_shortcut_root;
 use super::chain_load::{
-    PresenceStatus, SyncStatusContext, WalletStatusCounts, ppoi_presence_status, ready_status_bar,
-    sync_presence_status, sync_status_bar,
+    BalanceSyncIssue, PresenceStatus, SyncStatusContext, SyncStatusLabels, WalletStatusCounts,
+    balance_sync_issue, balances_presence_status, ppoi_presence_status, ready_status_bar,
+    sync_status_bar, sync_status_labels,
 };
 use super::private_assets::{
     format_private_asset_rows_from_snapshot, should_show_pending_poi_amount,
@@ -43,8 +50,9 @@ use super::utxo::{
 use super::{
     Activity, ChainUtxoState, HERO_CARD_MAX_WIDTH, HERO_MEDIUM_BREAKPOINT, HERO_STAGE_MAX_WIDTH,
     HERO_WIDE_BREAKPOINT, LOGS_DRAWER_HEIGHT, LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT,
-    SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot, app_status_tag,
-    chain_load_overrides, count_label, rgb_with_alpha,
+    SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState,
+    WalletRoot, WalletStartupRoot, app_status_tag, chain_load_overrides, count_label,
+    rgb_with_alpha,
 };
 
 pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
@@ -656,42 +664,81 @@ impl WalletRoot {
         }
     }
 
+    fn ppoi_status_for_state(
+        &self,
+        state: &ChainUtxoState,
+        counts: WalletStatusCounts,
+    ) -> PresenceStatus {
+        ppoi_presence_status(
+            state.poi_refreshing(),
+            state.poi_refresh_session().is_some(),
+            self.poi_cache_service.is_some(),
+            self.selected_chain_poi_artifact_progress(),
+            counts,
+        )
+    }
+
+    fn balances_status_for_state(&self, state: &ChainUtxoState) -> PresenceStatus {
+        balances_presence_status(
+            state.is_syncing(),
+            matches!(state, ChainUtxoState::Ready { .. }),
+            state.sync_tip(),
+            self.selected_chain,
+            now_epoch_secs(),
+        )
+    }
+
+    fn retry_selected_poi_artifact_cache_refresh(&mut self, cx: &mut Context<'_, Self>) {
+        let chain_id = self.selected_chain;
+        if !self.poi_artifact_cache_retrying_chains.insert(chain_id) {
+            return;
+        }
+        cx.notify();
+
+        let Some(service) = self.poi_cache_service.clone() else {
+            self.poi_artifact_cache_retrying_chains.remove(&chain_id);
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |root, cx| {
+            let started = service.retry_poi_artifact_cache_refresh(chain_id).await;
+            if !started {
+                tracing::debug!(
+                    chain_id,
+                    "skipping POI artifact cache retry without active cache service"
+                );
+                let _ = root.update(cx, |root, cx| {
+                    root.poi_artifact_cache_retrying_chains.remove(&chain_id);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn render_wallet_status_chips(
         &self,
         root: &Entity<Self>,
         state: &ChainUtxoState,
         counts: WalletStatusCounts,
     ) -> Vec<gpui::AnyElement> {
-        let syncing = state.is_syncing();
-        let ready = matches!(state, ChainUtxoState::Ready { .. });
-        let ppoi_status = ppoi_presence_status(
-            state.poi_refreshing(),
-            state.poi_refresh_session().is_some(),
-        );
-        let balances_status = sync_presence_status(syncing, ready);
+        let ppoi_status = self.ppoi_status_for_state(state, counts);
+        let balances_status = self.balances_status_for_state(state);
         let mut chips = Vec::new();
 
         if counts.ppoi_attention_count() > 0 {
             chips.push(self.render_ppoi_status_indicator(root, ppoi_status, counts));
         } else {
             chips.push(
-                status_presence_chip(
-                    "wallet-status-ppoi",
-                    "PPOI",
-                    ppoi_status,
-                    ppoi_status_tooltip(ppoi_status),
-                )
-                .into_any_element(),
+                render_ppoi_status_hover_target(root, "wallet-status-ppoi")
+                    .child(status_presence_text("PPOI", ppoi_status))
+                    .into_any_element(),
             );
         }
         chips.push(
-            status_presence_chip(
-                "wallet-status-balances",
-                "Balances",
-                balances_status,
-                balances_status_tooltip(balances_status),
-            )
-            .into_any_element(),
+            render_balances_status_hover_target(root, "wallet-status-balances")
+                .child(status_presence_text("Balances", balances_status))
+                .into_any_element(),
         );
         chips
     }
@@ -702,12 +749,7 @@ impl WalletRoot {
         status: PresenceStatus,
         counts: WalletStatusCounts,
     ) -> gpui::AnyElement {
-        let details_root = root.clone();
-        Button::new("wallet-status-ppoi-attention")
-            .text()
-            .tab_stop(false)
-            .cursor_pointer()
-            .tooltip(ppoi_attention_tooltip(status, counts))
+        render_ppoi_status_hover_target(root, "wallet-status-ppoi-hover")
             .child(
                 Badge::new()
                     .count(counts.ppoi_attention_count())
@@ -718,11 +760,6 @@ impl WalletRoot {
                             .into_any_element(),
                     ),
             )
-            .on_click(move |_event, window, cx| {
-                details_root.update(cx, |root, cx| {
-                    root.open_private_pending_status_dialog(window, cx);
-                });
-            })
             .into_any_element()
     }
 
@@ -886,16 +923,925 @@ fn status_presence_text(label: &'static str, status: PresenceStatus) -> gpui::Di
         )
 }
 
-fn status_presence_chip(
+fn render_balances_status_hover_target(
+    root: &Entity<WalletRoot>,
     id: &'static str,
-    label: &'static str,
-    status: PresenceStatus,
-    tooltip: &'static str,
 ) -> gpui::Stateful<gpui::Div> {
+    let tooltip_root = root.clone();
+    div().id(id).hoverable_tooltip(move |_window, cx| {
+        let root = tooltip_root.clone();
+        cx.new(|cx| BalancesStatusHoverCard::new(root, cx)).into()
+    })
+}
+
+struct BalancesStatusHoverCard {
+    root: Entity<WalletRoot>,
+}
+
+impl BalancesStatusHoverCard {
+    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self { root }
+    }
+}
+
+impl Render for BalancesStatusHoverCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let now = now_epoch_secs();
+        let (status, labels, sync_tip, indexed_catch_up, issue, counts, network_mode) = {
+            let root = self.root.read(cx);
+            let chain_id = root.selected_chain;
+            let state = root.chain_states.get(&chain_id);
+            let counts = root
+                .wallet_status_counts(state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref));
+            let labels = state.and_then(|state| {
+                let context = match state {
+                    ChainUtxoState::Loading { .. } => SyncStatusContext::Loading,
+                    ChainUtxoState::Syncing { .. } => SyncStatusContext::Syncing,
+                    ChainUtxoState::Idle
+                    | ChainUtxoState::Ready { .. }
+                    | ChainUtxoState::Error { .. } => return None,
+                };
+                Some(sync_status_labels(context, state.progress()))
+            });
+            let status = state.map_or(PresenceStatus::Unknown, |state| {
+                root.balances_status_for_state(state)
+            });
+            let sync_tip = state.and_then(ChainUtxoState::sync_tip);
+            let indexed_catch_up = sync_tip.and_then(|tip| tip.indexed_catch_up);
+            let issue = state
+                .filter(|state| matches!(state, ChainUtxoState::Ready { .. }))
+                .and_then(|_| balance_sync_issue(sync_tip, chain_id, now));
+            (
+                status,
+                labels,
+                sync_tip,
+                indexed_catch_up,
+                issue,
+                counts,
+                root.http.network_mode(),
+            )
+        };
+        let color = presence_status_color(status);
+
+        div()
+            .w(px(360.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::SURFACE))
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .text_size(APP_TEXT_SIZE)
+            .text_color(rgb(theme::TEXT))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(status_presence_dot(status).flex_none())
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(color))
+                            .child(balances_hover_heading(status, labels.as_ref(), issue)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(balances_hover_detail(
+                        status,
+                        labels.as_ref(),
+                        issue,
+                        network_mode,
+                    )),
+            )
+            .when_some(labels.as_ref(), |this, labels| {
+                this.child(render_balance_sync_progress_section(labels))
+            })
+            .when_some(indexed_catch_up, |this, catch_up| {
+                this.child(render_balance_indexed_catch_up_note(catch_up))
+            })
+            .when_some(sync_tip, |this, sync_tip| {
+                this.child(render_balance_sync_tip_section(sync_tip, now))
+            })
+            .when_some(balance_pending_detail(counts), |this, detail| {
+                this.child(render_status_hover_note_base(
+                    "Balance updates pending",
+                    &detail,
+                    theme::WARNING,
+                    0.08,
+                ))
+            })
+    }
+}
+
+fn render_ppoi_status_hover_target(
+    root: &Entity<WalletRoot>,
+    id: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    let tooltip_root = root.clone();
+    div().id(id).hoverable_tooltip(move |_window, cx| {
+        let root = tooltip_root.clone();
+        cx.new(|cx| PpoiStatusHoverCard::new(root, cx)).into()
+    })
+}
+
+struct PpoiStatusHoverCard {
+    root: Entity<WalletRoot>,
+}
+
+impl PpoiStatusHoverCard {
+    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self { root }
+    }
+}
+
+impl Render for PpoiStatusHoverCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let (status, progress, refreshing, counts, retrying) = {
+            let root = self.root.read(cx);
+            let state = root.chain_states.get(&root.selected_chain);
+            let counts = root
+                .wallet_status_counts(state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref));
+            let status = state.map_or(PresenceStatus::Unknown, |state| {
+                root.ppoi_status_for_state(state, counts)
+            });
+            let refreshing = state.is_some_and(ChainUtxoState::poi_refreshing);
+            (
+                status,
+                root.selected_chain_poi_artifact_progress().cloned(),
+                refreshing,
+                counts,
+                root.poi_artifact_cache_retrying_chains
+                    .contains(&root.selected_chain),
+            )
+        };
+        let color = presence_status_color(status);
+        let event_label = ppoi_event_header_label(progress.as_ref());
+
+        div()
+            .w(px(360.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::SURFACE))
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .text_size(APP_TEXT_SIZE)
+            .text_color(rgb(theme::TEXT))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(status_presence_dot(status).flex_none())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(color))
+                                    .truncate()
+                                    .child(ppoi_hover_heading(
+                                        status,
+                                        progress.as_ref(),
+                                        refreshing,
+                                    )),
+                            )
+                            .when_some(event_label, |this, label| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(theme::TEXT_MUTED))
+                                        .child(format!("({label})")),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(ppoi_hover_detail(status, progress.as_ref(), refreshing)),
+            )
+            .when_some(
+                progress
+                    .as_ref()
+                    .filter(|progress| progress.total_lists > 1),
+                |this, progress| this.child(render_ppoi_list_progress_section(progress)),
+            )
+            .when_some(
+                progress.as_ref().filter(|progress| !progress.is_ready()),
+                |this, progress| {
+                    if progress.is_error() {
+                        this.child(render_ppoi_artifact_error_section(
+                            self.root.clone(),
+                            progress,
+                            status,
+                            retrying,
+                        ))
+                    } else {
+                        this.child(render_ppoi_artifact_progress_section(progress, status))
+                    }
+                },
+            )
+            .when(refreshing, |this| {
+                this.child(render_ppoi_hover_note(
+                    "Refreshing PPOI status",
+                    "Checking private-output PPOI status and retrying recoverable outputs.",
+                    theme::WARNING,
+                ))
+            })
+            .when(counts.ppoi_attention_count() > 0, |this| {
+                this.child(render_ppoi_hover_action_note(
+                    self.root.clone(),
+                    "Needs review",
+                    ppoi_attention_detail(counts),
+                    ppoi_attention_hover_color(counts),
+                ))
+            })
+    }
+}
+
+fn render_ppoi_artifact_progress_section(
+    progress: &PoiArtifactCacheProgress,
+    status: PresenceStatus,
+) -> gpui::Div {
+    let percent = progress.percent();
+    let completed_lists = if percent == 100 && progress.total_lists > 0 {
+        progress.total_lists
+    } else {
+        progress.completed_lists.min(progress.total_lists)
+    };
+    let list_count = if progress.total_lists == 1 {
+        "list"
+    } else {
+        "lists"
+    };
+    let list_text = if progress.total_lists == 0 {
+        "Preparing POI list metadata".to_string()
+    } else if progress.total_lists == 1 && completed_lists == 1 {
+        "POI list ready".to_string()
+    } else {
+        format!(
+            "{} of {} {} ready",
+            completed_lists, progress.total_lists, list_count
+        )
+    };
+    let color = presence_status_color(status);
+
     div()
-        .id(id)
-        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-        .child(status_presence_text(label, status))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb_with_alpha(color, 0.24))
+        .bg(rgb_with_alpha(color, 0.05))
+        .p(px(10.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(color))
+                        .child(ppoi_artifact_phase_label(progress.phase)),
+                )
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(color))
+                        .child(format!("{percent}%")),
+                ),
+        )
+        .child(
+            UiProgress::new()
+                .h(px(7.0))
+                .value(f32::from(percent))
+                .bg(rgb(color)),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(list_text),
+        )
+        .when(
+            progress.current_event_index.is_some() || progress.target_event_index.is_some(),
+            |this| {
+                this.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(ppoi_event_progress_label(progress)),
+                )
+            },
+        )
+        .when_some(progress.current_list_key.as_ref(), |this, list_key| {
+            this.child(
+                div()
+                    .font_family(APP_MONO_FONT_FAMILY)
+                    .text_size(px(12.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(format!("List {}", short_poi_list_key(list_key.as_slice()))),
+            )
+        })
+        .when_some(progress.last_error.as_ref(), |this, error| {
+            this.child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(format!("Last error: {error}")),
+            )
+        })
+}
+
+fn render_ppoi_artifact_error_section(
+    root: Entity<WalletRoot>,
+    progress: &PoiArtifactCacheProgress,
+    status: PresenceStatus,
+    retrying: bool,
+) -> gpui::Div {
+    let color = if status == PresenceStatus::Error {
+        theme::DANGER
+    } else {
+        theme::WARNING
+    };
+    let error = progress
+        .last_error
+        .clone()
+        .unwrap_or_else(|| "Artifact cache refresh failed.".to_string());
+
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb_with_alpha(color, 0.34))
+        .bg(rgb_with_alpha(color, 0.05))
+        .p(px(10.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(color))
+                .child("Last refresh failed"),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(error),
+        )
+        .child(
+            div().flex().justify_end().child(
+                app_button("wallet-status-ppoi-retry-artifact-cache", "Retry refresh")
+                    .small()
+                    .loading(retrying)
+                    .disabled(retrying)
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        root.update(cx, |root, cx| {
+                            root.retry_selected_poi_artifact_cache_refresh(cx);
+                        });
+                    }),
+            ),
+        )
+}
+
+fn render_ppoi_hover_note(title: &str, detail: &str, color: u32) -> gpui::Div {
+    render_ppoi_hover_note_base(title, detail, color, 0.08)
+}
+
+fn render_ppoi_hover_action_note(
+    root: Entity<WalletRoot>,
+    title: &'static str,
+    detail: String,
+    color: u32,
+) -> gpui::Stateful<gpui::Div> {
+    render_ppoi_hover_note_base(title, &detail, color, 0.08)
+        .id("wallet-status-ppoi-needs-review")
+        .cursor_pointer()
+        .hover(move |this| this.bg(rgb_with_alpha(color, 0.14)))
+        .on_click(move |_event, window, cx| {
+            cx.stop_propagation();
+            root.update(cx, |root, cx| {
+                root.open_private_pending_status_dialog(window, cx);
+            });
+        })
+}
+
+fn render_ppoi_hover_note_base(title: &str, detail: &str, color: u32, bg_alpha: f32) -> gpui::Div {
+    render_status_hover_note_base(title, detail, color, bg_alpha)
+}
+
+fn render_status_hover_note_base(
+    title: &str,
+    detail: &str,
+    color: u32,
+    bg_alpha: f32,
+) -> gpui::Div {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(color))
+        .bg(rgb_with_alpha(color, bg_alpha))
+        .p(px(10.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(color))
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(detail.to_string()),
+        )
+}
+
+fn balances_hover_heading(
+    status: PresenceStatus,
+    labels: Option<&SyncStatusLabels>,
+    issue: Option<BalanceSyncIssue>,
+) -> String {
+    if let Some(issue) = issue {
+        return balance_sync_issue_heading(issue).to_string();
+    }
+    if let Some(labels) = labels {
+        return labels.title.clone();
+    }
+    match status {
+        PresenceStatus::Healthy => "Balances ready",
+        PresenceStatus::Active => "Balances catching up",
+        PresenceStatus::Error => "Balance sync error",
+        PresenceStatus::Unknown => "Balances unavailable",
+    }
+    .to_string()
+}
+
+fn balances_hover_detail(
+    status: PresenceStatus,
+    labels: Option<&SyncStatusLabels>,
+    issue: Option<BalanceSyncIssue>,
+    network_mode: WalletNetworkMode,
+) -> String {
+    if let Some(issue) = issue {
+        return balance_sync_issue_detail(issue, network_mode);
+    }
+    if labels.is_some() {
+        return "Private balance sync is catching up with chain state.".to_string();
+    }
+    match status {
+        PresenceStatus::Healthy => "Private balances are synced and following chain state.",
+        PresenceStatus::Active => "Private balance sync is catching up with chain state.",
+        PresenceStatus::Error => "Private balance sync reported an error.",
+        PresenceStatus::Unknown => "Private balance sync state is not available yet.",
+    }
+    .to_string()
+}
+
+fn render_balance_sync_progress_section(labels: &SyncStatusLabels) -> gpui::Div {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb_with_alpha(theme::WARNING, 0.34))
+        .bg(rgb_with_alpha(theme::WARNING, 0.05))
+        .p(px(10.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    UiProgress::new()
+                        .flex_1()
+                        .h(px(7.0))
+                        .value(f32::from(labels.percent))
+                        .bg(rgb(theme::WARNING)),
+                )
+                .child(
+                    div()
+                        .w(px(42.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::WARNING))
+                        .child(format!("{}%", labels.percent)),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(labels.detail.clone()),
+        )
+}
+
+fn render_balance_indexed_catch_up_note(catch_up: WalletIndexedCatchUpStatus) -> gpui::Div {
+    render_status_hover_note_base(
+        balance_indexed_catch_up_note_title(catch_up.source),
+        &balance_indexed_catch_up_note_detail(catch_up.source),
+        theme::WARNING,
+        0.08,
+    )
+    .child(render_balance_sync_tip_row(
+        "Catch-up range",
+        format!("{} -> {}", catch_up.from_block, catch_up.target_block),
+    ))
+}
+
+fn balance_indexed_catch_up_note_title(source: WalletIndexedCatchUpSource) -> &'static str {
+    match source {
+        WalletIndexedCatchUpSource::Squid => "Using Squid catch-up",
+        WalletIndexedCatchUpSource::IndexedArtifacts => "Using artifact catch-up",
+    }
+}
+
+fn balance_indexed_catch_up_note_detail(source: WalletIndexedCatchUpSource) -> String {
+    match source {
+        WalletIndexedCatchUpSource::Squid => {
+            "RPC log sync is behind, so balances are catching up from the Squid indexed wallet source."
+                .to_string()
+        }
+        WalletIndexedCatchUpSource::IndexedArtifacts => {
+            "Squid catch-up is unavailable, so balances are catching up from verified indexed artifacts."
+                .to_string()
+        }
+    }
+}
+
+fn render_balance_sync_tip_section(sync_tip: WalletSyncTip, now_secs: u64) -> gpui::Div {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb_with_alpha(theme::BORDER, 0.72))
+        .bg(rgb_with_alpha(theme::SURFACE_ELEVATED, 0.34))
+        .p(px(10.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEXT))
+                .child("Chain position"),
+        )
+        .child(render_balance_sync_tip_row(
+            "Wallet state",
+            format_block_label(Some(sync_tip.last_scanned_block)),
+        ))
+        .child(render_balance_sync_tip_row(
+            "Safe head",
+            format_block_label(sync_tip.safe_head_block),
+        ))
+        .child(render_balance_sync_tip_row(
+            "RPC head",
+            format_block_label(sync_tip.head_block),
+        ))
+        .when_some(
+            sync_tip.head_last_advanced_at_unix_secs,
+            |this, advanced_at| {
+                this.child(render_balance_sync_tip_row(
+                    "Head advanced",
+                    format!(
+                        "{} ago",
+                        format_duration_compact(now_secs.saturating_sub(advanced_at))
+                    ),
+                ))
+            },
+        )
+}
+
+fn render_balance_sync_tip_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .text_size(px(12.0))
+        .child(
+            div()
+                .min_w_0()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .truncate()
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_family(APP_MONO_FONT_FAMILY)
+                .text_color(rgb(theme::TEXT))
+                .child(value),
+        )
+}
+
+fn balance_sync_issue_heading(issue: BalanceSyncIssue) -> &'static str {
+    match issue {
+        BalanceSyncIssue::HeadUnavailable => "Balance head unavailable",
+        BalanceSyncIssue::HeadStalled { .. } => "Balance source stale",
+        BalanceSyncIssue::Lagging { .. } => "Balances lagging",
+    }
+}
+
+pub(super) fn balance_sync_issue_detail(
+    issue: BalanceSyncIssue,
+    network_mode: WalletNetworkMode,
+) -> String {
+    match issue {
+        BalanceSyncIssue::HeadUnavailable => "Waiting for chain head updates.".to_string(),
+        BalanceSyncIssue::HeadStalled {
+            stale_secs,
+            threshold_secs: _,
+        } => format!(
+            "RPC head has not advanced for {}. {}",
+            format_duration_compact(stale_secs),
+            balance_sync_issue_suggestion(network_mode)
+        ),
+        BalanceSyncIssue::Lagging {
+            lag_blocks,
+            threshold_blocks: _,
+        } => format!(
+            "Wallet state is {lag_blocks} safe-head blocks behind. {}",
+            balance_sync_issue_suggestion(network_mode)
+        ),
+    }
+}
+
+fn balance_sync_issue_suggestion(network_mode: WalletNetworkMode) -> &'static str {
+    match network_mode {
+        WalletNetworkMode::Tor => "Consider generating a new Tor session or using premium RPCs.",
+        WalletNetworkMode::Proxy | WalletNetworkMode::Direct => "Consider using premium RPCs.",
+    }
+}
+
+fn balance_pending_detail(counts: WalletStatusCounts) -> Option<String> {
+    let mut parts = Vec::new();
+    if counts.pending_incoming_outputs > 0 {
+        parts.push(count_label(
+            counts.pending_incoming_outputs,
+            "incoming output",
+        ));
+    }
+    if counts.pending_outgoing_outputs > 0 {
+        parts.push(count_label(
+            counts.pending_outgoing_outputs,
+            "outgoing output",
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{} waiting for confirmation and safe-head finality.",
+            parts.join(" · ")
+        ))
+    }
+}
+
+fn format_block_label(block: Option<u64>) -> String {
+    block.map_or_else(|| "Waiting".to_string(), |block| format!("block {block}"))
+}
+
+fn format_duration_compact(secs: u64) -> String {
+    if secs < SECONDS_PER_MINUTE {
+        return format!("{secs}s");
+    }
+    if secs < SECONDS_PER_HOUR {
+        return format!("{}m", secs / SECONDS_PER_MINUTE);
+    }
+    if secs < SECONDS_PER_DAY {
+        return format!("{}h", secs / SECONDS_PER_HOUR);
+    }
+    format!("{}d", secs / SECONDS_PER_DAY)
+}
+
+fn ppoi_hover_heading(
+    status: PresenceStatus,
+    progress: Option<&PoiArtifactCacheProgress>,
+    refreshing: bool,
+) -> &'static str {
+    if let Some(progress) = progress {
+        if progress.is_error() {
+            return if status == PresenceStatus::Error {
+                "PPOI checks blocked"
+            } else {
+                "Artifact cache refresh failed"
+            };
+        }
+        if progress.is_active() {
+            return if progress.phase == PoiArtifactCachePhase::LiveTailing {
+                "Following POI event tail"
+            } else {
+                "Rebuilding local POI artifact cache"
+            };
+        }
+    }
+    if refreshing {
+        return "Refreshing PPOI status";
+    }
+    match status {
+        PresenceStatus::Healthy => "PPOI ready",
+        PresenceStatus::Active => "PPOI catching up",
+        PresenceStatus::Error => "PPOI checks blocked",
+        PresenceStatus::Unknown => "PPOI status unavailable",
+    }
+}
+
+fn ppoi_hover_detail(
+    status: PresenceStatus,
+    progress: Option<&PoiArtifactCacheProgress>,
+    refreshing: bool,
+) -> &'static str {
+    if let Some(progress) = progress {
+        if progress.is_error() {
+            return if progress.ready_for_wallet_checks {
+                "Using last ready cache state."
+            } else {
+                "No ready local POI cache is available."
+            };
+        }
+        if progress.is_active() {
+            return "Private-output PPOI checks wait for this cache before refreshing.";
+        }
+    }
+    if refreshing {
+        return "Checking private-output PPOI status and retrying recoverable outputs.";
+    }
+    match status {
+        PresenceStatus::Healthy => "Up to date and following the source.",
+        PresenceStatus::Active => "Catching up with the PPOI source.",
+        PresenceStatus::Error => "PPOI checks are blocked until the artifact cache rebuilds.",
+        PresenceStatus::Unknown => "PPOI source or artifact-cache status is not available yet.",
+    }
+}
+
+const fn ppoi_artifact_phase_label(phase: PoiArtifactCachePhase) -> &'static str {
+    match phase {
+        PoiArtifactCachePhase::Idle => "Idle",
+        PoiArtifactCachePhase::LoadingPersisted => "Loading persisted cache",
+        PoiArtifactCachePhase::Resetting => "Resetting cache",
+        PoiArtifactCachePhase::FetchingManifest => "Fetching manifest",
+        PoiArtifactCachePhase::DownloadingBase => "Downloading base",
+        PoiArtifactCachePhase::ApplyingDeltas => "Applying deltas",
+        PoiArtifactCachePhase::SyncingBlockedShields => "Syncing blocked Shields",
+        PoiArtifactCachePhase::LiveTailing => "Live tailing",
+        PoiArtifactCachePhase::ValidatingRoots => "Validating roots",
+        PoiArtifactCachePhase::Ready => "Ready",
+        PoiArtifactCachePhase::Error => "Error",
+    }
+}
+
+fn ppoi_event_progress_label(progress: &PoiArtifactCacheProgress) -> String {
+    match (progress.current_event_index, progress.target_event_index) {
+        (Some(current), Some(target)) if current >= target => format!("Event {target}"),
+        (Some(current), Some(target)) => format!("Event {} of {}", current.min(target), target),
+        (Some(current), None) => format!("Event {current}"),
+        (None, Some(target)) => format!("Target event {target}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn ppoi_event_header_label(progress: Option<&PoiArtifactCacheProgress>) -> Option<String> {
+    let progress = progress?;
+    if progress.total_lists != 1 {
+        return None;
+    }
+    if let [list] = progress.list_progress.as_slice() {
+        return ppoi_inline_event_label(list.current_event_index, list.target_event_index);
+    }
+    ppoi_inline_event_label(progress.current_event_index, progress.target_event_index)
+}
+
+fn ppoi_inline_event_label(current: Option<u64>, target: Option<u64>) -> Option<String> {
+    match (current, target) {
+        (Some(current), Some(target)) if current < target => {
+            Some(format!("event {current}/{target}"))
+        }
+        (Some(current), Some(target)) => Some(format!("event {}", current.min(target))),
+        (Some(current), None) => Some(format!("event {current}")),
+        (None, Some(target)) => Some(format!("event {target}")),
+        (None, None) => None,
+    }
+}
+
+fn render_ppoi_list_progress_section(progress: &PoiArtifactCacheProgress) -> gpui::Div {
+    let ready_lists = progress
+        .list_progress
+        .iter()
+        .filter(|progress| progress.ready_for_wallet_checks)
+        .count();
+
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb_with_alpha(theme::BORDER, 0.72))
+        .bg(rgb_with_alpha(theme::SURFACE_ELEVATED, 0.34))
+        .p(px(10.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT))
+                        .child("POI lists"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(format!(
+                            "{} of {} ready",
+                            ready_lists.min(progress.total_lists),
+                            progress.total_lists,
+                        )),
+                ),
+        )
+        .children(
+            progress
+                .list_progress
+                .iter()
+                .map(render_ppoi_list_progress_row),
+        )
+}
+
+fn render_ppoi_list_progress_row(progress: &PoiArtifactCacheListProgress) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .text_size(px(12.0))
+        .child(
+            div()
+                .min_w_0()
+                .font_family(APP_MONO_FONT_FAMILY)
+                .text_color(rgb(theme::TEXT_MUTED))
+                .truncate()
+                .child(short_poi_list_key(progress.list_key.as_slice())),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_family(APP_MONO_FONT_FAMILY)
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(ppoi_list_event_label(progress).unwrap_or_else(|| "Not ready".to_string())),
+        )
+}
+
+fn ppoi_list_event_label(progress: &PoiArtifactCacheListProgress) -> Option<String> {
+    match (progress.current_event_index, progress.target_event_index) {
+        (Some(current), Some(target)) if current < target => {
+            Some(format!("Event {current}/{target}"))
+        }
+        (Some(current), Some(target)) => Some(format!("Event {}", current.min(target))),
+        (Some(current), None) => Some(format!("Event {current}")),
+        (None, Some(target)) => Some(format!("Event {target}")),
+        (None, None) => None,
+    }
+}
+
+fn short_poi_list_key(bytes: &[u8]) -> String {
+    let encoded = hex::encode(bytes);
+    if encoded.len() <= 16 {
+        return encoded;
+    }
+    format!("{}...{}", &encoded[..8], &encoded[encoded.len() - 6..])
 }
 
 const fn ppoi_attention_badge_color(counts: WalletStatusCounts) -> u32 {
@@ -906,28 +1852,12 @@ const fn ppoi_attention_badge_color(counts: WalletStatusCounts) -> u32 {
     }
 }
 
-const fn ppoi_status_tooltip(status: PresenceStatus) -> &'static str {
-    match status {
-        PresenceStatus::Healthy => "Up to date and following the source",
-        PresenceStatus::Active => "Refreshing PPOI status",
-        PresenceStatus::Unknown => "PPOI source unavailable",
+const fn ppoi_attention_hover_color(counts: WalletStatusCounts) -> u32 {
+    if counts.blocked_shield_outputs > 0 {
+        theme::DANGER
+    } else {
+        theme::WARNING
     }
-}
-
-const fn balances_status_tooltip(status: PresenceStatus) -> &'static str {
-    match status {
-        PresenceStatus::Healthy => "Balances are up to date and following chain state",
-        PresenceStatus::Active => "Syncing balances",
-        PresenceStatus::Unknown => "Balance sync unavailable",
-    }
-}
-
-fn ppoi_attention_tooltip(status: PresenceStatus, counts: WalletStatusCounts) -> String {
-    format!(
-        "{}. {}",
-        ppoi_status_tooltip(status),
-        ppoi_attention_detail(counts)
-    )
 }
 
 fn ppoi_attention_detail(counts: WalletStatusCounts) -> String {
@@ -997,8 +1927,15 @@ const fn presence_status_color(status: PresenceStatus) -> u32 {
     match status {
         PresenceStatus::Healthy => theme::SUCCESS,
         PresenceStatus::Active => theme::WARNING,
+        PresenceStatus::Error => theme::DANGER,
         PresenceStatus::Unknown => theme::TEXT_MUTED,
     }
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn walletconnect_tab_attention_badge(count: usize) -> impl IntoElement {

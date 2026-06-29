@@ -6,6 +6,14 @@ use super::{
 };
 
 impl WalletRoot {
+    pub(in crate::root) fn clear_settings_transient_status(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(editor) = self.settings_editor.clone() {
+            let _ = editor.update(cx, |editor, cx| {
+                editor.clear_transient_status(cx);
+            });
+        }
+    }
+
     pub(in crate::root) fn reusable_network_context(&self) -> HttpContext {
         self.http.clone()
     }

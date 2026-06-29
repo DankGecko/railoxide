@@ -282,7 +282,6 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.shutdown_wallet_session_store();
         self.install_view_session_with_dialog_policy(session, metadata, false, None, window, cx);
     }
 
@@ -317,6 +316,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.shutdown_wallet_session_store();
         let vault_view_unlock = Arc::new(session.clone_vault_view_unlock());
         let session = Arc::new(session);
         let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());

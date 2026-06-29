@@ -59,8 +59,10 @@ use sync_service::{
     WalletPendingSpent,
 };
 pub use sync_service::{
+    PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCacheService, PoiReadSource,
-    SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
+    SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletIndexedCatchUpSource,
+    WalletIndexedCatchUpStatus,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio::task::JoinSet;

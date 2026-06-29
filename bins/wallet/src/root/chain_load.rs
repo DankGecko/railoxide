@@ -1,4 +1,9 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Duration;
 
 use gpui::{
     AnyElement, Context, ParentElement, SharedString, Styled, Window, div,
@@ -6,11 +11,12 @@ use gpui::{
 };
 use gpui_component::{WindowExt, progress::Progress as UiProgress};
 use tokio::runtime::Handle;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::{OnceCell, oneshot, watch};
 use ui::theme::{self, APP_TEXT_SIZE};
 use wallet_ops::{
-    DesktopWalletSyncStartPolicy, HttpContext, ListUtxosOutput, PoiCacheService, PoiReadSource,
-    SyncProgressUnit, SyncProgressUpdate, ViewWalletChainSessionRequest, WalletSessionStore,
+    DesktopWalletSyncStartPolicy, HttpContext, ListUtxosOutput, PoiArtifactCacheProgress,
+    PoiCacheService, PoiReadSource, SyncProgressUnit, SyncProgressUpdate,
+    ViewWalletChainSessionRequest, WalletSessionStore, WalletSyncTip,
     vault::{DesktopVaultStore, WalletSource},
 };
 
@@ -26,17 +32,300 @@ pub(super) enum ChainUtxoState {
         snapshot: Arc<ListUtxosOutput>,
         progress: Option<SyncProgressUpdate>,
         session: Arc<wallet_ops::WalletSession>,
+        sync_tip: WalletSyncTip,
         poi_refreshing: bool,
     },
     Ready {
         snapshot: Arc<ListUtxosOutput>,
         session: Arc<wallet_ops::WalletSession>,
+        sync_tip: WalletSyncTip,
         poi_refreshing: bool,
     },
     Error {
         message: Arc<str>,
         start_block: Option<u64>,
     },
+}
+
+const WALLET_SYNC_STARTUP_SUPERSEDED: &str = "wallet sync startup superseded";
+const MERKLE_RESET_SYNC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+
+pub(super) struct WalletSyncLifecycle {
+    generation: Arc<AtomicU64>,
+    next_task_id: u64,
+    session_store: Arc<OnceCell<Arc<WalletSessionStore>>>,
+    startup_tasks: BTreeMap<u64, WalletSyncStartupTask>,
+    current_task_by_chain: BTreeMap<u64, u64>,
+}
+
+pub(super) struct WalletSyncStartupRegistration {
+    pub(super) chain_id: u64,
+    pub(super) generation: u64,
+    pub(super) task_id: u64,
+    pub(super) generation_token: Arc<AtomicU64>,
+    pub(super) session_store: Arc<OnceCell<Arc<WalletSessionStore>>>,
+}
+
+struct WalletSyncStartupTask {
+    chain_id: u64,
+    generation: u64,
+    task_id: u64,
+    join: tokio::task::JoinHandle<()>,
+}
+
+pub(super) struct WalletSyncLifecycleCleanup {
+    startup_tasks: Vec<WalletSyncStartupTask>,
+    session_store: Arc<OnceCell<Arc<WalletSessionStore>>>,
+}
+
+#[derive(Clone)]
+pub(super) struct WalletSyncLifecycleCleanupTask {
+    completed_rx: watch::Receiver<Option<WalletSyncLifecycleCleanupReport>>,
+}
+
+pub(super) struct WalletSyncLifecycleCleanupWaitGroup {
+    tasks: Vec<WalletSyncLifecycleCleanupTask>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct WalletSyncLifecycleCleanupReport {
+    pub(super) stopped_startup_tasks: usize,
+    pub(super) failed_startup_tasks: usize,
+    pub(super) shut_down_session_store: bool,
+}
+
+impl WalletSyncLifecycle {
+    pub(super) fn new() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            next_task_id: 0,
+            session_store: Arc::new(OnceCell::new()),
+            startup_tasks: BTreeMap::new(),
+            current_task_by_chain: BTreeMap::new(),
+        }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(super) fn prepare_startup(&mut self, chain_id: u64) -> WalletSyncStartupRegistration {
+        let generation = self.current_generation();
+        self.next_task_id = self.next_task_id.wrapping_add(1).max(1);
+        let task_id = self.next_task_id;
+
+        for task in self
+            .startup_tasks
+            .values()
+            .filter(|task| task.chain_id == chain_id && task.generation == generation)
+        {
+            task.join.abort();
+        }
+        self.current_task_by_chain.insert(chain_id, task_id);
+
+        WalletSyncStartupRegistration {
+            chain_id,
+            generation,
+            task_id,
+            generation_token: Arc::clone(&self.generation),
+            session_store: Arc::clone(&self.session_store),
+        }
+    }
+
+    pub(super) fn track_startup(
+        &mut self,
+        registration: &WalletSyncStartupRegistration,
+        join: tokio::task::JoinHandle<()>,
+    ) {
+        self.startup_tasks.insert(
+            registration.task_id,
+            WalletSyncStartupTask {
+                chain_id: registration.chain_id,
+                generation: registration.generation,
+                task_id: registration.task_id,
+                join,
+            },
+        );
+    }
+
+    pub(super) fn is_current_startup(&self, chain_id: u64, generation: u64, task_id: u64) -> bool {
+        self.current_generation() == generation
+            && self
+                .current_task_by_chain
+                .get(&chain_id)
+                .is_some_and(|current| *current == task_id)
+    }
+
+    pub(super) fn finish_startup(&mut self, chain_id: u64, generation: u64, task_id: u64) {
+        if self
+            .startup_tasks
+            .get(&task_id)
+            .is_some_and(|task| task.chain_id == chain_id && task.generation == generation)
+        {
+            self.startup_tasks.remove(&task_id);
+        }
+        if self
+            .current_task_by_chain
+            .get(&chain_id)
+            .is_some_and(|current| *current == task_id)
+        {
+            self.current_task_by_chain.remove(&chain_id);
+        }
+    }
+
+    pub(super) fn finish_startup_after_session_installation(
+        &mut self,
+        chain_id: u64,
+        generation: u64,
+        task_id: u64,
+        ready: bool,
+    ) {
+        if self
+            .startup_tasks
+            .get(&task_id)
+            .is_some_and(|task| task.chain_id == chain_id && task.generation == generation)
+        {
+            self.startup_tasks.remove(&task_id);
+        }
+        if ready {
+            if self
+                .current_task_by_chain
+                .get(&chain_id)
+                .is_some_and(|current| *current == task_id)
+            {
+                self.current_task_by_chain.remove(&chain_id);
+            }
+        }
+    }
+
+    pub(super) fn invalidate(&mut self) -> WalletSyncLifecycleCleanup {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.current_task_by_chain.clear();
+        let startup_tasks = std::mem::take(&mut self.startup_tasks)
+            .into_values()
+            .collect::<Vec<_>>();
+        let session_store = std::mem::replace(&mut self.session_store, Arc::new(OnceCell::new()));
+        for task in &startup_tasks {
+            task.join.abort();
+        }
+        WalletSyncLifecycleCleanup {
+            startup_tasks,
+            session_store,
+        }
+    }
+}
+
+impl WalletSyncLifecycleCleanup {
+    #[cfg(test)]
+    pub(super) async fn shutdown(self) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        Ok(self.shutdown_inner().await)
+    }
+
+    pub(super) fn spawn(self, runtime: &Handle) -> WalletSyncLifecycleCleanupTask {
+        let (completed_tx, completed_rx) = watch::channel(None);
+        runtime.spawn(async move {
+            let report = self.shutdown_inner().await;
+            let _ = completed_tx.send(Some(report));
+        });
+        WalletSyncLifecycleCleanupTask { completed_rx }
+    }
+
+    async fn shutdown_inner(self) -> WalletSyncLifecycleCleanupReport {
+        for task in &self.startup_tasks {
+            task.join.abort();
+        }
+
+        let stopped_startup_tasks = self.startup_tasks.len();
+        let mut failed_startup_tasks = 0;
+        for task in self.startup_tasks {
+            match task.join.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    failed_startup_tasks += 1;
+                    tracing::warn!(
+                        chain_id = task.chain_id,
+                        task_id = task.task_id,
+                        %error,
+                        "wallet sync startup task failed during cleanup"
+                    );
+                }
+            }
+        }
+
+        let shut_down_session_store = if let Some(store) = self.session_store.get().cloned() {
+            store.shutdown().await;
+            true
+        } else {
+            false
+        };
+
+        WalletSyncLifecycleCleanupReport {
+            stopped_startup_tasks,
+            failed_startup_tasks,
+            shut_down_session_store,
+        }
+    }
+}
+
+impl WalletSyncLifecycleCleanupTask {
+    pub(super) fn is_finished(&self) -> bool {
+        self.completed_rx.borrow().is_some()
+    }
+
+    async fn wait(mut self) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        loop {
+            let report = { *self.completed_rx.borrow() };
+            if let Some(report) = report {
+                return Ok(report);
+            }
+            self.completed_rx
+                .changed()
+                .await
+                .map_err(|_| "wallet sync cleanup task ended before completion".to_string())?;
+        }
+    }
+}
+
+impl WalletSyncLifecycleCleanupWaitGroup {
+    pub(super) fn new(tasks: Vec<WalletSyncLifecycleCleanupTask>) -> Self {
+        Self { tasks }
+    }
+
+    pub(super) async fn shutdown_for_merkle_reset(
+        self,
+    ) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        self.shutdown_with_timeout(MERKLE_RESET_SYNC_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    pub(super) async fn shutdown_with_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        tokio::time::timeout(timeout, self.wait())
+            .await
+            .map_err(|_| "timed out stopping wallet sync; try again".to_string())?
+    }
+
+    async fn wait(self) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        let mut combined = WalletSyncLifecycleCleanupReport::default();
+        for task in self.tasks {
+            let report = task.wait().await?;
+            combined.stopped_startup_tasks += report.stopped_startup_tasks;
+            combined.failed_startup_tasks += report.failed_startup_tasks;
+            combined.shut_down_session_store |= report.shut_down_session_store;
+        }
+        Ok(combined)
+    }
+}
+
+fn wallet_sync_startup_superseded(generation: &AtomicU64, expected: u64) -> bool {
+    generation.load(Ordering::Acquire) != expected
+}
+
+fn wallet_sync_startup_superseded_error() -> eyre::Report {
+    eyre::eyre!(WALLET_SYNC_STARTUP_SUPERSEDED)
 }
 
 impl ChainUtxoState {
@@ -91,6 +380,13 @@ impl ChainUtxoState {
         }
     }
 
+    pub(super) const fn sync_tip(&self) -> Option<WalletSyncTip> {
+        match self {
+            Self::Syncing { sync_tip, .. } | Self::Ready { sync_tip, .. } => Some(*sync_tip),
+            Self::Idle | Self::Loading { .. } | Self::Error { .. } => None,
+        }
+    }
+
     pub(super) const fn private_action_forms_available(&self) -> bool {
         matches!(self, Self::Syncing { .. } | Self::Ready { .. })
     }
@@ -117,7 +413,21 @@ pub(super) struct SyncStatusLabels {
 pub(super) enum PresenceStatus {
     Healthy,
     Active,
+    Error,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BalanceSyncIssue {
+    HeadUnavailable,
+    HeadStalled {
+        stale_secs: u64,
+        threshold_secs: u64,
+    },
+    Lagging {
+        lag_blocks: u64,
+        threshold_blocks: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -141,28 +451,134 @@ impl WalletStatusCounts {
     pub(super) const fn ppoi_attention_count(self) -> usize {
         self.recoverable_poi_outputs + self.blocked_shield_outputs
     }
-}
 
-pub(super) const fn sync_presence_status(syncing: bool, ready: bool) -> PresenceStatus {
-    if syncing {
-        PresenceStatus::Active
-    } else if ready {
-        PresenceStatus::Healthy
-    } else {
-        PresenceStatus::Unknown
+    pub(super) const fn has_ppoi_blocking_checks(self) -> bool {
+        self.pending_poi_assets > 0 || self.recoverable_poi_outputs > 0
     }
 }
 
-pub(super) const fn ppoi_presence_status(
+pub(super) fn balances_presence_status(
+    syncing: bool,
+    ready: bool,
+    sync_tip: Option<WalletSyncTip>,
+    chain_id: u64,
+    now_secs: u64,
+) -> PresenceStatus {
+    if syncing {
+        return PresenceStatus::Active;
+    }
+    if !ready {
+        return PresenceStatus::Unknown;
+    }
+    if sync_tip.is_some_and(|tip| tip.indexed_catch_up.is_some()) {
+        return PresenceStatus::Active;
+    }
+    match balance_sync_issue(sync_tip, chain_id, now_secs) {
+        None => PresenceStatus::Healthy,
+        Some(BalanceSyncIssue::HeadUnavailable) => PresenceStatus::Unknown,
+        Some(BalanceSyncIssue::HeadStalled { .. } | BalanceSyncIssue::Lagging { .. }) => {
+            PresenceStatus::Active
+        }
+    }
+}
+
+pub(super) fn balance_sync_issue(
+    sync_tip: Option<WalletSyncTip>,
+    chain_id: u64,
+    now_secs: u64,
+) -> Option<BalanceSyncIssue> {
+    let Some(sync_tip) = sync_tip else {
+        return Some(BalanceSyncIssue::HeadUnavailable);
+    };
+    if sync_tip.head_block.is_none() {
+        return Some(BalanceSyncIssue::HeadUnavailable);
+    }
+    let Some(safe_head_block) = sync_tip.safe_head_block else {
+        return Some(BalanceSyncIssue::HeadUnavailable);
+    };
+    let Some(head_last_advanced_at) = sync_tip.head_last_advanced_at_unix_secs else {
+        return Some(BalanceSyncIssue::HeadUnavailable);
+    };
+
+    let threshold_secs = balance_stale_timeout_secs(chain_id);
+    let stale_secs = now_secs.saturating_sub(head_last_advanced_at);
+    if stale_secs > threshold_secs {
+        return Some(BalanceSyncIssue::HeadStalled {
+            stale_secs,
+            threshold_secs,
+        });
+    }
+
+    let lag_blocks = safe_head_block.saturating_sub(sync_tip.last_scanned_block);
+    let threshold_blocks = balance_lag_threshold_blocks(chain_id);
+    if lag_blocks > threshold_blocks {
+        return Some(BalanceSyncIssue::Lagging {
+            lag_blocks,
+            threshold_blocks,
+        });
+    }
+
+    None
+}
+
+pub(super) const fn balance_block_time_secs(chain_id: u64) -> u64 {
+    match chain_id {
+        1 => 12,
+        56 => 3,
+        137 => 2,
+        42161 => 1,
+        _ => 12,
+    }
+}
+
+pub(super) const fn balance_stale_timeout_secs(chain_id: u64) -> u64 {
+    let timeout = balance_block_time_secs(chain_id) * 10;
+    if timeout < 45 { 45 } else { timeout }
+}
+
+pub(super) const fn balance_lag_threshold_blocks(chain_id: u64) -> u64 {
+    let block_time = balance_block_time_secs(chain_id);
+    let threshold = balance_stale_timeout_secs(chain_id) / block_time;
+    if threshold < 2 { 2 } else { threshold }
+}
+
+pub(super) fn ppoi_presence_status(
     refreshing: bool,
     source_available: bool,
+    artifact_cache_expected: bool,
+    artifact_progress: Option<&PoiArtifactCacheProgress>,
+    counts: WalletStatusCounts,
 ) -> PresenceStatus {
+    if !source_available {
+        return PresenceStatus::Unknown;
+    }
+
+    if let Some(progress) = artifact_progress {
+        if progress.is_error() {
+            return if !progress.ready_for_wallet_checks && counts.has_ppoi_blocking_checks() {
+                PresenceStatus::Error
+            } else {
+                PresenceStatus::Active
+            };
+        }
+        if progress.is_active() {
+            return PresenceStatus::Active;
+        }
+        if !progress.is_ready() {
+            return PresenceStatus::Unknown;
+        }
+    } else if artifact_cache_expected {
+        return if refreshing {
+            PresenceStatus::Active
+        } else {
+            PresenceStatus::Unknown
+        };
+    }
+
     if refreshing {
         PresenceStatus::Active
-    } else if source_available {
-        PresenceStatus::Healthy
     } else {
-        PresenceStatus::Unknown
+        PresenceStatus::Healthy
     }
 }
 
@@ -480,6 +896,10 @@ impl WalletRoot {
             .and_then(ChainUtxoState::start_block)
     }
 
+    pub(super) fn selected_chain_poi_artifact_progress(&self) -> Option<&PoiArtifactCacheProgress> {
+        self.poi_artifact_cache_progress.get(&self.selected_chain)
+    }
+
     pub(super) fn is_active_wallet_generation(&self, wallet_id: &str, generation: u64) -> bool {
         wallet_generation_matches(
             self.selected_wallet_id.as_deref(),
@@ -507,16 +927,95 @@ impl WalletRoot {
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }
+        self.poi_artifact_cache_retrying_chains.clear();
         self.sync_utxo_table(cx);
     }
 
     pub(super) fn shutdown_wallet_session_store(&mut self) {
-        if let Some(store) = self.session_store.get().cloned() {
-            self.runtime.spawn(async move {
-                store.shutdown().await;
-            });
+        let cleanup = self.wallet_sync_lifecycle.invalidate();
+        self.start_wallet_sync_cleanup(cleanup);
+    }
+
+    fn start_wallet_sync_cleanup(
+        &mut self,
+        cleanup: WalletSyncLifecycleCleanup,
+    ) -> WalletSyncLifecycleCleanupTask {
+        self.prune_finished_wallet_sync_cleanups();
+        let task = cleanup.spawn(&self.runtime);
+        self.wallet_sync_cleanup_tasks.push(task.clone());
+        task
+    }
+
+    fn prune_finished_wallet_sync_cleanups(&mut self) {
+        self.wallet_sync_cleanup_tasks
+            .retain(|cleanup| !cleanup.is_finished());
+    }
+
+    fn wallet_sync_cleanup_wait_group(&mut self) -> WalletSyncLifecycleCleanupWaitGroup {
+        self.prune_finished_wallet_sync_cleanups();
+        WalletSyncLifecycleCleanupWaitGroup::new(self.wallet_sync_cleanup_tasks.clone())
+    }
+
+    pub(super) fn begin_merkle_forest_cache_reset(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) -> WalletSyncLifecycleCleanupWaitGroup {
+        self.merkle_forest_cache_resetting = true;
+        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        let cleanup = self.wallet_sync_lifecycle.invalidate();
+        self.start_wallet_sync_cleanup(cleanup);
+        self.send_forms.clear();
+        self.unshield_forms.clear();
+        self.private_action_form = None;
+        self.clear_private_broadcaster_progress_state();
+        self.broadcaster_picker = None;
+        for state in self.chain_states.values_mut() {
+            *state = ChainUtxoState::Idle;
         }
-        self.session_store = Arc::new(OnceCell::new());
+        self.poi_artifact_cache_retrying_chains.clear();
+        self.sync_utxo_table(cx);
+        cx.notify();
+        self.wallet_sync_cleanup_wait_group()
+    }
+
+    pub(super) fn finish_merkle_forest_cache_reset(
+        &mut self,
+        reset_succeeded: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.merkle_forest_cache_resetting = false;
+        self.prune_finished_wallet_sync_cleanups();
+        if reset_succeeded && self.view_session.is_some() {
+            self.ensure_chain_load(self.selected_chain, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn is_current_chain_load_startup(
+        &self,
+        wallet_id: &str,
+        active_wallet_generation: u64,
+        chain_id: u64,
+        lifecycle_generation: u64,
+        task_id: u64,
+    ) -> bool {
+        self.is_active_wallet_generation(wallet_id, active_wallet_generation)
+            && self.wallet_sync_lifecycle.is_current_startup(
+                chain_id,
+                lifecycle_generation,
+                task_id,
+            )
+    }
+
+    fn finish_chain_load_startup(
+        &mut self,
+        chain_id: u64,
+        lifecycle_generation: u64,
+        task_id: u64,
+    ) {
+        self.wallet_sync_lifecycle
+            .finish_startup(chain_id, lifecycle_generation, task_id);
     }
 
     pub(super) fn ensure_chain_load(&mut self, chain_id: u64, cx: &mut Context<'_, Self>) {
@@ -549,6 +1048,13 @@ impl WalletRoot {
             );
             return;
         };
+        if self.merkle_forest_cache_resetting {
+            tracing::debug!(
+                chain_id,
+                "skipping wallet sync during Merkle forest cache reset"
+            );
+            return;
+        }
         if matches!(
             self.chain_states.get(&chain_id),
             Some(
@@ -607,33 +1113,83 @@ impl WalletRoot {
         let db_path = self.options.db_path.clone();
         let http = self.http.clone();
         let poi_cache_service = self.poi_cache_service.clone();
-        let session_store = Arc::clone(&self.session_store);
+        let registration = self.wallet_sync_lifecycle.prepare_startup(chain_id);
+        let lifecycle_generation = registration.generation;
+        let chain_load_task_id = registration.task_id;
+        let lifecycle_generation_token = Arc::clone(&registration.generation_token);
+        let session_store = Arc::clone(&registration.session_store);
         let vault_db = self.vault_store.as_ref().map(|store| store.db());
+        let (result_tx, result_rx) = oneshot::channel();
         let join = self.runtime.spawn(async move {
-            if let Some(previous_session) = previous_session {
-                previous_session.stop().await?;
-            }
-            let mut request = request;
-            if let Some(poi_cache_service) = poi_cache_service.as_ref() {
-                request.local_poi_caches = Some(poi_cache_service.start_chain(chain_id).await);
-            }
-            let store = session_store
-                .get_or_try_init(|| {
-                    let db_path = db_path.clone();
-                    let vault_db = vault_db.clone();
-                    async move {
-                        Ok::<Arc<WalletSessionStore>, eyre::Report>(Arc::new(match vault_db {
-                            Some(db) => WalletSessionStore::from_db(db),
-                            None => WalletSessionStore::open(db_path)?,
-                        }))
+            let result = async move {
+                if wallet_sync_startup_superseded(&lifecycle_generation_token, lifecycle_generation)
+                {
+                    return Err(wallet_sync_startup_superseded_error());
+                }
+                if let Some(previous_session) = previous_session {
+                    previous_session.stop().await?;
+                }
+                let mut request = request;
+                if let Some(poi_cache_service) = poi_cache_service.as_ref() {
+                    if wallet_sync_startup_superseded(
+                        &lifecycle_generation_token,
+                        lifecycle_generation,
+                    ) {
+                        return Err(wallet_sync_startup_superseded_error());
                     }
-                })
-                .await?
-                .clone();
-            store
-                .start_view_wallet_session_immediate(request, None, &http)
-                .await
+                    let local_poi_caches = poi_cache_service.start_chain(chain_id).await;
+                    if wallet_sync_startup_superseded(
+                        &lifecycle_generation_token,
+                        lifecycle_generation,
+                    ) {
+                        return Err(wallet_sync_startup_superseded_error());
+                    }
+                    request.local_poi_caches = Some(local_poi_caches);
+                }
+                if wallet_sync_startup_superseded(&lifecycle_generation_token, lifecycle_generation)
+                {
+                    return Err(wallet_sync_startup_superseded_error());
+                }
+                let store = session_store
+                    .get_or_try_init(|| {
+                        let db_path = db_path.clone();
+                        let vault_db = vault_db.clone();
+                        async move {
+                            Ok::<Arc<WalletSessionStore>, eyre::Report>(Arc::new(match vault_db {
+                                Some(db) => WalletSessionStore::from_db(db),
+                                None => WalletSessionStore::open(db_path)?,
+                            }))
+                        }
+                    })
+                    .await?
+                    .clone();
+                if wallet_sync_startup_superseded(&lifecycle_generation_token, lifecycle_generation)
+                {
+                    store.shutdown().await;
+                    return Err(wallet_sync_startup_superseded_error());
+                }
+                let session = store
+                    .start_view_wallet_session_immediate(request, None, &http)
+                    .await?;
+                if wallet_sync_startup_superseded(&lifecycle_generation_token, lifecycle_generation)
+                {
+                    if let Err(error) = session.stop().await {
+                        tracing::warn!(
+                            chain_id,
+                            %error,
+                            "failed to stop superseded wallet sync session"
+                        );
+                    }
+                    store.shutdown().await;
+                    return Err(wallet_sync_startup_superseded_error());
+                }
+                Ok(session)
+            }
+            .await;
+            let _ = result_tx.send(result);
         });
+        self.wallet_sync_lifecycle
+            .track_startup(&registration, join);
 
         let progress_wallet_id = Arc::clone(&active_wallet_id);
         cx.spawn(async move |this, cx| {
@@ -643,9 +1199,12 @@ impl WalletRoot {
                 }
                 let progress = *progress_rx.borrow();
                 let should_continue = this.update(cx, |root, cx| {
-                    if !root.is_active_wallet_generation(
+                    if !root.is_current_chain_load_startup(
                         progress_wallet_id.as_ref(),
                         active_wallet_generation,
+                        chain_id,
+                        lifecycle_generation,
+                        chain_load_task_id,
                     ) {
                         return false;
                     }
@@ -675,14 +1234,23 @@ impl WalletRoot {
 
         let result_wallet_id = active_wallet_id;
         cx.spawn(async move |this, cx| {
-            let session = match join.await {
+            let session = match result_rx.await {
                 Ok(Ok(session)) => Arc::new(session),
                 Ok(Err(error)) => {
                     let _ = this.update(cx, |root, cx| {
-                        if !root.is_active_wallet_generation(
+                        let is_current = root.is_current_chain_load_startup(
                             result_wallet_id.as_ref(),
                             active_wallet_generation,
-                        ) {
+                            chain_id,
+                            lifecycle_generation,
+                            chain_load_task_id,
+                        );
+                        root.finish_chain_load_startup(
+                            chain_id,
+                            lifecycle_generation,
+                            chain_load_task_id,
+                        );
+                        if !is_current {
                             return;
                         }
                         root.chain_states.insert(
@@ -701,10 +1269,19 @@ impl WalletRoot {
                 }
                 Err(error) => {
                     let _ = this.update(cx, |root, cx| {
-                        if !root.is_active_wallet_generation(
+                        let is_current = root.is_current_chain_load_startup(
                             result_wallet_id.as_ref(),
                             active_wallet_generation,
-                        ) {
+                            chain_id,
+                            lifecycle_generation,
+                            chain_load_task_id,
+                        );
+                        root.finish_chain_load_startup(
+                            chain_id,
+                            lifecycle_generation,
+                            chain_load_task_id,
+                        );
+                        if !is_current {
                             return;
                         }
                         root.chain_states.insert(
@@ -723,20 +1300,62 @@ impl WalletRoot {
                 }
             };
 
+            let is_current = this
+                .update(cx, |root, _cx| {
+                    let is_current = root.is_current_chain_load_startup(
+                        result_wallet_id.as_ref(),
+                        active_wallet_generation,
+                        chain_id,
+                        lifecycle_generation,
+                        chain_load_task_id,
+                    );
+                    if !is_current {
+                        root.finish_chain_load_startup(
+                            chain_id,
+                            lifecycle_generation,
+                            chain_load_task_id,
+                        );
+                    }
+                    is_current
+                })
+                .unwrap_or(false);
+            if !is_current {
+                if let Err(error) = session.stop().await {
+                    tracing::warn!(chain_id, %error, "failed to stop stale wallet sync session");
+                }
+                return;
+            }
+
             let mut snapshots_rx = session.snapshots_rx.clone();
             let mut ready_rx = session.ready_rx.clone();
+            let mut sync_tip_rx = session.sync_tip_rx.clone();
             let mut poi_refreshing_rx = session.poi_refreshing_rx.clone();
             let initial_snapshot = snapshots_rx.borrow().clone();
             let mut ready = *ready_rx.borrow();
+            let initial_sync_tip = *sync_tip_rx.borrow();
             let initial_poi_refreshing = *poi_refreshing_rx.borrow();
 
-            let _ = this.update(cx, |root, cx| {
-                if !root.is_active_wallet_generation(
+            let installed = this.update(cx, |root, cx| {
+                if !root.is_current_chain_load_startup(
                     result_wallet_id.as_ref(),
                     active_wallet_generation,
+                    chain_id,
+                    lifecycle_generation,
+                    chain_load_task_id,
                 ) {
-                    return;
+                    root.finish_chain_load_startup(
+                        chain_id,
+                        lifecycle_generation,
+                        chain_load_task_id,
+                    );
+                    return false;
                 }
+                root.wallet_sync_lifecycle.finish_startup_after_session_installation(
+                    chain_id,
+                    lifecycle_generation,
+                    chain_load_task_id,
+                    ready,
+                );
                 let progress = root
                     .chain_states
                     .get(&chain_id)
@@ -745,6 +1364,7 @@ impl WalletRoot {
                     ChainUtxoState::Ready {
                         snapshot: initial_snapshot.clone(),
                         session: session.clone(),
+                        sync_tip: initial_sync_tip,
                         poi_refreshing: initial_poi_refreshing,
                     }
                 } else {
@@ -752,6 +1372,7 @@ impl WalletRoot {
                         snapshot: initial_snapshot.clone(),
                         progress,
                         session: session.clone(),
+                        sync_tip: initial_sync_tip,
                         poi_refreshing: initial_poi_refreshing,
                     }
                 };
@@ -765,7 +1386,14 @@ impl WalletRoot {
                     );
                 }
                 cx.notify();
+                true
             });
+            if !matches!(installed, Ok(true)) {
+                if let Err(error) = session.stop().await {
+                    tracing::warn!(chain_id, %error, "failed to stop stale wallet sync session");
+                }
+                return;
+            }
 
             loop {
                 tokio::select! {
@@ -826,10 +1454,15 @@ impl WalletRoot {
                                 return false;
                             };
                             match state {
-                                ChainUtxoState::Syncing { snapshot, session, poi_refreshing, .. } => {
+                                ChainUtxoState::Syncing { snapshot, session, sync_tip, poi_refreshing, .. } => {
+                                    root.finish_chain_load_startup(
+                                        chain_id,
+                                        lifecycle_generation,
+                                        chain_load_task_id,
+                                    );
                                     root.chain_states.insert(
                                         chain_id,
-                                        ChainUtxoState::Ready { snapshot, session, poi_refreshing },
+                                        ChainUtxoState::Ready { snapshot, session, sync_tip, poi_refreshing },
                                     );
                                     root.reschedule_ready_public_broadcaster_cost_estimates(chain_id, cx);
                                     if root.selected_chain == chain_id {
@@ -849,6 +1482,37 @@ impl WalletRoot {
                                     false
                                 }
                             }
+                        });
+                        if !matches!(should_continue, Ok(true)) {
+                            break;
+                        }
+                    }
+                    changed = sync_tip_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let sync_tip = *sync_tip_rx.borrow();
+                        let should_continue = this.update(cx, |root, cx| {
+                            if !root.is_active_wallet_generation(
+                                result_wallet_id.as_ref(),
+                                active_wallet_generation,
+                            ) {
+                                return false;
+                            }
+                            let Some(state) = root.chain_states.get_mut(&chain_id) else {
+                                return false;
+                            };
+                            match state {
+                                ChainUtxoState::Syncing { sync_tip: state, .. }
+                                | ChainUtxoState::Ready { sync_tip: state, .. } => {
+                                    *state = sync_tip;
+                                }
+                                ChainUtxoState::Idle
+                                | ChainUtxoState::Loading { .. }
+                                | ChainUtxoState::Error { .. } => return false,
+                            }
+                            cx.notify();
+                            true
                         });
                         if !matches!(should_continue, Ok(true)) {
                             break;
@@ -890,6 +1554,10 @@ impl WalletRoot {
                     }
                 }
             }
+
+            let _ = this.update(cx, |root, _cx| {
+                root.finish_chain_load_startup(chain_id, lifecycle_generation, chain_load_task_id);
+            });
         })
         .detach();
     }

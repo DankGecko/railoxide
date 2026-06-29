@@ -14,13 +14,14 @@ use gpui_component::{
 };
 use rand::RngExt;
 use tokio::runtime::Handle;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::watch;
 use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
-    BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiCacheService, PoiReadSource,
-    ProverCacheBuildProgress, PublicBalanceSnapshot, PublicBroadcasterWakuClient,
-    TokenAnchorRateCache, TokenAnchorRefreshHandle, WalletNetworkHealth, WalletSessionStore,
+    BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
+    PoiCacheService, PoiReadSource, ProverCacheBuildProgress, PublicBalanceSnapshot,
+    PublicBroadcasterWakuClient, TokenAnchorRateCache, TokenAnchorRefreshHandle,
+    WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
@@ -80,7 +81,10 @@ use broadcaster_preferences::{
     broadcaster_preference_is_banned, broadcaster_preference_is_favorite,
 };
 use broadcaster_view::{BroadcasterActivityTab, BroadcasterPreferenceListKind};
-use chain_load::{ChainUtxoState, chain_load_overrides, start_shared_poi_cache_service};
+use chain_load::{
+    ChainUtxoState, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, chain_load_overrides,
+    start_shared_poi_cache_service,
+};
 use gas_fee::Eip1559GasFeeEditorState;
 use key_export::KeyExportState;
 use manage_wallets::ManageWalletsState;
@@ -133,9 +137,10 @@ use broadcaster_picker::{
 };
 #[cfg(test)]
 use chain_load::{
-    PresenceStatus, WalletStatusCounts, loading_summary, ppoi_presence_status, progress_detail,
-    ready_wallet_status_labels, ready_wallet_status_shows_text, sync_presence_status,
-    wallet_generation_matches,
+    BalanceSyncIssue, PresenceStatus, WalletStatusCounts, balance_lag_threshold_blocks,
+    balance_stale_timeout_secs, balance_sync_issue, balances_presence_status, loading_summary,
+    ppoi_presence_status, progress_detail, ready_wallet_status_labels,
+    ready_wallet_status_shows_text, wallet_generation_matches,
 };
 #[cfg(test)]
 use gas_fee::{format_gwei, parse_gwei_to_wei, validate_custom_gas_fee};
@@ -386,7 +391,11 @@ pub(crate) struct WalletRoot {
     chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
     poi_cache_service: Option<Arc<PoiCacheService>>,
-    session_store: Arc<OnceCell<Arc<WalletSessionStore>>>,
+    poi_artifact_cache_progress: BTreeMap<u64, PoiArtifactCacheProgress>,
+    poi_artifact_cache_retrying_chains: BTreeSet<u64>,
+    wallet_sync_lifecycle: WalletSyncLifecycle,
+    wallet_sync_cleanup_tasks: Vec<WalletSyncLifecycleCleanupTask>,
+    merkle_forest_cache_resetting: bool,
     unlock_password_input: Entity<InputState>,
     new_password_input: Entity<InputState>,
     confirm_password_input: Entity<InputState>,
@@ -448,11 +457,8 @@ impl Drop for WalletRoot {
         if let Some(service) = self.poi_cache_service.as_ref() {
             service.shutdown();
         }
-        if let Some(store) = self.session_store.get().cloned() {
-            self.runtime.spawn(async move {
-                store.shutdown().await;
-            });
-        }
+        let cleanup = self.wallet_sync_lifecycle.invalidate();
+        let _ = cleanup.spawn(&self.runtime);
     }
 }
 
@@ -523,6 +529,35 @@ impl WalletRoot {
                 cx.background_executor()
                     .timer(PROVER_CACHE_BUILD_DISCOVERY_INTERVAL)
                     .await;
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_poi_artifact_cache_progress_monitor(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(service) = self.poi_cache_service.as_ref().cloned() else {
+            return;
+        };
+        let mut progress_rx = service.progress_rx();
+        self.poi_artifact_cache_progress = progress_rx.borrow().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                if progress_rx.changed().await.is_err() {
+                    break;
+                }
+                let progress = progress_rx.borrow().clone();
+                if this
+                    .update(cx, |root, cx| {
+                        for chain_id in progress.keys() {
+                            root.poi_artifact_cache_retrying_chains.remove(chain_id);
+                        }
+                        root.poi_artifact_cache_progress = progress;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -813,7 +848,7 @@ impl WalletRoot {
         let mut public_broadcaster_sort_seed = [0_u8; 32];
         rand::rng().fill(public_broadcaster_sort_seed.as_mut_slice());
         let mut anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
-        let root = Self {
+        let mut root = Self {
             selected_chain: initial_chain_id,
             options,
             vault_store,
@@ -897,7 +932,11 @@ impl WalletRoot {
             chain_select: chain_select.clone(),
             chain_states,
             poi_cache_service,
-            session_store: Arc::new(OnceCell::new()),
+            poi_artifact_cache_progress: BTreeMap::new(),
+            poi_artifact_cache_retrying_chains: BTreeSet::new(),
+            wallet_sync_lifecycle: WalletSyncLifecycle::new(),
+            wallet_sync_cleanup_tasks: Vec::new(),
+            merkle_forest_cache_resetting: false,
             unlock_password_input,
             new_password_input,
             confirm_password_input,
@@ -1370,6 +1409,7 @@ impl WalletRoot {
             }
         })
         .detach();
+        root.spawn_poi_artifact_cache_progress_monitor(cx);
         root.spawn_network_health_monitor(cx);
         root
     }

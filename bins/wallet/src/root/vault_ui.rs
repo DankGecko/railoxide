@@ -190,6 +190,7 @@ impl WalletRoot {
     ) {
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
             window.close_all_dialogs(cx);
+            self.clear_settings_transient_status(cx);
             self.active_activity = Activity::Settings;
             cx.notify();
         } else if should_show_pre_unlock_settings_action(&self.vault_state) {

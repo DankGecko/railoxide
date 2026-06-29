@@ -30,6 +30,7 @@ use gpui_component::{
 use railgun_ui::{chain_icon_asset_path, chain_name, short_address};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
+use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text, app_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::{
@@ -56,8 +57,8 @@ use crate::assets::RailgunActionIcon;
 use super::WalletRoot;
 use super::startup::WalletStartupRoot;
 use super::ui_helpers::{
-    dialog_content_max_height, dialog_max_height, rgb_with_alpha, scrollable_dialog_content,
-    secondary_dialog_content_width,
+    ConfirmationDialogProps, confirmation_dialog, dialog_content_max_height, dialog_max_height,
+    rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width,
 };
 use super::wallet_header::ChainSelectItem;
 

@@ -95,8 +95,8 @@ pub(in crate::root) struct WalletSettingsEditor {
     pub(in crate::root) status: Option<Arc<str>>,
     pub(in crate::root) cache_building: bool,
     pub(in crate::root) cache_build_progress: Option<ProverCacheBuildProgress>,
-    pub(in crate::root) poi_cache_reset_confirming: bool,
     pub(in crate::root) poi_cache_resetting: bool,
+    pub(in crate::root) merkle_forest_resetting: bool,
     pub(in crate::root) startup_root: Option<Entity<WalletStartupRoot>>,
     pub(in crate::root) active_root: Option<WeakEntity<WalletRoot>>,
 }

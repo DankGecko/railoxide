@@ -590,6 +590,15 @@ pub struct ShieldSendOutput {
     pub shield: TxReceiptOutput,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalletSyncTip {
+    pub last_scanned_block: u64,
+    pub head_block: Option<u64>,
+    pub safe_head_block: Option<u64>,
+    pub head_last_advanced_at_unix_secs: Option<u64>,
+    pub indexed_catch_up: Option<WalletIndexedCatchUpStatus>,
+}
+
 pub struct WalletSession {
     pub chain_id: u64,
     pub poi_rpc_url: Url,
@@ -597,6 +606,7 @@ pub struct WalletSession {
     pub start_block: u64,
     pub ready_rx: watch::Receiver<bool>,
     pub snapshots_rx: watch::Receiver<Arc<ListUtxosOutput>>,
+    pub sync_tip_rx: watch::Receiver<WalletSyncTip>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
     pub(crate) db: Arc<DbStore>,
     pub(crate) sync_manager: Arc<SyncManager>,

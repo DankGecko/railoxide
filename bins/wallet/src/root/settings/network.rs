@@ -342,16 +342,20 @@ pub(in crate::root) const fn indexed_artifact_source_status_message(
     settings: &WalletSettings,
 ) -> &'static str {
     match settings.indexed_artifacts.source_mode {
-        IndexedArtifactSourceModeSetting::Disabled => {
-            "Indexed artifacts are disabled. Squid quick-sync remains the indexed-data fallback, with RPC/archive RPC used when indexed sources are unavailable."
-        }
+        IndexedArtifactSourceModeSetting::Disabled => "Squid quick-sync -> RPC",
         IndexedArtifactSourceModeSetting::Official => {
-            "Official indexed artifacts are preferred for indexed data. Squid quick-sync and RPC/archive RPC remain available as fallback paths."
+            "Official indexed artifacts -> Squid quick-sync -> RPC"
         }
         IndexedArtifactSourceModeSetting::Custom => {
-            "Custom indexed artifacts are preferred for indexed data. Squid quick-sync and RPC/archive RPC remain available as fallback paths."
+            "Custom indexed artifacts -> Squid quick-sync -> RPC"
         }
     }
+}
+
+pub(in crate::root) const fn should_show_indexed_artifact_custom_settings(
+    mode: IndexedArtifactSourceModeSetting,
+) -> bool {
+    matches!(mode, IndexedArtifactSourceModeSetting::Custom)
 }
 
 pub(in crate::root) const fn network_mode_value(mode: NetworkModeSetting) -> &'static str {

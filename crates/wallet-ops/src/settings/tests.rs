@@ -406,6 +406,56 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
 }
 
 #[test]
+fn indexed_artifact_official_source_ignores_stored_custom_fields() {
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Official;
+    settings.indexed_artifacts.publisher_pubkey = Some("not-hex".to_string());
+    settings.indexed_artifacts.manifest_source = Some(IndexedArtifactManifestSourceSetting::Url(
+        "ftp://artifacts.example/manifest.json".to_string(),
+    ));
+    settings.indexed_artifacts.gateway_urls = vec!["ftp://gateway.example".to_string()];
+    settings.indexed_artifacts.max_manifest_age_secs = Some(0);
+    settings.indexed_artifacts.concurrency = Some(0);
+    settings.indexed_artifacts.max_in_flight_bytes = Some(1024 * 1024 * 1024 + 1);
+
+    settings
+        .validate()
+        .expect("official mode ignores stored custom-only fields");
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    let source = configs
+        .get(&1)
+        .and_then(|config| config.indexed_artifact_source.as_ref())
+        .expect("official indexed artifact source");
+
+    assert_eq!(
+        alloy::hex::encode(source.trusted_publisher_pubkey.as_slice()),
+        OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY.trim_start_matches("0x")
+    );
+    assert!(matches!(
+        &source.manifest_source,
+        super::IndexedArtifactManifestSource::IpnsName(name)
+            if name == OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
+    ));
+    assert_eq!(
+        source
+            .gateway_urls
+            .iter()
+            .map(|url| url.as_str().to_string())
+            .collect::<Vec<_>>(),
+        OFFICIAL_INDEXED_ARTIFACT_GATEWAYS
+            .iter()
+            .map(|gateway| format!("{gateway}/"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(source.concurrency, DEFAULT_INDEXED_ARTIFACT_CONCURRENCY);
+    assert_eq!(
+        source.max_in_flight_bytes,
+        DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES
+    );
+    assert_eq!(source.max_manifest_age, None);
+}
+
+#[test]
 fn indexed_artifact_custom_source_builds_effective_config() {
     let mut settings = WalletSettings::default();
     settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;

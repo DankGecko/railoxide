@@ -85,10 +85,36 @@ impl IndexedArtifactSettings {
     }
 
     pub(super) fn source_config(&self) -> Option<IndexedArtifactSourceConfig> {
-        if matches!(self.source_mode, IndexedArtifactSourceModeSetting::Disabled) {
-            return None;
+        match self.source_mode {
+            IndexedArtifactSourceModeSetting::Disabled => None,
+            IndexedArtifactSourceModeSetting::Official => Some(Self::official_source_config()),
+            IndexedArtifactSourceModeSetting::Custom => Some(self.custom_source_config()),
         }
-        Some(IndexedArtifactSourceConfig {
+    }
+
+    fn official_source_config() -> IndexedArtifactSourceConfig {
+        IndexedArtifactSourceConfig {
+            trusted_publisher_pubkey: parse_fixed_hex_32(
+                OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY,
+            )
+            .expect("official indexed artifact publisher public key is valid"),
+            manifest_source: IndexedArtifactManifestSource::IpnsName(
+                OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME.to_string(),
+            ),
+            gateway_urls: OFFICIAL_INDEXED_ARTIFACT_GATEWAYS
+                .iter()
+                .map(|gateway| {
+                    Url::parse(gateway).expect("official indexed artifact gateway URL is valid")
+                })
+                .collect(),
+            max_manifest_age: None,
+            concurrency: DEFAULT_INDEXED_ARTIFACT_CONCURRENCY,
+            max_in_flight_bytes: DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
+        }
+    }
+
+    fn custom_source_config(&self) -> IndexedArtifactSourceConfig {
+        IndexedArtifactSourceConfig {
             trusted_publisher_pubkey: parse_fixed_hex_32(
                 self.publisher_pubkey
                     .as_deref()
@@ -112,13 +138,17 @@ impl IndexedArtifactSettings {
             max_in_flight_bytes: self
                 .max_in_flight_bytes
                 .unwrap_or(DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES),
-        })
+        }
     }
 
     pub(super) fn validate(&self, errors: &mut Vec<String>) {
-        if !matches!(self.source_mode, IndexedArtifactSourceModeSetting::Disabled) {
-            self.validate_required_source(errors);
+        if matches!(self.source_mode, IndexedArtifactSourceModeSetting::Custom) {
+            self.validate_custom_source(errors);
         }
+    }
+
+    fn validate_custom_source(&self, errors: &mut Vec<String>) {
+        self.validate_required_source(errors);
         validate_optional_range(
             "indexed_artifacts.max_manifest_age_secs",
             self.max_manifest_age_secs,

@@ -1,5 +1,38 @@
 use super::*;
 
+const INDEXED_ARTIFACT_REPOSITORY_URL: &str = "https://github.com/triamazikamno/railgun-indexer/";
+
+fn indexed_artifact_repository_help_item() -> SettingItem {
+    SettingItem::render(move |_options, _window, _cx| {
+        div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_size(px(13.0))
+            .line_height(px(18.0))
+            .text_color(rgb(theme::TEXT_SUBTLE))
+            .child(
+                "Chain-indexed data artifacts for wallet catch-up, public TXID cache, and Merkle quick-sync. See",
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .font_family(APP_MONO_FONT_FAMILY)
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(INDEXED_ARTIFACT_REPOSITORY_URL)
+                    .child(clipboard_with_toast(
+                        "wallet-settings-indexed-artifact-repository-url-copy",
+                        INDEXED_ARTIFACT_REPOSITORY_URL,
+                    )),
+            )
+            .child("for more information or if you want to run your own")
+    })
+}
+
 impl Render for WalletSettingsEditor {
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
@@ -79,6 +112,8 @@ impl Render for WalletSettingsEditor {
         );
         let poi_reset_editor = editor.clone();
         let poi_cache_reset_editor = editor.clone();
+        let merkle_forest_cache_reset_editor = editor.clone();
+        let prover_cache_editor = editor.clone();
         let indexed_source_mode = Self::dropdown_field(
             editor.clone(),
             vec![
@@ -254,25 +289,40 @@ impl Render for WalletSettingsEditor {
         let indexed_gateway_kind = SettingsUrlListKind::IndexedArtifactGateway;
         let indexed_gateway_endpoints = indexed_gateway_kind.endpoints(&self.draft);
         let indexed_gateway_editor = editor.clone();
-        let indexed_artifact_status = indexed_artifact_source_status_message(&self.draft);
-        let indexed_artifact_group = settings_group()
+        let indexed_artifact_status = format!(
+            "Current index source priority order: {}",
+            indexed_artifact_source_status_message(&self.draft)
+        );
+        let mut indexed_artifact_group = settings_group()
             .item(settings_section_header("Indexed artifacts"))
             .item(SettingItem::render(move |_options, _window, _cx| {
-                settings_info_banner(indexed_artifact_status)
+                settings_info_banner(&indexed_artifact_status)
             }))
-            .item(
-                SettingItem::new("Indexed artifact source", indexed_source_mode)
-                    .description("Controls chain-indexed data artifacts for wallet catch-up, public TXID cache, and Merkle quick-sync. Squid quick-sync endpoints stay configurable as fallback."),
-            )
-            .item(SettingItem::new("Publisher public key", indexed_publisher).layout(Axis::Vertical))
-            .item(SettingItem::new("IPNS name", indexed_ipns).layout(Axis::Vertical))
-            .item(SettingItem::new("Chunk concurrency", indexed_concurrency))
-            .item(SettingItem::new("In-flight byte budget", indexed_byte_budget))
             .item(SettingItem::new(
-                "Reset official indexed artifacts",
-                SettingField::<SharedString>::render(move |_options, _window, _cx| {
-                    let reset_editor = indexed_reset_editor.clone();
-                    app_button("wallet-settings-indexed-artifact-official-preset", "Reset to official")
+                "Indexed artifact source",
+                indexed_source_mode,
+            ))
+            .item(indexed_artifact_repository_help_item());
+        if should_show_indexed_artifact_custom_settings(self.draft.indexed_artifacts.source_mode) {
+            indexed_artifact_group = indexed_artifact_group
+                .item(
+                    SettingItem::new("Publisher public key", indexed_publisher)
+                        .layout(Axis::Vertical),
+                )
+                .item(SettingItem::new("IPNS name", indexed_ipns).layout(Axis::Vertical))
+                .item(SettingItem::new("Chunk concurrency", indexed_concurrency))
+                .item(SettingItem::new(
+                    "In-flight byte budget",
+                    indexed_byte_budget,
+                ))
+                .item(SettingItem::new(
+                    "Reset official indexed artifacts",
+                    SettingField::<SharedString>::render(move |_options, _window, _cx| {
+                        let reset_editor = indexed_reset_editor.clone();
+                        app_button(
+                            "wallet-settings-indexed-artifact-official-preset",
+                            "Reset to official",
+                        )
                         .on_click(move |_event, _window, cx| {
                             reset_editor.update(cx, |editor, cx| {
                                 editor.draft.indexed_artifacts =
@@ -280,14 +330,15 @@ impl Render for WalletSettingsEditor {
                                 editor.programmatic_draft_changed(cx);
                             });
                         })
-                }),
-            ))
-            .item(Self::settings_url_list_item(
-                "Indexed artifact gateway URLs",
-                indexed_gateway_editor,
-                indexed_gateway_kind,
-                indexed_gateway_endpoints,
-            ));
+                    }),
+                ))
+                .item(Self::settings_url_list_item(
+                    "Indexed artifact gateway URLs",
+                    indexed_gateway_editor,
+                    indexed_gateway_kind,
+                    indexed_gateway_endpoints,
+                ));
+        }
 
         let poi_gateway_kind = SettingsUrlListKind::PoiGateway;
         let poi_gateway_endpoints = poi_gateway_kind.endpoints(&self.draft);
@@ -555,7 +606,6 @@ impl Render for WalletSettingsEditor {
         let save_editor = editor.clone();
         let discard_editor = editor.clone();
         let reset_editor = editor.clone();
-        let cache_editor = editor.clone();
         let apply_editor = editor.clone();
         let mut privacy_group =
             settings_group().item(SettingItem::new("Network mode", network_mode));
@@ -592,20 +642,7 @@ impl Render for WalletSettingsEditor {
                                     });
                                 })
                         }),
-                    ))
-                    .item(
-                        SettingItem::new(
-                            "Reset local POI cache",
-                            SettingField::<SharedString>::render(move |_options, _window, cx| {
-                                Self::render_local_poi_cache_reset_action(
-                                    &poi_cache_reset_editor,
-                                    cx,
-                                )
-                            }),
-                        )
-                        .description("Clears only cached POI proof data and starts a fresh POI cache sync.")
-                        .layout(Axis::Vertical),
-                    ),
+                    )),
             )
             .group(poi_gateway_group);
         let public_broadcasters_page = SettingPage::new("Public Broadcasters")
@@ -667,6 +704,49 @@ impl Render for WalletSettingsEditor {
             SettingPage::new("WalletConnect").group(settings_group().item(
                 SettingItem::new("Project ID", walletconnect_project_id).layout(Axis::Vertical),
             ));
+        let maintenance_page = SettingPage::new("Maintenance")
+            .group(
+                settings_group()
+                    .item(settings_section_header("Prover cache"))
+                    .item(
+                        SettingItem::new(
+                            "Build prover cache",
+                            SettingField::<SharedString>::render(move |_options, _window, cx| {
+                                Self::render_build_prover_cache_action(&prover_cache_editor, cx)
+                            }),
+                        )
+                        .description("Prepares prover artifacts locally so transaction proof generation can start faster.")
+                        .layout(Axis::Vertical),
+                    ),
+            )
+            .group(
+                settings_group()
+                    .item(settings_section_header("Local caches"))
+                    .item(
+                        SettingItem::new(
+                            "Reset local POI cache",
+                            SettingField::<SharedString>::render(move |_options, _window, cx| {
+                                Self::render_local_poi_cache_reset_action(
+                                    &poi_cache_reset_editor,
+                                    cx,
+                                )
+                            }),
+                        )
+                        .layout(Axis::Vertical),
+                    )
+                    .item(
+                        SettingItem::new(
+                            "Reset local Merkle forest cache",
+                            SettingField::<SharedString>::render(move |_options, _window, cx| {
+                                Self::render_local_merkle_forest_cache_reset_action(
+                                    &merkle_forest_cache_reset_editor,
+                                    cx,
+                                )
+                            }),
+                        )
+                        .layout(Axis::Vertical),
+                    ),
+            );
         div()
             .size_full()
             .min_h(px(0.0))
@@ -695,7 +775,8 @@ impl Render for WalletSettingsEditor {
                             .page(contracts_page)
                             .page(token_page)
                             .page(public_broadcasters_page)
-                            .page(walletconnect_page),
+                            .page(walletconnect_page)
+                            .page(maintenance_page),
                     ),
             )
             .child(
@@ -705,15 +786,6 @@ impl Render for WalletSettingsEditor {
                     .flex_wrap()
                     .justify_end()
                     .gap_2()
-                    .child(
-                        app_button("wallet-settings-build-cache", "Build prover cache")
-                            .disabled(self.cache_building || self.validation_error.is_some())
-                            .on_click(move |_event, _window, cx| {
-                                cache_editor.update(cx, |editor, cx| {
-                                    editor.build_prover_cache(cx);
-                                });
-                            }),
-                    )
                     .child(
                         app_button("wallet-settings-discard", "Discard")
                             .disabled(!self.is_dirty())

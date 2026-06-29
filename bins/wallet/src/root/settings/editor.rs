@@ -18,8 +18,8 @@ impl WalletSettingsEditor {
             status: None,
             cache_building: false,
             cache_build_progress: None,
-            poi_cache_reset_confirming: false,
             poi_cache_resetting: false,
+            merkle_forest_resetting: false,
             startup_root,
             active_root,
         };
@@ -37,7 +37,6 @@ impl WalletSettingsEditor {
 
     pub(in crate::root) fn draft_changed(&mut self, cx: &mut Context<'_, Self>) {
         self.status = None;
-        self.poi_cache_reset_confirming = false;
         self.refresh_validation();
         cx.notify();
     }
@@ -90,6 +89,15 @@ impl WalletSettingsEditor {
         Some(settings_info_banner(status.to_string()))
     }
 
+    pub(in crate::root) fn clear_transient_status(&mut self, cx: &mut Context<'_, Self>) {
+        if self.cache_building || self.poi_cache_resetting || self.merkle_forest_resetting {
+            return;
+        }
+        if self.status.take().is_some() {
+            cx.notify();
+        }
+    }
+
     pub(in crate::root) fn save_draft(&mut self, cx: &mut Context<'_, Self>) -> bool {
         if classify_settings_apply_mode(&self.saved, &self.draft)
             == SettingsApplyMode::NetworkingRestart
@@ -132,7 +140,6 @@ impl WalletSettingsEditor {
         self.draft = settings_draft_after_discard(&self.saved);
         self.sync_fields_from_draft();
         self.refresh_validation();
-        self.poi_cache_reset_confirming = false;
         cx.notify();
     }
 
@@ -140,24 +147,48 @@ impl WalletSettingsEditor {
         self.draft = WalletSettings::default();
         self.sync_fields_from_draft();
         self.refresh_validation();
-        self.poi_cache_reset_confirming = false;
         cx.notify();
     }
 
-    pub(in crate::root) fn reset_local_poi_cache(&mut self, cx: &mut Context<'_, Self>) {
+    pub(in crate::root) fn open_local_poi_cache_reset_dialog(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.poi_cache_resetting {
             return;
         }
-        if !self.poi_cache_reset_confirming {
-            self.poi_cache_reset_confirming = true;
-            self.status = Some(Arc::from(
-                "Confirm reset to clear cached POI artifact proof data",
-            ));
-            cx.notify();
+        let editor = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let confirm_editor = editor.clone();
+            confirmation_dialog(
+                dialog,
+                ConfirmationDialogProps::danger(
+                    "Reset local POI cache",
+                    "Clears locally cached POI artifact proof data. The wallet will rebuild it as needed.",
+                    Some("Wallet data, keys, and balances are not deleted."),
+                    "Reset POI cache",
+                ),
+                dialog_width,
+                dialog_max_height,
+                content_max_height,
+            )
+            .on_ok(move |_event, _window, cx| {
+                confirm_editor.update(cx, |editor, cx| {
+                    editor.confirm_local_poi_cache_reset(cx);
+                });
+                true
+            })
+        });
+    }
+
+    pub(in crate::root) fn confirm_local_poi_cache_reset(&mut self, cx: &mut Context<'_, Self>) {
+        if self.poi_cache_resetting {
             return;
         }
-
-        self.poi_cache_reset_confirming = false;
         self.poi_cache_resetting = true;
         self.status = Some(Arc::from("Resetting local POI cache..."));
         let db = self.vault_store.db();
@@ -187,15 +218,14 @@ impl WalletSettingsEditor {
                         "Local POI cache reset; cleared {removed} cache records and requested resync"
                     )
                 }
-                Ok(Ok(removed)) => format!(
-                    "Local POI cache reset; cleared {removed} cache records"
-                ),
+                Ok(Ok(removed)) => {
+                    format!("Local POI cache reset; cleared {removed} cache records")
+                }
                 Ok(Err(error)) => format!("Failed to reset local POI cache: {error}"),
                 Err(error) => format!("Local POI cache reset task failed: {error}"),
             };
             let _ = this.update(cx, |editor, cx| {
                 editor.poi_cache_resetting = false;
-                editor.poi_cache_reset_confirming = false;
                 editor.status = Some(Arc::from(message));
                 cx.notify();
             });
@@ -204,64 +234,169 @@ impl WalletSettingsEditor {
         cx.notify();
     }
 
-    pub(in crate::root) fn cancel_local_poi_cache_reset(&mut self, cx: &mut Context<'_, Self>) {
-        self.poi_cache_reset_confirming = false;
-        self.status = None;
+    pub(in crate::root) fn open_local_merkle_forest_cache_reset_dialog(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.merkle_forest_resetting {
+            return;
+        }
+        let editor = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(560.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let confirm_editor = editor.clone();
+            confirmation_dialog(
+                dialog,
+                ConfirmationDialogProps::danger(
+                    "Reset local Merkle forest cache",
+                    "Clears local Merkle forest snapshots for all chains. The wallet will resync tree data before private actions are available again.",
+                    Some("Wallet data and keys are not deleted."),
+                    "Reset Merkle cache",
+                ),
+                dialog_width,
+                dialog_max_height,
+                content_max_height,
+            )
+            .on_ok(move |_event, _window, cx| {
+                confirm_editor.update(cx, |editor, cx| {
+                    editor.confirm_local_merkle_forest_cache_reset(cx);
+                });
+                true
+            })
+        });
+    }
+
+    pub(in crate::root) fn confirm_local_merkle_forest_cache_reset(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.merkle_forest_resetting {
+            return;
+        }
+        self.merkle_forest_resetting = true;
+        self.status = Some(Arc::from("Resetting local Merkle forest cache..."));
+        let db = self.vault_store.db();
+        let active_root = self.active_root.clone();
+        let begin_result = active_root.as_ref().and_then(|root| {
+            root.update(cx, |root, cx| root.begin_merkle_forest_cache_reset(cx))
+                .ok()
+        });
+        let resync_requested = begin_result.is_some();
+        let cleanup = begin_result;
+        let join = self.runtime.spawn(async move {
+            if let Some(cleanup) = cleanup {
+                cleanup.shutdown_for_merkle_reset().await?;
+            }
+            tokio::task::spawn_blocking(move || {
+                wallet_ops::reset_local_merkle_forest_cache(db.as_ref())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        });
+        cx.spawn(async move |this, cx| {
+            let (message, reset_succeeded) = match join.await {
+                Ok(Ok(removed)) if resync_requested => {
+                    (
+                        format!(
+                            "Local Merkle forest cache reset; cleared {removed} snapshot files and restarted private sync"
+                        ),
+                        true,
+                    )
+                }
+                Ok(Ok(removed)) => (
+                    format!(
+                        "Local Merkle forest cache reset; cleared {removed} snapshot files"
+                    ),
+                    true,
+                ),
+                Ok(Err(error)) => (
+                    format!("Failed to reset local Merkle forest cache: {error}"),
+                    false,
+                ),
+                Err(error) => (
+                    format!("Local Merkle forest cache reset task failed: {error}"),
+                    false,
+                ),
+            };
+            let _ = this.update(cx, |editor, cx| {
+                editor.merkle_forest_resetting = false;
+                editor.status = Some(Arc::from(message));
+                if let Some(root) = editor.active_root.as_ref() {
+                    let _ = root.update(cx, |root, cx| {
+                        root.finish_merkle_forest_cache_reset(reset_succeeded, cx);
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
+    }
+
+    pub(in crate::root) fn render_build_prover_cache_action(
+        editor: &Entity<Self>,
+        cx: &App,
+    ) -> gpui::Div {
+        let (building, invalid) = {
+            let state = editor.read(cx);
+            (state.cache_building, state.validation_error.is_some())
+        };
+        let label = if building {
+            "Building..."
+        } else {
+            "Build prover cache"
+        };
+        let build_editor = editor.clone();
+        div().flex().items_center().child(
+            app_button("wallet-settings-build-cache", label)
+                .disabled(building || invalid)
+                .on_click(move |_event, _window, cx| {
+                    build_editor.update(cx, |editor, cx| {
+                        editor.build_prover_cache(cx);
+                    });
+                }),
+        )
     }
 
     pub(in crate::root) fn render_local_poi_cache_reset_action(
         editor: &Entity<Self>,
         cx: &App,
     ) -> gpui::Div {
-        let (confirming, resetting) = {
-            let state = editor.read(cx);
-            (state.poi_cache_reset_confirming, state.poi_cache_resetting)
-        };
-
-        if confirming {
-            let confirm_editor = editor.clone();
-            let cancel_editor = editor.clone();
-            return div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .child(
-                    app_button("wallet-settings-poi-cache-confirm-reset", "Confirm reset")
-                        .danger()
-                        .disabled(resetting)
-                        .on_click(move |_event, _window, cx| {
-                            confirm_editor.update(cx, |editor, cx| {
-                                editor.reset_local_poi_cache(cx);
-                            });
-                        }),
-                )
-                .child(
-                    app_button("wallet-settings-poi-cache-cancel-reset", "Cancel")
-                        .outline()
-                        .disabled(resetting)
-                        .on_click(move |_event, _window, cx| {
-                            cancel_editor.update(cx, |editor, cx| {
-                                editor.cancel_local_poi_cache_reset(cx);
-                            });
-                        }),
-                );
-        }
-
+        let resetting = editor.read(cx).poi_cache_resetting;
         let reset_editor = editor.clone();
-        let label = if resetting {
-            "Resetting..."
-        } else {
-            "Reset local cache"
-        };
+        let label = if resetting { "Resetting..." } else { "Reset" };
         div().flex().items_center().child(
             app_button("wallet-settings-poi-cache-reset", label)
                 .danger()
+                .outline()
                 .disabled(resetting)
-                .on_click(move |_event, _window, cx| {
+                .on_click(move |_event, window, cx| {
                     reset_editor.update(cx, |editor, cx| {
-                        editor.reset_local_poi_cache(cx);
+                        editor.open_local_poi_cache_reset_dialog(window, cx);
+                    });
+                }),
+        )
+    }
+
+    pub(in crate::root) fn render_local_merkle_forest_cache_reset_action(
+        editor: &Entity<Self>,
+        cx: &App,
+    ) -> gpui::Div {
+        let resetting = editor.read(cx).merkle_forest_resetting;
+        let reset_editor = editor.clone();
+        let label = if resetting { "Resetting..." } else { "Reset" };
+        div().flex().items_center().child(
+            app_button("wallet-settings-merkle-forest-reset", label)
+                .danger()
+                .outline()
+                .disabled(resetting)
+                .on_click(move |_event, window, cx| {
+                    reset_editor.update(cx, |editor, cx| {
+                        editor.open_local_merkle_forest_cache_reset_dialog(window, cx);
                     });
                 }),
         )

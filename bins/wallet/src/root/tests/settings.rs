@@ -3,6 +3,7 @@ use crate::root::settings::{
     add_indexed_artifact_gateway_url, apply_indexed_artifact_source_mode,
     indexed_artifact_source_mode_value, indexed_artifact_source_status_message,
     remove_indexed_artifact_gateway_url, set_indexed_artifact_gateway_url,
+    should_show_indexed_artifact_custom_settings,
 };
 use wallet_ops::settings::{IndexedArtifactSettings, IndexedArtifactSourceModeSetting};
 
@@ -558,7 +559,23 @@ fn indexed_artifact_source_mode_helpers_apply_official_and_disabled_presets() {
         settings.indexed_artifacts,
         IndexedArtifactSettings::disabled_preset()
     );
-    assert!(indexed_artifact_source_status_message(&settings).contains("disabled"));
+    assert_eq!(
+        indexed_artifact_source_status_message(&settings),
+        "Squid quick-sync -> RPC"
+    );
+}
+
+#[test]
+fn indexed_artifact_custom_settings_only_show_for_custom_mode() {
+    assert!(!should_show_indexed_artifact_custom_settings(
+        IndexedArtifactSourceModeSetting::Official
+    ));
+    assert!(!should_show_indexed_artifact_custom_settings(
+        IndexedArtifactSourceModeSetting::Disabled
+    ));
+    assert!(should_show_indexed_artifact_custom_settings(
+        IndexedArtifactSourceModeSetting::Custom
+    ));
 }
 
 #[test]

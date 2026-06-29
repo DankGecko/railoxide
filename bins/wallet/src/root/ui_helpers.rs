@@ -1,15 +1,16 @@
 use gpui::{
-    App, ElementId, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, img, px,
-    rgb,
+    App, ElementId, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, img,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
     Disableable, Icon, Sizable,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
+    dialog::{Dialog, DialogButtonProps},
     tag::Tag,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button_base, app_muted_text};
+use ui::controls::{app_button_base, app_muted_text, app_strong_text, app_text};
 use ui::icons;
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 
@@ -63,6 +64,77 @@ pub(super) fn scrollable_dialog_content(
         .min_h(px(0.0))
         .overflow_y_scrollbar()
         .child(content)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ConfirmationDialogProps {
+    title: &'static str,
+    body: &'static str,
+    detail: Option<&'static str>,
+    confirm_text: &'static str,
+    confirm_variant: ButtonVariant,
+}
+
+impl ConfirmationDialogProps {
+    pub(super) const fn danger(
+        title: &'static str,
+        body: &'static str,
+        detail: Option<&'static str>,
+        confirm_text: &'static str,
+    ) -> Self {
+        Self {
+            title,
+            body,
+            detail,
+            confirm_text,
+            confirm_variant: ButtonVariant::Danger,
+        }
+    }
+}
+
+pub(super) fn confirmation_dialog(
+    dialog: Dialog,
+    props: ConfirmationDialogProps,
+    dialog_width: Pixels,
+    dialog_max_height: Pixels,
+    content_max_height: Pixels,
+) -> Dialog {
+    let content_width = secondary_dialog_content_width(dialog_width);
+    dialog
+        .w(dialog_width)
+        .max_h(dialog_max_height)
+        .title(app_strong_text(props.title))
+        .button_props(
+            DialogButtonProps::default()
+                .ok_text(props.confirm_text)
+                .ok_variant(props.confirm_variant),
+        )
+        .confirm()
+        .child(scrollable_dialog_content(
+            content_max_height,
+            confirmation_dialog_content(props, content_width),
+        ))
+}
+
+fn confirmation_dialog_content(props: ConfirmationDialogProps, content_width: Pixels) -> gpui::Div {
+    div()
+        .w(content_width)
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            app_text(props.body)
+                .line_height(px(20.0))
+                .whitespace_normal(),
+        )
+        .when_some(props.detail, |this, detail| {
+            this.child(
+                app_muted_text(detail)
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .whitespace_normal(),
+            )
+        })
 }
 
 pub(super) fn app_panel(bg: u32, border: u32) -> gpui::Div {

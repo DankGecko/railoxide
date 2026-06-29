@@ -1,5 +1,6 @@
 use super::*;
 
+mod local_cache;
 mod private_tx;
 mod prover_cache;
 mod public_broadcaster;
@@ -35,6 +36,7 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
     );
 }
 
+pub use local_cache::*;
 pub use private_tx::*;
 pub use prover_cache::*;
 pub use public_broadcaster::*;
