@@ -63,7 +63,13 @@ RailOxide also monitors public broadcaster availability through Waku. In proxy m
 
 ## Wallet Storage
 
-The encrypted wallet vault protects wallet secrets and encrypted wallet cache records.
+The encrypted wallet vault protects wallet secrets and decrypted-wallet cache material. Wallet UTXO payloads, pending-output POI contexts, and output POI recovery records are encrypted with wallet view capability before they enter the local database. Their workflow-row keys are opaque, domain-separated HMAC identifiers rather than transaction hashes, commitments, NPKs, or output roles. Authentication binds each encrypted payload to its record kind, wallet-chain namespace, and opaque row ID.
+
+Lower-sensitivity coordination metadata remains plaintext by product decision. This includes the wallet-chain ownership index, `wallet_meta` checkpoint and safe-head fields, and wallet sync actor/reset state. These records can reveal local wallet organization and synchronization progress, but not the encrypted transaction-correlatable POI workflow payloads.
+
+Released plaintext pending-output and recovery rows migrate after the matching view capability is unlocked and before the wallet actor starts. Hardware-derived wallets therefore require the matching hardware view capability. Migration is retryable and fail-closed: runtime reads do not mix old plaintext rows with encrypted rows, and malformed or conflicting rows stop startup for that wallet-chain namespace.
+
+Logical migration removes plaintext rows from current database tables and atomically schedules database compaction. RailOxide does not swap or compact a live shared database handle; compaction runs before handles are exposed on the next cold database open. Until that restart completes, freed pages and pre-migration backups may still contain old plaintext bytes.
 
 App settings are stored outside the encrypted vault and may include:
 

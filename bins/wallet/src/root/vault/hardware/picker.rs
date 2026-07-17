@@ -1,7 +1,18 @@
 #[cfg(not(feature = "hardware"))]
 use super::WalletRoot;
 #[cfg(feature = "hardware")]
-use super::*;
+use super::{
+    Arc, Context, DesktopVaultStore, Focusable, HardwareAccountPickerRow,
+    HardwareDerivationDescriptor, HardwareDerivationMethod, HardwareDeviceKind,
+    HardwareProfileApprovalPrompt, HardwareProfileMetadata, HardwareProfilePickerView,
+    HardwareProfileSession, HardwareProfileStep, HardwareProfileStepStatus,
+    HardwareProfileUnlockPurpose, HardwareProfileUnlockState, HardwareRailgunAccountMetadata,
+    HardwareWalletCreationError, HardwareWalletSyncIntent, TrezorPassphraseMode, ViewUnlock,
+    WalletMetadataBundle, WalletRoot, Window, create_hardware_profile_accounts, mpsc,
+    open_hardware_account, parse_hardware_exact_recovery_index, parse_hardware_recovery_range,
+    trezor_cipher_key_label, unlock_hardware_profile, vault_error_message,
+    wallet_options_from_metadata,
+};
 
 #[cfg(feature = "hardware")]
 pub(in crate::root) fn hardware_profile_approval_prompt_for_account(
@@ -52,13 +63,16 @@ pub(in crate::root) fn hardware_account_picker_rows(
     metadata: &[WalletMetadataBundle],
     profile_id: &str,
     active_wallet_id: Option<&str>,
+    purpose: HardwareProfileUnlockPurpose,
+    target_wallet_id: Option<&str>,
 ) -> (Vec<HardwareAccountPickerRow>, Vec<HardwareAccountPickerRow>) {
     let mut matching = Vec::new();
     let mut locked = Vec::new();
-    for wallet in metadata
-        .iter()
-        .filter(|wallet| wallet.status == wallet_ops::vault::WalletStatus::Active)
-    {
+    for wallet in metadata.iter().filter(|wallet| {
+        wallet.status == wallet_ops::vault::WalletStatus::Active
+            || (purpose == HardwareProfileUnlockPurpose::Delete
+                && target_wallet_id == Some(wallet.wallet_uuid.as_str()))
+    }) {
         let Some(account) = wallet.hardware_account.clone() else {
             continue;
         };
@@ -113,7 +127,7 @@ pub(in crate::root) fn hardware_profile_auto_open_wallet_id(
         return Ok(Some(Arc::clone(&row.wallet_id)));
     }
 
-    if state.purpose == HardwareProfileUnlockPurpose::AddWallet {
+    if state.purpose == HardwareProfileUnlockPurpose::Add {
         return Ok(None);
     }
 
@@ -376,6 +390,8 @@ impl WalletRoot {
             metadata,
             &profile.profile_id,
             self.selected_wallet_id.as_deref(),
+            self.hardware_profile_unlock.purpose,
+            self.hardware_profile_unlock.target_wallet_id.as_deref(),
         );
         self.hardware_profile_label_input.update(cx, |input, cx| {
             input.set_value(profile.label.clone(), window, cx);
@@ -504,6 +520,8 @@ impl WalletRoot {
                 root.hardware_profile_unlock.action_label = None;
                 match result {
                     Ok(Ok((session, metadata))) => {
+                        root.manage_wallets
+                            .mark_hardware_delete_target_opened(session.wallet_id());
                         root.install_view_session(session, metadata, window, cx);
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {
@@ -715,6 +733,7 @@ impl WalletRoot {
         self.hardware_profile_unlock.error = None;
         let profile_generation = self.next_hardware_profile_action_generation();
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let pending_create_new_chain_ids = self.enabled_chain_ids_for_created_wallet();
         Self::spawn_hardware_profile_progress_listener(profile_generation, progress_rx, window, cx);
         cx.notify();
 
@@ -726,6 +745,7 @@ impl WalletRoot {
             session,
             account_indices,
             sync_intent,
+            pending_create_new_chain_ids,
             trezor_mode,
             trezor_app_passphrase,
             progress_tx,

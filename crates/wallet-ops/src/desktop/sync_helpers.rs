@@ -1,27 +1,32 @@
 use super::*;
 use eyre::eyre;
 
-pub(super) async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxosOutput {
-    let utxos = handle.utxos.read().await.clone();
-    let pending_overlay = handle.pending_overlay().await;
+pub(super) fn snapshot_from_view(
+    chain_id: u64,
+    cache_key: &str,
+    view: &WalletViewState,
+) -> Option<ListUtxosOutput> {
+    let snapshot = view.current_snapshot()?;
+    let utxos = snapshot.utxos.to_vec();
+    let pending_overlay = snapshot.pending_overlay.as_ref();
     let local_pending_spent_count = pending_overlay.local_pending_spent.len();
     let confirmed_utxos = utxos.clone();
     let (utxo_outputs, totals) = utxo_outputs_from_utxos(utxos);
     let mut utxo_outputs = utxo_outputs;
-    apply_pending_overlay_to_outputs(&confirmed_utxos, pending_overlay, &mut utxo_outputs);
+    apply_pending_overlay_to_outputs(&confirmed_utxos, pending_overlay.clone(), &mut utxo_outputs);
     let unspent_count = utxo_outputs.iter().filter(|utxo| !utxo.is_spent).count();
     let spent_count = utxo_outputs.len().saturating_sub(unspent_count);
 
-    ListUtxosOutput {
+    Some(ListUtxosOutput {
         chain_id,
-        cache_key: handle.cache_key.clone(),
+        cache_key: cache_key.to_string(),
         utxo_count: utxo_outputs.len(),
         unspent_count,
         spent_count,
         local_pending_spent_count,
         utxos: utxo_outputs,
         totals,
-    }
+    })
 }
 
 pub(super) struct SyncedViewWallet {
@@ -30,6 +35,24 @@ pub(super) struct SyncedViewWallet {
     pub(super) chain_key: ChainKey,
     pub(super) start_block: u64,
     pub(super) handle: WalletHandle,
+    pub(super) public_data_plane: PublicDataPlaneHandle,
+}
+
+fn initialize_atomic_wallet_cache_metadata(
+    db: &DbStore,
+    cache_key: &WalletCacheKey,
+    metadata: &vault::WalletChainMetadataBundle,
+) -> Result<()> {
+    db.put_wallet_meta_if_absent(
+        cache_key,
+        &WalletMeta {
+            last_scanned_block: metadata.last_scanned_block,
+            updated_at: 0,
+            last_scanned_block_hash: metadata.last_scanned_block_hash,
+        },
+    )
+    .wrap_err("initialize atomic wallet cache metadata")?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,21 +65,15 @@ pub(crate) struct DesktopWalletChainStart {
 pub(crate) struct NewWalletChainMetadataInitReport {
     pub(crate) initialized: usize,
     pub(crate) skipped_disabled: usize,
+    pub(crate) skipped_unavailable: usize,
     pub(crate) skipped_selected: usize,
     pub(crate) skipped_existing: usize,
-    pub(crate) deployment_fallbacks: usize,
     pub(crate) failed: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct NewWalletChainBaseline {
-    start: DesktopWalletChainStart,
-    used_deployment_fallback: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum NewWalletChainMetadataInitOutcome {
-    Initialized { used_deployment_fallback: bool },
+    Initialized,
     SkippedExisting,
     Failed,
 }
@@ -95,16 +112,29 @@ pub(crate) async fn initialize_new_wallet_chain_metadata_for_session(
     db: Arc<DbStore>,
     http: HttpContext,
     skip_chain_id: Option<u64>,
+    init_policy: CreatedWalletChainInitPolicy,
 ) -> NewWalletChainMetadataInitReport {
     let vault_store = vault::DesktopVaultStore::from_db(db);
     let mut report = NewWalletChainMetadataInitReport::default();
+    let pending_chain_ids = match vault_store.load_wallet_metadata_for_session(&view_session) {
+        Ok(metadata) => metadata.pending_create_new_chain_ids,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load pending new-wallet chain metadata initialization");
+            report.failed += 1;
+            return report;
+        }
+    };
 
-    for effective_chain in effective_chains.into_values() {
+    for chain_id in pending_chain_ids {
+        let Some(effective_chain) = effective_chains.get(&chain_id) else {
+            report.skipped_unavailable += 1;
+            continue;
+        };
         if !effective_chain.enabled {
             report.skipped_disabled += 1;
             continue;
         }
-        if skip_chain_id == Some(effective_chain.chain_id) {
+        if skip_chain_id == Some(chain_id) {
             report.skipped_selected += 1;
             continue;
         }
@@ -112,18 +142,14 @@ pub(crate) async fn initialize_new_wallet_chain_metadata_for_session(
         match initialize_new_wallet_chain_metadata_for_chain(
             &vault_store,
             view_session.as_ref(),
-            &effective_chain,
+            effective_chain,
             &http,
+            init_policy,
         )
         .await
         {
-            NewWalletChainMetadataInitOutcome::Initialized {
-                used_deployment_fallback,
-            } => {
+            NewWalletChainMetadataInitOutcome::Initialized => {
                 report.initialized += 1;
-                if used_deployment_fallback {
-                    report.deployment_fallbacks += 1;
-                }
             }
             NewWalletChainMetadataInitOutcome::SkippedExisting => {
                 report.skipped_existing += 1;
@@ -142,6 +168,7 @@ async fn initialize_new_wallet_chain_metadata_for_chain(
     view_session: &vault::DesktopViewSession,
     effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
+    init_policy: CreatedWalletChainInitPolicy,
 ) -> NewWalletChainMetadataInitOutcome {
     let chain_id = effective_chain.chain_id;
     let chain_defaults = match chain_defaults_for_chain(chain_id) {
@@ -163,7 +190,15 @@ async fn initialize_new_wallet_chain_metadata_for_chain(
     };
 
     match vault_store.find_wallet_chain_metadata_for_session(view_session, 0, chain_id, &contract) {
-        Ok(Some(_)) => return NewWalletChainMetadataInitOutcome::SkippedExisting,
+        Ok(Some(_)) => {
+            return complete_new_wallet_chain_metadata_initialization(
+                vault_store,
+                view_session,
+                chain_id,
+                &contract,
+                NewWalletChainMetadataInitOutcome::SkippedExisting,
+            );
+        }
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(chain_id, error = %error, "failed to check existing new wallet chain metadata");
@@ -171,36 +206,48 @@ async fn initialize_new_wallet_chain_metadata_for_chain(
         }
     }
 
-    let baseline = new_wallet_chain_baseline(&chain_defaults, effective_chain, http).await;
-
-    match vault_store.find_wallet_chain_metadata_for_session(view_session, 0, chain_id, &contract) {
-        Ok(Some(_)) => return NewWalletChainMetadataInitOutcome::SkippedExisting,
-        Ok(None) => {}
+    let baseline = match new_wallet_chain_baseline(
+        init_policy,
+        &chain_defaults,
+        effective_chain,
+        http,
+    )
+    .await
+    {
+        Ok(baseline) => baseline,
         Err(error) => {
-            tracing::warn!(chain_id, error = %error, "failed to recheck new wallet chain metadata");
+            tracing::warn!(chain_id, error = %error, "retain pending new wallet chain initialization until its baseline is available");
             return NewWalletChainMetadataInitOutcome::Failed;
         }
-    }
+    };
 
-    match vault_store.create_wallet_chain_metadata_for_session(
+    match vault_store.find_or_create_wallet_chain_metadata_for_session(
         view_session,
         0,
         chain_id,
         &contract,
-        baseline.start.start_block,
-        baseline.start.last_scanned_block,
+        baseline.start_block,
+        baseline.last_scanned_block,
     ) {
-        Ok(_) => {
-            tracing::info!(
+        Ok((metadata, created)) => {
+            let outcome = if created {
+                tracing::info!(
+                    chain_id,
+                    start_block = metadata.start_block,
+                    last_scanned_block = metadata.last_scanned_block,
+                    "initialized new wallet chain metadata"
+                );
+                NewWalletChainMetadataInitOutcome::Initialized
+            } else {
+                NewWalletChainMetadataInitOutcome::SkippedExisting
+            };
+            complete_new_wallet_chain_metadata_initialization(
+                vault_store,
+                view_session,
                 chain_id,
-                start_block = baseline.start.start_block,
-                last_scanned_block = baseline.start.last_scanned_block,
-                used_deployment_fallback = baseline.used_deployment_fallback,
-                "initialized new wallet chain metadata"
-            );
-            NewWalletChainMetadataInitOutcome::Initialized {
-                used_deployment_fallback: baseline.used_deployment_fallback,
-            }
+                &contract,
+                outcome,
+            )
         }
         Err(error) => {
             tracing::warn!(chain_id, error = %error, "failed to create new wallet chain metadata");
@@ -209,31 +256,45 @@ async fn initialize_new_wallet_chain_metadata_for_chain(
     }
 }
 
+fn complete_new_wallet_chain_metadata_initialization(
+    vault_store: &vault::DesktopVaultStore,
+    view_session: &vault::DesktopViewSession,
+    chain_id: u64,
+    contract: &str,
+    outcome: NewWalletChainMetadataInitOutcome,
+) -> NewWalletChainMetadataInitOutcome {
+    match vault_store.complete_pending_create_new_chain_for_session(
+        view_session,
+        0,
+        chain_id,
+        contract,
+    ) {
+        Ok(_) => outcome,
+        Err(error) => {
+            tracing::warn!(chain_id, error = %error, "failed to persist new wallet chain initialization completion");
+            NewWalletChainMetadataInitOutcome::Failed
+        }
+    }
+}
+
 async fn new_wallet_chain_baseline(
+    init_policy: CreatedWalletChainInitPolicy,
     defaults: &ChainConfigDefaults,
     effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
-) -> NewWalletChainBaseline {
-    match fetch_new_wallet_chain_head(defaults, effective_chain, http).await {
-        Ok(head) => NewWalletChainBaseline {
-            start: new_wallet_chain_start_from_head(
+) -> Result<DesktopWalletChainStart> {
+    match init_policy {
+        CreatedWalletChainInitPolicy::InitialCreate => {
+            let head = fetch_new_wallet_chain_head(defaults, effective_chain, http).await?;
+            Ok(new_wallet_chain_start_from_head(
                 effective_chain.deployment_block,
                 effective_chain.finality_depth,
                 head,
-            ),
-            used_deployment_fallback: false,
-        },
-        Err(error) => {
-            tracing::warn!(
-                chain_id = effective_chain.chain_id,
-                error = %error,
-                "falling back to deployment block for new wallet chain metadata"
-            );
-            NewWalletChainBaseline {
-                start: new_wallet_chain_start_from_deployment(effective_chain.deployment_block),
-                used_deployment_fallback: true,
-            }
+            ))
         }
+        CreatedWalletChainInitPolicy::Resumed => Ok(new_wallet_chain_start_from_deployment(
+            effective_chain.deployment_block,
+        )),
     }
 }
 
@@ -323,8 +384,6 @@ pub(super) async fn setup_synced_view_wallet_with_store(
     use_indexed_wallet_catch_up: bool,
     effective_chain: Option<settings::EffectiveChainConfig>,
     poi_read_source: PoiReadSource,
-    poi_rpc_url: Url,
-    shared_local_poi_caches: Option<WalletLocalPoiCaches>,
     rewind_wallet_cache: bool,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
@@ -374,7 +433,7 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         .map_or(chain_defaults.deployment_block, |chain| {
             chain.deployment_block
         });
-    let resolved_start = resolve_desktop_wallet_chain_start(
+    let mut resolved_start = resolve_desktop_wallet_chain_start(
         sync_start_policy,
         existing_wallet_chain_metadata.as_ref(),
         init_block_number,
@@ -382,6 +441,26 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         safe_head,
         rewind_wallet_cache,
     )?;
+    let mut wallet_chain_metadata = match existing_wallet_chain_metadata {
+        Some(metadata) => metadata,
+        None => vault_store
+            .find_or_create_wallet_chain_metadata_for_session(
+                view_session.as_ref(),
+                0,
+                chain_id,
+                &contract,
+                resolved_start.start_block,
+                resolved_start.last_scanned_block,
+            )
+            .map(|(metadata, _created)| metadata)
+            .wrap_err("find or create encrypted wallet chain metadata")?,
+    };
+    if !rewind_wallet_cache {
+        resolved_start = DesktopWalletChainStart {
+            start_block: wallet_chain_metadata.start_block,
+            last_scanned_block: wallet_chain_metadata.last_scanned_block,
+        };
+    }
     tracing::info!(
         chain_id,
         start_block = resolved_start.start_block,
@@ -392,19 +471,14 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         sync_start_policy = ?sync_start_policy,
         "starting desktop view wallet sync"
     );
-    let mut wallet_chain_metadata = match existing_wallet_chain_metadata {
-        Some(metadata) => metadata,
-        None => vault_store
-            .create_wallet_chain_metadata_for_session(
-                view_session.as_ref(),
-                0,
-                chain_id,
-                &contract,
-                resolved_start.start_block,
-                resolved_start.last_scanned_block,
-            )
-            .wrap_err("create encrypted wallet chain metadata")?,
-    };
+    vault_store
+        .complete_pending_create_new_chain_for_session(
+            view_session.as_ref(),
+            0,
+            chain_id,
+            &contract,
+        )
+        .wrap_err("persist new wallet chain initialization completion")?;
     let start_block = resolved_start.start_block;
     if rewind_wallet_cache {
         wallet_chain_metadata.start_block = start_block;
@@ -429,24 +503,22 @@ pub(super) async fn setup_synced_view_wallet_with_store(
             .store_wallet_chain_metadata_with_session(view_session.as_ref(), &wallet_chain_metadata)
             .wrap_err("persist selected POI read source")?;
     }
-    let cache_key = wallet_chain_metadata.wallet_chain_uuid.clone();
-    let (local_poi_caches, manage_local_poi_cache) = wallet_local_poi_caches(
-        &poi_read_source,
-        chain_id,
-        &cache_key,
-        shared_local_poi_caches,
-    );
+    let cache_key = wallet_chain_metadata
+        .wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .wrap_err("parse wallet-chain cache key")?;
+    initialize_atomic_wallet_cache_metadata(db.as_ref(), &cache_key, &wallet_chain_metadata)?;
     let cache_store = Arc::new(
         vault::DesktopEncryptedWalletCacheStore::new(
             Arc::clone(&db),
-            Arc::clone(&view_session),
+            &view_session,
             wallet_chain_metadata,
         )
         .wrap_err("create encrypted wallet cache")?,
     );
     let scan_keys = view_session.scan_keys();
-    let poi_recovery_prover =
-        ProverService::new_with_db(artifact_source(http, db.as_ref()), Arc::clone(&db));
+    let prover_artifact_source = artifact_source(http, db.as_ref());
+    let poi_recovery_prover = ProverService::new_with_db(&prover_artifact_source, &db);
     let wallet_cfg = WalletConfig {
         chain: chain_key,
         cache_key,
@@ -458,10 +530,6 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         progress_tx,
         cache_store: Some(cache_store),
         poi_recovery_prover: Some(poi_recovery_prover),
-        poi_rpc_url: poi_rpc_url.clone(),
-        poi_read_source,
-        local_poi_caches,
-        manage_local_poi_cache,
         use_indexed_wallet_catch_up: effective_use_indexed_wallet_catch_up,
     };
 
@@ -470,7 +538,8 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         .await
         .wrap_err("register wallet sync worker")?;
     if wait_until_ready {
-        handle.wait_until_ready().await;
+        let readiness = handle.wait_until_ready().await;
+        finish_waited_wallet_startup(sync_manager.as_ref(), &handle, readiness).await?;
     }
 
     Ok(SyncedViewWallet {
@@ -479,7 +548,28 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         chain_key,
         start_block,
         handle,
+        public_data_plane: chain_service.public_data_plane(),
     })
+}
+
+async fn finish_waited_wallet_startup(
+    sync_manager: &SyncManager,
+    handle: &WalletHandle,
+    readiness: std::result::Result<(), WalletReadinessWaitError>,
+) -> Result<()> {
+    let Err(error) = readiness else {
+        return Ok(());
+    };
+    let cleanup_error = sync_manager.remove_wallet_session(handle).await.err();
+    let context = cleanup_error.map_or_else(
+        || "wait for wallet sync worker readiness".to_string(),
+        |cleanup_error| {
+            format!(
+                "wait for wallet sync worker readiness; exact actor cleanup also failed: {cleanup_error}"
+            )
+        },
+    );
+    Err::<(), _>(error).wrap_err(context)
 }
 
 pub(crate) fn chain_defaults_for_chain(chain_id: u64) -> Result<ChainConfigDefaults> {
@@ -584,37 +674,10 @@ pub(super) fn parse_effective_address(label: &str, value: &str) -> Result<Addres
     Address::from_str(value).wrap_err_with(|| format!("parse effective {label} address"))
 }
 
-pub(super) fn wallet_local_poi_caches(
-    poi_read_source: &PoiReadSource,
-    chain_id: u64,
-    cache_key: &str,
-    shared_local_poi_caches: Option<WalletLocalPoiCaches>,
-) -> (Option<WalletLocalPoiCaches>, bool) {
-    if !matches!(poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
-        return (None, false);
-    }
-
-    if let Some(local_poi_caches) = shared_local_poi_caches {
-        tracing::info!(
-            chain_id,
-            cache_key,
-            "using shared chain-scoped local POI cache for wallet session"
-        );
-        return (Some(local_poi_caches), false);
-    }
-
-    tracing::info!(
-        chain_id,
-        cache_key,
-        "local POI cache enabled for wallet session"
-    );
-    (Some(Arc::new(RwLock::new(BTreeMap::new()))), true)
-}
-
 pub(super) const fn poi_read_source_label(poi_read_source: &PoiReadSource) -> &'static str {
     match poi_read_source {
-        PoiReadSource::IndexedArtifacts(_) => "indexed-artifacts",
-        PoiReadSource::PoiProxy => "poi-proxy",
+        PoiReadSource::IndexedArtifacts { .. } => "indexed-artifacts",
+        PoiReadSource::PoiProxy { .. } => "poi-proxy",
     }
 }
 
@@ -677,5 +740,160 @@ mod tests {
 
         assert_eq!(source.out_dir, db.blob_dir().join("artifacts"));
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn alpha_wallet_cache_metadata_initializes_once_from_chain_metadata() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open test db");
+        let cache_key = WalletCacheKey::from_opaque_id([0x42; 16]);
+        let mut metadata = vault::WalletChainMetadataBundle {
+            wallet_chain_uuid: cache_key.to_string(),
+            wallet_uuid: "wallet".to_string(),
+            chain_type: 0,
+            chain_id: 1,
+            contract: "0x1111111111111111111111111111111111111111".to_string(),
+            start_block: 100,
+            last_scanned_block: 149,
+            last_scanned_block_hash: Some([0x33; 32]),
+            poi_read_source: None,
+        };
+
+        initialize_atomic_wallet_cache_metadata(&db, &cache_key, &metadata)
+            .expect("initialize atomic metadata");
+        metadata.last_scanned_block = 999;
+        initialize_atomic_wallet_cache_metadata(&db, &cache_key, &metadata)
+            .expect("repeat atomic metadata initialization");
+
+        let stored = db
+            .get_wallet_meta(&cache_key)
+            .expect("load atomic metadata")
+            .expect("atomic metadata present");
+        assert_eq!(stored.last_scanned_block, 149);
+        assert_eq!(stored.last_scanned_block_hash, Some([0x33; 32]));
+
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn waited_startup_failure_removes_only_the_failed_actor() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let root_dir = temp_db_root();
+                let db = Arc::new(
+                    DbStore::open(DbConfig {
+                        root_dir: root_dir.clone(),
+                    })
+                    .expect("open test db"),
+                );
+                let rpc_url = Url::parse("http://127.0.0.1:1").expect("test RPC URL");
+                let chain_key = ChainKey {
+                    chain_id: 1,
+                    contract: Address::ZERO,
+                };
+                let sync_manager = SyncManager::new(
+                    Arc::clone(&db),
+                    PoiReadSource::PoiProxy {
+                        rpc_url: rpc_url.clone().into(),
+                    },
+                );
+                sync_manager
+                    .add_chain(ChainConfig {
+                        chain_id: chain_key.chain_id,
+                        contract: chain_key.contract,
+                        rpcs: Arc::new(QueryRpcPool::new(
+                            vec![rpc_url.clone()],
+                            Duration::from_millis(1),
+                        )),
+                        archive_rpc_url: None,
+                        archive_until_block: 0,
+                        deployment_block: 0,
+                        v2_start_block: 0,
+                        legacy_shield_block: 0,
+                        block_range: 100,
+                        indexed_wallet_block_range: 100,
+                        poll_interval: Duration::from_mins(1),
+                        finality_depth: 0,
+                        quick_sync_endpoint: None,
+                        indexed_artifact_source: None,
+                        anchor_interval: 1000,
+                        anchor_retention: 5,
+                        http_client: None,
+                        progress_tx: None,
+                    })
+                    .await
+                    .expect("add test chain");
+                let cache_key = WalletCacheKey::from_opaque_bytes(b"waited-startup-cleanup")
+                    .expect("test cache key");
+                let wallet_cfg = WalletConfig {
+                    chain: chain_key,
+                    cache_key: cache_key.clone(),
+                    start_block: Some(0),
+                    sync_to_block: Some(0),
+                    quick_sync_endpoint: None,
+                    scan_keys: broadcaster_core::crypto::railgun::ViewingKeyData {
+                        viewing_private_key: [0; 32],
+                        viewing_public_key: [0; 32],
+                        nullifying_key: U256::ZERO,
+                        master_public_key: U256::ZERO,
+                    },
+                    spending_public_key: None,
+                    progress_tx: None,
+                    cache_store: None,
+                    poi_recovery_prover: None,
+                    use_indexed_wallet_catch_up: false,
+                };
+                let failed = sync_manager
+                    .add_wallet(wallet_cfg.clone())
+                    .await
+                    .expect("register failed actor fixture");
+                sync_manager
+                    .remove_wallet_session(&failed)
+                    .await
+                    .expect("retire failed actor fixture");
+                let replacement = sync_manager
+                    .add_wallet(wallet_cfg)
+                    .await
+                    .expect("register replacement actor");
+
+                let error = finish_waited_wallet_startup(
+                    &sync_manager,
+                    &failed,
+                    Err(WalletReadinessWaitError::Failed(
+                        WalletReadinessError::ApplyFailed,
+                    )),
+                )
+                .await
+                .expect_err("startup failure is propagated");
+                assert_eq!(
+                    error.downcast_ref::<WalletReadinessWaitError>(),
+                    Some(&WalletReadinessWaitError::Failed(
+                        WalletReadinessError::ApplyFailed
+                    ))
+                );
+                assert!(
+                    sync_manager
+                        .wallet_handle(&chain_key, cache_key.as_str())
+                        .await
+                        .is_some(),
+                    "exact cleanup must not remove a replacement actor",
+                );
+
+                sync_manager
+                    .remove_wallet_session(&replacement)
+                    .await
+                    .expect("remove replacement actor");
+                sync_manager.shutdown().await;
+                drop(sync_manager);
+                drop(db);
+                fs::remove_dir_all(root_dir).expect("remove temp db dir");
+            });
     }
 }

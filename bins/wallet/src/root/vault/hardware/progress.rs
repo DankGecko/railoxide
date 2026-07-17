@@ -1,5 +1,10 @@
 #[cfg(feature = "hardware")]
-use super::*;
+use super::{
+    Arc, Duration, HardwareDerivationError, HardwareDeviceKind, HardwareProfileApprovalPrompt,
+    HardwareProfilePinMatrixRequest, HardwareProfileProgressUpdate, HardwareProfileStep,
+    HardwareProfileStepStatus, TrezorPinMatrixProvider, TrezorPinMatrixRequestKind, Zeroizing,
+    hardware_device_label, mpsc,
+};
 
 #[cfg(feature = "hardware")]
 pub(super) const HARDWARE_PROFILE_READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(1);

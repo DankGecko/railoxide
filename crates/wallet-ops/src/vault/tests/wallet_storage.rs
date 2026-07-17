@@ -277,6 +277,7 @@ fn wallet_with_metadata_stores_records_in_one_batch() {
         display_order: 0,
         hardware_descriptor: None,
         hardware_account: None,
+        pending_create_new_chain_ids: BTreeSet::new(),
     };
 
     let stored = store

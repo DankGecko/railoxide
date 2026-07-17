@@ -59,15 +59,18 @@ pub(in crate::root) struct StartupSettingsActionState {
     pub(in crate::root) settings: bool,
     pub(in crate::root) reset: bool,
     pub(in crate::root) retry: bool,
+    pub(in crate::root) maintenance_actions_enabled: bool,
 }
 
 pub(in crate::root) const fn startup_settings_action_state(
     has_error: bool,
+    maintenance_idle: bool,
 ) -> StartupSettingsActionState {
     StartupSettingsActionState {
         settings: true,
         reset: has_error,
         retry: has_error,
+        maintenance_actions_enabled: maintenance_idle,
     }
 }
 
@@ -95,9 +98,8 @@ pub(in crate::root) struct WalletSettingsEditor {
     pub(in crate::root) status: Option<Arc<str>>,
     pub(in crate::root) cache_building: bool,
     pub(in crate::root) cache_build_progress: Option<ProverCacheBuildProgress>,
-    pub(in crate::root) poi_cache_resetting: bool,
-    pub(in crate::root) merkle_forest_resetting: bool,
-    pub(in crate::root) startup_root: Option<Entity<WalletStartupRoot>>,
+    pub(in crate::root) maintenance_controller: Entity<WalletMaintenanceController>,
+    pub(in crate::root) startup_root: Option<WeakEntity<WalletStartupRoot>>,
     pub(in crate::root) active_root: Option<WeakEntity<WalletRoot>>,
 }
 

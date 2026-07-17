@@ -1,7 +1,8 @@
 use super::{
     ChainSettings, Deserialize, Error, GasSettings, IndexedArtifactSettings, NetworkSettings,
-    PoiReadSource, PoiReadSourceSetting, PoiSettings, PublicBroadcasterSettings, RuntimeSettings,
-    Serialize, TokenSettings, Url, WakuSettings, WalletConnectSettings, WalletNetworkMode, fmt,
+    PoiProxyFallback, PoiReadSource, PoiReadSourceSetting, PoiSettings, PublicBroadcasterSettings,
+    RuntimeSettings, SensitiveUrl, Serialize, TokenSettings, Url, WakuSettings,
+    WalletConnectSettings, WalletNetworkMode, fmt,
 };
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
@@ -206,22 +207,27 @@ impl WalletSettings {
         if !errors.is_empty() {
             return Err(WalletSettingsValidationError::new(errors));
         }
+        let rpc_url = self.poi_rpc_url()?;
         Ok(match self.poi.read_source {
-            PoiReadSourceSetting::PoiProxy => PoiReadSource::PoiProxy,
-            PoiReadSourceSetting::IndexedArtifacts => {
-                PoiReadSource::IndexedArtifacts(self.poi.artifact.source_config())
-            }
+            PoiReadSourceSetting::PoiProxy => PoiReadSource::PoiProxy { rpc_url },
+            PoiReadSourceSetting::IndexedArtifacts => PoiReadSource::IndexedArtifacts {
+                artifact_source: self.poi.artifact.source_config(),
+                rpc_url,
+                wallet_read_fallback: PoiProxyFallback::Disabled,
+            },
         })
     }
 
-    pub fn poi_rpc_url(&self) -> Result<Url, WalletSettingsValidationError> {
+    pub fn poi_rpc_url(&self) -> Result<SensitiveUrl, WalletSettingsValidationError> {
         let mut errors = Vec::new();
         self.poi.proxy.validate(&mut errors);
         if !errors.is_empty() {
             return Err(WalletSettingsValidationError::new(errors));
         }
-        Url::parse(&self.poi.proxy.rpc_url).map_err(|error| {
-            WalletSettingsValidationError::new(vec![format!("invalid POI RPC URL: {error}")])
-        })
+        Url::parse(&self.poi.proxy.rpc_url)
+            .map(SensitiveUrl::from)
+            .map_err(|error| {
+                WalletSettingsValidationError::new(vec![format!("invalid POI RPC URL: {error}")])
+            })
     }
 }

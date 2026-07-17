@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::maintenance::{WalletMaintenanceReset, WalletMaintenanceStateMachine};
 use crate::root::settings::{
     add_indexed_artifact_gateway_url, apply_indexed_artifact_source_mode,
     indexed_artifact_source_mode_value, indexed_artifact_source_status_message,
@@ -10,6 +11,41 @@ use wallet_ops::settings::{IndexedArtifactSettings, IndexedArtifactSourceModeSet
 #[test]
 fn private_tab_is_default_wallet_tab() {
     assert_eq!(WalletTab::default(), WalletTab::Private);
+}
+
+#[test]
+fn maintenance_reset_state_machine_rejects_competing_acquisition() {
+    let mut state = WalletMaintenanceStateMachine::default();
+    let public_generation = state
+        .try_acquire(WalletMaintenanceReset::Public, "public reset")
+        .expect("idle state acquires public reset");
+
+    assert_eq!(state.reset(), WalletMaintenanceReset::Public);
+    assert_eq!(state.status().as_deref(), Some("public reset"));
+    assert!(
+        state
+            .try_acquire(WalletMaintenanceReset::Merkle, "merkle reset")
+            .is_none()
+    );
+    assert!(state.complete(public_generation, "public reset complete"));
+    assert_eq!(state.reset(), WalletMaintenanceReset::Idle);
+    assert!(state.set_idle_status("cleanup pending"));
+    assert_eq!(state.status().as_deref(), Some("cleanup pending"));
+}
+
+#[test]
+fn maintenance_reset_state_machine_ignores_stale_completion() {
+    let mut state = WalletMaintenanceStateMachine::default();
+    let generation = state
+        .try_acquire(WalletMaintenanceReset::Merkle, "merkle reset")
+        .expect("idle state acquires merkle reset");
+
+    assert!(!state.complete(generation.wrapping_add(1), "stale completion"));
+    assert_eq!(state.reset(), WalletMaintenanceReset::Merkle);
+    assert_eq!(state.status().as_deref(), Some("merkle reset"));
+    assert!(state.complete(generation, "merkle reset complete"));
+    assert_eq!(state.reset(), WalletMaintenanceReset::Idle);
+    assert_eq!(state.status().as_deref(), Some("merkle reset complete"));
 }
 
 #[test]
@@ -133,21 +169,27 @@ fn locked_vault_screen_exposes_pre_unlock_settings_action() {
 #[test]
 fn startup_pre_unlock_state_exposes_settings_and_error_recovery() {
     assert_eq!(
-        startup_settings_action_state(true),
+        startup_settings_action_state(true, true),
         super::StartupSettingsActionState {
             settings: true,
             reset: true,
             retry: true,
+            maintenance_actions_enabled: true,
         }
     );
     assert_eq!(
-        startup_settings_action_state(false),
+        startup_settings_action_state(false, true),
         super::StartupSettingsActionState {
             settings: true,
             reset: false,
             retry: false,
+            maintenance_actions_enabled: true,
         }
     );
+    let blocked = startup_settings_action_state(true, false);
+    assert!(blocked.reset);
+    assert!(blocked.retry);
+    assert!(!blocked.maintenance_actions_enabled);
 }
 
 #[test]
@@ -203,7 +245,8 @@ fn settings_save_action_requires_restart_for_networking_changes() {
     assert!(settings_restart_action_enabled(
         &saved,
         &network_draft,
-        false
+        false,
+        true,
     ));
 
     let mut request_draft = saved.clone();
@@ -212,14 +255,22 @@ fn settings_save_action_requires_restart_for_networking_changes() {
     assert!(settings_restart_action_enabled(
         &saved,
         &request_draft,
-        false
+        false,
+        true,
     ));
 
     assert!(!settings_save_action_enabled(&saved, &request_draft, true));
     assert!(!settings_restart_action_enabled(
         &saved,
         &request_draft,
-        true
+        true,
+        true,
+    ));
+    assert!(!settings_restart_action_enabled(
+        &saved,
+        &request_draft,
+        false,
+        false,
     ));
 }
 

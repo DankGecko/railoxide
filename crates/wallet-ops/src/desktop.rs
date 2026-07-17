@@ -16,6 +16,7 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
     db: Arc<DbStore>,
     http: HttpContext,
     skip_chain_id: Option<u64>,
+    init_policy: CreatedWalletChainInitPolicy,
 ) {
     let report = initialize_new_wallet_chain_metadata_for_session(
         view_session,
@@ -23,14 +24,15 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
         db,
         http,
         skip_chain_id,
+        init_policy,
     )
     .await;
     tracing::info!(
         initialized = report.initialized,
         skipped_disabled = report.skipped_disabled,
+        skipped_unavailable = report.skipped_unavailable,
         skipped_selected = report.skipped_selected,
         skipped_existing = report.skipped_existing,
-        deployment_fallbacks = report.deployment_fallbacks,
         failed = report.failed,
         "new wallet chain metadata initialization complete"
     );

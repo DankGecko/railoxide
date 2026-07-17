@@ -52,6 +52,8 @@ mod errors;
 mod hardware;
 mod inputs;
 mod lifecycle;
+#[cfg(test)]
+pub(in crate::root) use lifecycle::vault_lock_is_allowed;
 mod selection;
 mod setup;
 mod types;

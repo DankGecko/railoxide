@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use super::{
     Address, BTreeMap, Deserialize, HardwareDerivationDescriptor, HardwareDeviceKind,
@@ -113,6 +113,8 @@ pub struct WalletMetadataBundle {
     pub hardware_descriptor: Option<HardwareDerivationDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_account: Option<HardwareRailgunAccountMetadata>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pending_create_new_chain_ids: BTreeSet<u64>,
 }
 
 impl WalletMetadataBundle {
@@ -816,6 +818,8 @@ pub(super) struct WalletMetadataWire {
     pub(super) hardware_descriptor: Option<HardwareDerivationDescriptor>,
     #[serde(default)]
     pub(super) hardware_account: Option<HardwareRailgunAccountMetadata>,
+    #[serde(default)]
+    pub(super) pending_create_new_chain_ids: BTreeSet<u64>,
 }
 
 pub(super) struct DecodedWalletMetadata {

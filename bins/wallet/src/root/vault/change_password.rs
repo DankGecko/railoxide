@@ -114,7 +114,7 @@ impl ChangeVaultPasswordDialogContent {
         }
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn submit(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
         if self.pending {
             return;
         }
@@ -175,7 +175,7 @@ impl ChangeVaultPasswordDialogContent {
                     Ok(Ok(())) => {
                         dialog.clear_inputs(window, cx);
                         let root = dialog.root.clone();
-                        root.update(cx, |root, cx| root.clear_spend_authorization(cx));
+                        root.update(cx, WalletRoot::clear_spend_authorization);
                         window.close_dialog(cx);
                     }
                     Ok(Err(error)) => {
@@ -282,8 +282,7 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         let root = cx.entity();
-        let content_root = root.clone();
-        let content = cx.new(|cx| ChangeVaultPasswordDialogContent::new(content_root, window, cx));
+        let content = cx.new(|cx| ChangeVaultPasswordDialogContent::new(root, window, cx));
         let focus_content = content.clone();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(CHANGE_VAULT_PASSWORD_DIALOG_WIDTH);

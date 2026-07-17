@@ -3,8 +3,9 @@ use super::{
     SpendGrant, StoredWalletRecord, VaultError, VaultRecordEntries, ViewUnlock, WALLET_VIEW_PREFIX,
     WalletKeys, WalletMetadataBundle, WalletSpendBundle, WalletViewBundle, Zeroizing,
     bip39_entropy_from_mnemonic, initial_derived_public_account,
-    public_account_metadata_record_entry, unlock_spend, unlock_view, wallet_metadata_record_key,
-    wallet_spend_record_key, wallet_view_record_key,
+    public_account_metadata_record_entry, unlock_spend, unlock_view,
+    wallet_chain_index_complete_record_entry, wallet_metadata_record_key, wallet_spend_record_key,
+    wallet_view_record_key,
 };
 
 impl DesktopVaultStore {
@@ -274,7 +275,7 @@ impl DesktopVaultStore {
         let spend_record = spend.encrypt_spend_bundle(wallet_id, &spend_bundle)?;
         let view_record_key = wallet_view_record_key(wallet_id);
         let spend_record_key = wallet_spend_record_key(wallet_id);
-        let mut records = Vec::with_capacity(2 + usize::from(metadata.is_some()) * 2);
+        let mut records = Vec::with_capacity(2 + usize::from(metadata.is_some()) * 3);
         records.push(view_record.to_record_entry(view_record_key.clone())?);
         records.push(spend_record.to_record_entry(spend_record_key.clone())?);
 
@@ -282,6 +283,9 @@ impl DesktopVaultStore {
             let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
             records
                 .push(record.to_record_entry(wallet_metadata_record_key(&metadata.wallet_uuid))?);
+            records.push(wallet_chain_index_complete_record_entry(
+                &metadata.wallet_uuid,
+            )?);
 
             let public_account =
                 initial_derived_public_account(wallet_id, entropy, &existing_public_accounts)?;

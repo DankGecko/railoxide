@@ -1,18 +1,20 @@
 use super::{
     ADDITIONAL_WALLET_LABEL_PREFIX, Address, BROADCASTER_BANNED_PREFIX,
-    BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, CacheKeys,
-    HARDWARE_PROFILE_PREFIX, HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareProfileMetadata,
+    BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, HARDWARE_PROFILE_PREFIX,
+    HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareProfileMetadata,
     HardwareWalletAccountIndexReservation, KEY_LEN, MnemonicBuilder, PRIMARY_WALLET_LABEL,
     PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX,
     PUBLIC_ADDRESS_BOOK_PREFIX, PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata,
     PublicAccountScope, PublicAccountSecret, PublicAccountSource, PublicAccountStatus,
     PublicAddressBookEntry, RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock,
-    WALLET_CACHE_ROW_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
+    WALLET_CHAIN_INDEX_COMPLETE_PREFIX, WALLET_CHAIN_INDEX_COMPLETE_VERSION,
+    WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
     WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
     WALLETCONNECT_SESSION_PREFIX, WalletCacheError, WalletConnectRelayIdentity,
     WalletConnectSessionRecord, WalletMetadataBundle, WalletUtxo, Zeroizing,
     bip39_mnemonic_from_entropy, generate_opaque_id,
 };
+
 use crate::parse_railgun_recipient;
 
 pub(super) fn wallet_view_record_key(wallet_id: &str) -> String {
@@ -31,27 +33,42 @@ pub(super) fn wallet_chain_metadata_record_key(wallet_chain_uuid: &str) -> Strin
     format!("{WALLET_CHAIN_METADATA_PREFIX}{wallet_chain_uuid}")
 }
 
+pub(super) fn wallet_chain_index_prefix(wallet_uuid: &str) -> String {
+    format!(
+        "{WALLET_CHAIN_INDEX_PREFIX}{}|",
+        alloy::hex::encode(wallet_uuid.as_bytes())
+    )
+}
+
+pub(super) fn wallet_chain_index_record_key(wallet_uuid: &str, wallet_chain_uuid: &str) -> String {
+    format!(
+        "{}{wallet_chain_uuid}",
+        wallet_chain_index_prefix(wallet_uuid)
+    )
+}
+
+pub(super) fn wallet_chain_index_complete_record_key(wallet_uuid: &str) -> String {
+    format!(
+        "{WALLET_CHAIN_INDEX_COMPLETE_PREFIX}{}",
+        alloy::hex::encode(wallet_uuid.as_bytes())
+    )
+}
+
+pub(super) fn wallet_chain_index_complete_record_entry(
+    wallet_uuid: &str,
+) -> Result<(String, Vec<u8>), VaultError> {
+    Ok((
+        wallet_chain_index_complete_record_key(wallet_uuid),
+        rmp_serde::to_vec_named(&WALLET_CHAIN_INDEX_COMPLETE_VERSION)?,
+    ))
+}
+
 pub(super) fn hardware_wallet_account_index_record_key(reservation_uuid: &str) -> String {
     format!("{HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX}{reservation_uuid}")
 }
 
 pub(super) fn hardware_profile_record_key(profile_id: &str) -> String {
     format!("{HARDWARE_PROFILE_PREFIX}{profile_id}")
-}
-
-pub(super) fn wallet_cache_row_prefix(wallet_chain_uuid: &str) -> String {
-    format!("{WALLET_CACHE_ROW_PREFIX}{wallet_chain_uuid}|")
-}
-
-pub(super) fn wallet_cache_row_record_key(
-    wallet_chain_uuid: &str,
-    row_id: &[u8; KEY_LEN],
-) -> String {
-    format!(
-        "{}{row_id}",
-        wallet_cache_row_prefix(wallet_chain_uuid),
-        row_id = CacheKeys::row_record_id(row_id)
-    )
 }
 
 pub(super) fn public_account_metadata_record_key(public_account_uuid: &str) -> String {

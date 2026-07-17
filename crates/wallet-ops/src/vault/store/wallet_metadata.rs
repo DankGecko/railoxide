@@ -1,12 +1,24 @@
+use local_db::WalletDeletionBatch;
+
+static WALLET_METADATA_UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) fn wallet_metadata_update_guard() -> std::sync::MutexGuard<'static, ()> {
+    WALLET_METADATA_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 use super::{
     BTreeSet, DesktopVaultStore, DesktopViewSession, EncryptedRecord, HardwareDerivationDescriptor,
-    HardwareRailgunAccountMetadata, LoadedWalletMetadata, PublicAccountScope, VaultError,
-    ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WalletMetadataBundle, WalletSource,
-    WalletSpendSource, WalletStatus, assign_missing_display_orders,
-    default_wallet_label_for_metadata, generate_opaque_id,
+    HardwareRailgunAccountMetadata, HardwareWalletSyncIntent, LoadedWalletMetadata,
+    PublicAccountScope, VaultError, ViewUnlock, WALLET_CHAIN_INDEX_COMPLETE_VERSION,
+    WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WalletCacheKey, WalletMetadataBundle,
+    WalletPrivateNamespaceId, WalletSource, WalletSpendSource, WalletStatus,
+    assign_missing_display_orders, default_wallet_label_for_metadata, generate_opaque_id,
     hardware_wallet_account_index_record_entry, next_wallet_display_order,
     public_account_metadata_record_key, public_account_secret_record_key, sort_wallet_metadata,
-    validate_wallet_label, wallet_cache_row_prefix, wallet_metadata_record_entry,
+    validate_wallet_label, wallet_chain_index_complete_record_key, wallet_chain_index_prefix,
+    wallet_chain_index_record_key, wallet_chain_metadata_record_key, wallet_metadata_record_entry,
     wallet_metadata_record_key, wallet_spend_record_key, wallet_view_record_key,
 };
 
@@ -50,6 +62,13 @@ impl DesktopVaultStore {
     ) -> Result<WalletMetadataBundle, VaultError> {
         let view = self.unlock_view(password)?;
         self.load_wallet_metadata_with_view(&view, wallet_uuid)
+    }
+
+    pub fn load_wallet_metadata_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.load_wallet_metadata_with_view(&view_session.view, view_session.wallet_id())
     }
 
     pub(super) fn load_wallet_metadata_with_view(
@@ -164,6 +183,14 @@ impl DesktopVaultStore {
         &self,
         view: &ViewUnlock,
     ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let _guard = wallet_metadata_update_guard();
+        self.list_wallet_metadata_with_view_unlocked(view)
+    }
+
+    fn list_wallet_metadata_with_view_unlocked(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
         let mut wallet_ids = self.list_wallet_ids()?;
         wallet_ids.sort();
 
@@ -207,6 +234,7 @@ impl DesktopVaultStore {
                     display_order: 0,
                     hardware_descriptor: None,
                     hardware_account: None,
+                    pending_create_new_chain_ids: BTreeSet::new(),
                 },
                 needs_persist: true,
                 missing_display_order: true,
@@ -273,7 +301,31 @@ impl DesktopVaultStore {
         source: WalletSource,
         label: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
+        self.new_wallet_metadata_with_pending_create_new_chain_ids(
+            password,
+            wallet_uuid,
+            derivation_index,
+            source,
+            label,
+            BTreeSet::new(),
+        )
+    }
+
+    pub fn new_wallet_metadata_with_pending_create_new_chain_ids(
+        &self,
+        password: &str,
+        wallet_uuid: &str,
+        derivation_index: u32,
+        source: WalletSource,
+        label: &str,
+        pending_create_new_chain_ids: BTreeSet<u64>,
+    ) -> Result<WalletMetadataBundle, VaultError> {
         let (label, display_order) = self.new_wallet_label_and_order(password, label)?;
+        let pending_create_new_chain_ids = if source == WalletSource::Generated {
+            pending_create_new_chain_ids
+        } else {
+            BTreeSet::new()
+        };
         Ok(WalletMetadataBundle {
             wallet_uuid: wallet_uuid.to_owned(),
             label,
@@ -283,6 +335,7 @@ impl DesktopVaultStore {
             display_order,
             hardware_descriptor: None,
             hardware_account: None,
+            pending_create_new_chain_ids,
         })
     }
 
@@ -293,8 +346,31 @@ impl DesktopVaultStore {
         label: &str,
         descriptor: HardwareDerivationDescriptor,
     ) -> Result<WalletMetadataBundle, VaultError> {
+        self.new_hardware_wallet_metadata_with_pending_create_new_chain_ids(
+            password,
+            wallet_uuid,
+            label,
+            descriptor,
+            BTreeSet::new(),
+        )
+    }
+
+    pub fn new_hardware_wallet_metadata_with_pending_create_new_chain_ids(
+        &self,
+        password: &str,
+        wallet_uuid: &str,
+        label: &str,
+        descriptor: HardwareDerivationDescriptor,
+        pending_create_new_chain_ids: BTreeSet<u64>,
+    ) -> Result<WalletMetadataBundle, VaultError> {
         let view = self.unlock_view(password)?;
-        self.new_hardware_wallet_metadata_with_view(&view, wallet_uuid, label, descriptor)
+        self.new_hardware_wallet_metadata_with_view(
+            &view,
+            wallet_uuid,
+            label,
+            descriptor,
+            pending_create_new_chain_ids,
+        )
     }
 
     pub fn new_hardware_wallet_metadata_with_view_unlock(
@@ -304,7 +380,30 @@ impl DesktopVaultStore {
         label: &str,
         descriptor: HardwareDerivationDescriptor,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        self.new_hardware_wallet_metadata_with_view(view, wallet_uuid, label, descriptor)
+        self.new_hardware_wallet_metadata_with_pending_create_new_chain_ids_for_view_unlock(
+            view,
+            wallet_uuid,
+            label,
+            descriptor,
+            BTreeSet::new(),
+        )
+    }
+
+    pub fn new_hardware_wallet_metadata_with_pending_create_new_chain_ids_for_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+        label: &str,
+        descriptor: HardwareDerivationDescriptor,
+        pending_create_new_chain_ids: BTreeSet<u64>,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.new_hardware_wallet_metadata_with_view(
+            view,
+            wallet_uuid,
+            label,
+            descriptor,
+            pending_create_new_chain_ids,
+        )
     }
 
     fn new_hardware_wallet_metadata_with_view(
@@ -313,6 +412,7 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
         label: &str,
         descriptor: HardwareDerivationDescriptor,
+        pending_create_new_chain_ids: BTreeSet<u64>,
     ) -> Result<WalletMetadataBundle, VaultError> {
         descriptor
             .validate()
@@ -321,6 +421,12 @@ impl DesktopVaultStore {
         Self::ensure_hardware_wallet_account_index_available(&existing, &descriptor)?;
         let label = validate_wallet_label(label, &existing, None)?;
         let display_order = next_wallet_display_order(&existing)?;
+        let pending_create_new_chain_ids =
+            if descriptor.sync_intent == HardwareWalletSyncIntent::CreateNew {
+                pending_create_new_chain_ids
+            } else {
+                BTreeSet::new()
+            };
         Ok(WalletMetadataBundle {
             wallet_uuid: wallet_uuid.to_owned(),
             label,
@@ -330,7 +436,35 @@ impl DesktopVaultStore {
             display_order,
             hardware_descriptor: Some(descriptor),
             hardware_account: None,
+            pending_create_new_chain_ids,
         })
+    }
+
+    pub fn complete_pending_create_new_chain_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        chain_type: u8,
+        chain_id: u64,
+        contract: &str,
+    ) -> Result<bool, VaultError> {
+        let _guard = wallet_metadata_update_guard();
+        let mut metadata = self.load_wallet_metadata_for_session(view_session)?;
+        if !metadata.pending_create_new_chain_ids.contains(&chain_id)
+            || self
+                .find_wallet_chain_metadata_for_session(
+                    view_session,
+                    chain_type,
+                    chain_id,
+                    contract,
+                )?
+                .is_none()
+        {
+            return Ok(false);
+        }
+
+        metadata.pending_create_new_chain_ids.remove(&chain_id);
+        self.store_wallet_metadata_with_view(&view_session.view, &metadata)?;
+        Ok(true)
     }
 
     pub fn update_wallet_label(
@@ -367,7 +501,8 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
         label: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        let mut metadata = self.list_wallet_metadata_with_view(view)?;
+        let _guard = wallet_metadata_update_guard();
+        let mut metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
         let label = validate_wallet_label(label, &metadata, Some(wallet_uuid))?;
         let Some(target) = metadata
             .iter_mut()
@@ -411,7 +546,8 @@ impl DesktopVaultStore {
         view: &ViewUnlock,
         ordered_wallet_uuids: &[String],
     ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
-        let mut metadata = self.list_wallet_metadata_with_view(view)?;
+        let _guard = wallet_metadata_update_guard();
+        let mut metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
         let active_ids = metadata
             .iter()
             .filter(|metadata| metadata.status == WalletStatus::Active)
@@ -476,7 +612,8 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
         active: bool,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        let mut metadata = self.list_wallet_metadata_with_view(view)?;
+        let _guard = wallet_metadata_update_guard();
+        let mut metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
         let active_count = metadata
             .iter()
             .filter(|metadata| metadata.status == WalletStatus::Active)
@@ -532,7 +669,8 @@ impl DesktopVaultStore {
         view_session: Option<&DesktopViewSession>,
         wallet_uuid: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        let metadata = self.list_wallet_metadata_with_view(view)?;
+        let _guard = wallet_metadata_update_guard();
+        let metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
         let Some(target) = metadata
             .iter()
             .find(|metadata| metadata.wallet_uuid == wallet_uuid)
@@ -547,47 +685,141 @@ impl DesktopVaultStore {
         if target.status == WalletStatus::Active && active_count <= 1 {
             return Err(VaultError::LastActiveWallet);
         }
+        if let Some(descriptor) = target.hardware_derivation_descriptor() {
+            let session = view_session.ok_or(VaultError::HardwareWalletViewRequiresDevice)?;
+            if session.wallet_id() != wallet_uuid {
+                return Err(VaultError::HardwareWalletIdentityMismatch);
+            }
+            session
+                .hardware_profile_session()
+                .ok_or(VaultError::HardwareWalletIdentityMismatch)?
+                .verify_descriptor(descriptor)?;
+        }
         let mut keys_to_delete = vec![
             wallet_metadata_record_key(wallet_uuid),
             wallet_view_record_key(wallet_uuid),
             wallet_spend_record_key(wallet_uuid),
         ];
-
-        let chain_records = self
+        let index_complete_key = wallet_chain_index_complete_record_key(wallet_uuid);
+        let ownership_index_complete = self
             .db
-            .list_desktop_wallet_vault_records(WALLET_CHAIN_METADATA_PREFIX)?;
-        for stored in chain_records {
-            let Some(wallet_chain_uuid) = stored.key.strip_prefix(WALLET_CHAIN_METADATA_PREFIX)
-            else {
-                continue;
-            };
-            let Ok(record) = rmp_serde::from_slice::<EncryptedRecord>(&stored.payload) else {
-                tracing::warn!(
-                    "ignoring invalid wallet chain metadata record during wallet delete"
-                );
-                continue;
-            };
-            let metadata = view_session
-                .and_then(|session| {
-                    session
-                        .decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)
-                        .ok()
-                })
-                .or_else(|| {
-                    view.decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)
-                        .ok()
-                });
-            let Some(metadata) = metadata else {
-                continue;
-            };
-            if metadata.wallet_uuid != wallet_uuid {
-                continue;
-            }
-            let cache_rows = self
+            .get_desktop_wallet_vault_record(&index_complete_key)?
+            .is_some_and(|payload| {
+                rmp_serde::from_slice::<u8>(&payload)
+                    .is_ok_and(|version| version == WALLET_CHAIN_INDEX_COMPLETE_VERSION)
+            });
+        keys_to_delete.push(index_complete_key);
+        let mut wallet_private_namespaces = BTreeSet::new();
+        let chain_index_prefix = wallet_chain_index_prefix(wallet_uuid);
+        let mut wallet_chain_uuids = BTreeSet::new();
+        let mut indexed_chain_metadata_keys = BTreeSet::new();
+
+        if !ownership_index_complete {
+            for stored in self
                 .db
-                .list_desktop_wallet_vault_records(&wallet_cache_row_prefix(wallet_chain_uuid))?;
+                .list_desktop_wallet_vault_records(WALLET_CHAIN_INDEX_PREFIX)?
+            {
+                let Some((_, wallet_chain_uuid)) = stored.key.rsplit_once('|') else {
+                    continue;
+                };
+                if !wallet_chain_uuid.is_empty() {
+                    indexed_chain_metadata_keys
+                        .insert(wallet_chain_metadata_record_key(wallet_chain_uuid));
+                }
+            }
+        }
+
+        for stored in self
+            .db
+            .list_desktop_wallet_vault_records(&chain_index_prefix)?
+        {
+            let wallet_chain_uuid = stored
+                .key
+                .strip_prefix(&chain_index_prefix)
+                .filter(|wallet_chain_uuid| !wallet_chain_uuid.is_empty())
+                .ok_or(VaultError::WalletChainMetadataUnavailable)?
+                .to_owned();
+            let chain_id = rmp_serde::from_slice::<u64>(&stored.payload)
+                .map_err(|_| VaultError::WalletChainMetadataUnavailable)?;
+            wallet_chain_uuids.insert(wallet_chain_uuid.clone());
+            wallet_private_namespaces
+                .insert((chain_id, wallet_chain_uuid.parse::<WalletCacheKey>()?));
             keys_to_delete.push(stored.key);
-            keys_to_delete.extend(cache_rows.into_iter().map(|row| row.key));
+            keys_to_delete.push(wallet_chain_metadata_record_key(&wallet_chain_uuid));
+        }
+
+        if !ownership_index_complete {
+            let chain_records = self
+                .db
+                .list_desktop_wallet_vault_records(WALLET_CHAIN_METADATA_PREFIX)?;
+            for stored in chain_records {
+                let Some(wallet_chain_uuid) = stored
+                    .key
+                    .strip_prefix(WALLET_CHAIN_METADATA_PREFIX)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let record = match rmp_serde::from_slice::<EncryptedRecord>(&stored.payload) {
+                    Ok(record) => record,
+                    Err(_) if indexed_chain_metadata_keys.contains(&stored.key) => continue,
+                    Err(_) => return Err(VaultError::WalletChainMetadataUnavailable),
+                };
+                let mut authenticated_malformed = false;
+                let metadata = view_session
+                    .and_then(|session| {
+                        match session.decrypt_wallet_chain_metadata(&wallet_chain_uuid, &record) {
+                            Ok(metadata) => Some(metadata),
+                            Err(VaultError::Decrypt) => None,
+                            Err(_) => {
+                                authenticated_malformed = true;
+                                None
+                            }
+                        }
+                    })
+                    .or_else(|| {
+                        match view.decrypt_wallet_chain_metadata(&wallet_chain_uuid, &record) {
+                            Ok(metadata) => Some(metadata),
+                            Err(VaultError::Decrypt) => None,
+                            Err(_) => {
+                                authenticated_malformed = true;
+                                None
+                            }
+                        }
+                    });
+                let Some(metadata) = metadata else {
+                    if authenticated_malformed && !indexed_chain_metadata_keys.contains(&stored.key)
+                    {
+                        return Err(VaultError::WalletChainMetadataUnavailable);
+                    }
+                    continue;
+                };
+                if metadata.wallet_uuid != wallet_uuid {
+                    continue;
+                }
+                if wallet_chain_uuids.insert(wallet_chain_uuid.clone()) {
+                    wallet_private_namespaces.insert((
+                        metadata.chain_id,
+                        wallet_chain_uuid.parse::<WalletCacheKey>()?,
+                    ));
+                }
+                keys_to_delete.push(stored.key);
+                keys_to_delete.push(wallet_chain_index_record_key(
+                    wallet_uuid,
+                    &wallet_chain_uuid,
+                ));
+            }
+        }
+
+        if !wallet_private_namespaces.is_empty() {
+            let alpha_wallet_cache_key = wallet_uuid.parse::<WalletCacheKey>()?;
+            for chain_id in wallet_private_namespaces
+                .iter()
+                .map(|(chain_id, _)| *chain_id)
+                .collect::<BTreeSet<_>>()
+            {
+                wallet_private_namespaces.insert((chain_id, alpha_wallet_cache_key.clone()));
+            }
         }
 
         for account in self.list_public_account_metadata_with_view(view)? {
@@ -604,20 +836,27 @@ impl DesktopVaultStore {
             }
         }
 
-        if let Some(descriptor) = target.hardware_descriptor.as_ref() {
+        let put_records = if let Some(descriptor) = target.hardware_derivation_descriptor() {
             let reservation = Self::hardware_wallet_account_index_reservation(descriptor);
             let record = hardware_wallet_account_index_record_entry(
                 view,
                 &generate_opaque_id()?,
                 &reservation,
             )?;
-            self.db.put_desktop_wallet_vault_records(&[record])?;
-        }
+            vec![record]
+        } else {
+            Vec::new()
+        };
+        let private_namespaces = wallet_private_namespaces
+            .into_iter()
+            .map(|(chain_id, wallet_id)| WalletPrivateNamespaceId::new(chain_id, wallet_id))
+            .collect::<Vec<_>>();
 
-        for key in keys_to_delete {
-            self.db.delete_desktop_wallet_vault_record(&key)?;
-        }
-
+        self.db.delete_wallet(&WalletDeletionBatch {
+            private_namespaces: &private_namespaces,
+            desktop_wallet_vault_delete_keys: &keys_to_delete,
+            desktop_wallet_vault_put_records: &put_records,
+        })?;
         Ok(target)
     }
 }

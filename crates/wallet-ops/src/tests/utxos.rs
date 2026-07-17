@@ -31,6 +31,7 @@ fn pending_spent_utxos_filter_planner_inputs() {
         pending_spent: vec![WalletPendingSpent {
             tree: 0,
             position: 1,
+            stable_identity: None,
             tx_hash: Some(FixedBytes::from([0x99; 32])),
             block_number: Some(20),
             block_timestamp: Some(1_700_000_020),
@@ -52,6 +53,7 @@ fn pending_overlay_rows_are_not_spendable() {
         pending_spent: vec![WalletPendingSpent {
             tree: 0,
             position: 1,
+            stable_identity: None,
             tx_hash: Some(FixedBytes::from([0x99; 32])),
             block_number: Some(20),
             block_timestamp: Some(1_700_000_020),
@@ -81,6 +83,9 @@ fn local_pending_spent_rows_are_not_spendable() {
         local_pending_spent: vec![WalletPendingSpent {
             tree: 0,
             position: 1,
+            stable_identity: Some(railgun_wallet::wallet_cache::wallet_utxo_stable_identity(
+                &confirmed,
+            )),
             tx_hash: Some(FixedBytes::from([0x99; 32])),
             block_number: None,
             block_timestamp: Some(1_700_000_020),
@@ -99,6 +104,80 @@ fn local_pending_spent_rows_are_not_spendable() {
         max_unshield_amount_from_outputs(&outputs, token),
         U256::ZERO
     );
+}
+
+#[test]
+fn retained_local_lock_matches_identical_replay_but_not_reorg_replacement() {
+    let token = address(0x11);
+    let original = utxo(token, 5, 0, 1);
+    let replacement = utxo(token, 7, 0, 1);
+    let retained_lock = WalletPendingSpent {
+        tree: 0,
+        position: 1,
+        stable_identity: Some(railgun_wallet::wallet_cache::wallet_utxo_stable_identity(
+            &original,
+        )),
+        tx_hash: Some(FixedBytes::from([0x99; 32])),
+        block_number: None,
+        block_timestamp: Some(1_700_000_020),
+    };
+    let overlay = WalletPendingOverlay {
+        local_pending_spent: vec![retained_lock],
+        ..WalletPendingOverlay::default()
+    };
+
+    assert!(
+        crate::poi_verified_unspent_utxos_from_records(std::slice::from_ref(&original), &overlay,)
+            .is_empty(),
+        "the identical input remains locked when it replays"
+    );
+    let selected = crate::poi_verified_unspent_utxos_from_records(
+        std::slice::from_ref(&replacement),
+        &overlay,
+    );
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].note.value, uint!(7_U256));
+
+    let (mut outputs, _) = utxo_outputs_from_utxos(vec![replacement.clone()]);
+    apply_pending_overlay_to_outputs(&[replacement], overlay, &mut outputs);
+    assert!(!outputs[0].local_pending_spent);
+    assert_eq!(max_send_amount_from_outputs(&outputs, token), uint!(7_U256));
+}
+
+#[test]
+fn same_position_local_intents_match_current_identity_in_either_order() {
+    let token = address(0x11);
+    let current = utxo(token, 5, 0, 1);
+    let replacement = utxo(token, 7, 0, 1);
+    let lock_for = |utxo: &WalletUtxo, marker| WalletPendingSpent {
+        tree: utxo.utxo.tree,
+        position: utxo.utxo.position,
+        stable_identity: Some(railgun_wallet::wallet_cache::wallet_utxo_stable_identity(
+            utxo,
+        )),
+        tx_hash: Some(FixedBytes::from([marker; 32])),
+        block_number: None,
+        block_timestamp: Some(1_700_000_020),
+    };
+    let current_lock = lock_for(&current, 0x91);
+    let replacement_lock = lock_for(&replacement, 0x92);
+
+    for local_pending_spent in [
+        vec![current_lock.clone(), replacement_lock.clone()],
+        vec![replacement_lock, current_lock],
+    ] {
+        let (mut outputs, _) = utxo_outputs_from_utxos(vec![current.clone()]);
+        apply_pending_overlay_to_outputs(
+            std::slice::from_ref(&current),
+            WalletPendingOverlay {
+                local_pending_spent,
+                ..WalletPendingOverlay::default()
+            },
+            &mut outputs,
+        );
+        assert!(outputs[0].local_pending_spent);
+        assert_eq!(max_send_amount_from_outputs(&outputs, token), U256::ZERO);
+    }
 }
 
 #[test]

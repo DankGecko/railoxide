@@ -390,26 +390,24 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             let pending_contexts = match &plan {
                 DesktopUnshieldPreparedPlan::Single(plan) => {
                     persist_pending_unshield_output_poi_contexts(
-                        request.session.db.as_ref(),
-                        request.chain_id,
-                        request.view_session.wallet_id(),
+                        request.session.as_ref(),
                         &plan.chunks,
                         &pre_transaction_pois.pending_pois,
                         &pre_transaction_pois.pending_poi_list_keys,
                         true,
                         !same_token_fee,
-                    )?
+                    )
+                    .await?
                 }
                 DesktopUnshieldPreparedPlan::Composite(plan) => {
                     persist_pending_composite_unshield_output_poi_contexts(
-                        request.session.db.as_ref(),
-                        request.chain_id,
-                        request.view_session.wallet_id(),
+                        request.session.as_ref(),
                         &plan.chunks,
                         &plan.private_output_roles,
                         &pre_transaction_pois.pending_pois,
                         &pre_transaction_pois.pending_poi_list_keys,
-                    )?
+                    )
+                    .await?
                 }
             };
             tracing::info!(
@@ -751,15 +749,14 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
             .await?;
             let pending_persist_started = Instant::now();
             let pending_contexts = persist_pending_send_output_poi_contexts(
-                request.session.db.as_ref(),
-                request.chain_id,
-                request.view_session.wallet_id(),
+                request.session.as_ref(),
                 &plan.chunks,
                 &pre_transaction_pois.pending_pois,
                 &pre_transaction_pois.pending_poi_list_keys,
                 true,
                 !same_token_fee,
-            )?;
+            )
+            .await?;
             tracing::info!(
                 chain_id = request.chain_id,
                 pending_contexts,

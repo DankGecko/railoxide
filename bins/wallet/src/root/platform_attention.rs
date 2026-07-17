@@ -3,6 +3,8 @@ pub(super) struct PlatformAttentionState {
 }
 
 impl PlatformAttentionState {
+    // The Windows implementation resolves a native handle at runtime and cannot be const.
+    #[allow(clippy::missing_const_for_fn)]
     pub(super) fn new(window: &gpui::Window) -> Self {
         Self {
             native: imp::NativePlatformAttentionState::new(window),

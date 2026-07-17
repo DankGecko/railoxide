@@ -19,7 +19,7 @@ struct VaultUnlockResult {
 }
 
 impl VaultUnlockResult {
-    fn new(
+    const fn new(
         session: Option<DesktopViewSession>,
         metadata: Vec<wallet_ops::vault::WalletMetadataBundle>,
         vault_view_unlock: Arc<ViewUnlock>,
@@ -36,7 +36,7 @@ impl VaultUnlockResult {
     }
 
     #[cfg(feature = "hardware")]
-    fn remembered_hardware(
+    const fn remembered_hardware(
         wallet_id: Arc<str>,
         metadata: Vec<wallet_ops::vault::WalletMetadataBundle>,
         vault_view_unlock: Arc<ViewUnlock>,
@@ -185,23 +185,22 @@ impl WalletRoot {
                 ));
             }
             if let Some(wallet) = remembered_wallet_option(&active, remembered_wallet_id.as_deref())
+                && wallet.source.is_hardware_derived()
             {
-                if wallet.source.is_hardware_derived() {
-                    #[cfg(feature = "hardware")]
-                    {
-                        return Ok(VaultUnlockResult::remembered_hardware(
-                            Arc::clone(&wallet.wallet_id),
-                            metadata,
-                            vault_view_unlock,
-                        ));
-                    }
-                    #[cfg(not(feature = "hardware"))]
-                    {
-                        tracing::warn!(
-                            wallet_id = wallet.wallet_id.as_ref(),
-                            "remembered hardware wallet cannot be opened in this build; falling back"
-                        );
-                    }
+                #[cfg(feature = "hardware")]
+                {
+                    return Ok(VaultUnlockResult::remembered_hardware(
+                        Arc::clone(&wallet.wallet_id),
+                        metadata,
+                        vault_view_unlock,
+                    ));
+                }
+                #[cfg(not(feature = "hardware"))]
+                {
+                    tracing::warn!(
+                        wallet_id = wallet.wallet_id.as_ref(),
+                        "remembered hardware wallet cannot be opened in this build; falling back"
+                    );
                 }
             }
             let session = load_preferred_password_unlockable_wallet_session(
@@ -305,7 +304,7 @@ impl WalletRoot {
     ) {
         self.open_hardware_profile_unlock_dialog_for_device(
             device_kind,
-            HardwareProfileUnlockPurpose::AddWallet,
+            HardwareProfileUnlockPurpose::Add,
             window,
             cx,
         );
@@ -448,6 +447,7 @@ impl WalletRoot {
             }
         };
         let label = self.wallet_name_from_input(cx);
+        let pending_create_new_chain_ids = self.enabled_chain_ids_for_created_wallet();
         let Some(password) = self.wallet_creation_password(window, cx) else {
             return;
         };
@@ -460,12 +460,13 @@ impl WalletRoot {
                 self.set_vault_error("Generate a recovery phrase before creating the wallet", cx);
                 return;
             };
-            let metadata = store.new_wallet_metadata(
+            let metadata = store.new_wallet_metadata_with_pending_create_new_chain_ids(
                 password.as_str(),
                 &wallet_id,
                 0,
                 WalletSource::Generated,
                 &label,
+                pending_create_new_chain_ids,
             );
             let metadata = match metadata {
                 Ok(metadata) => metadata,

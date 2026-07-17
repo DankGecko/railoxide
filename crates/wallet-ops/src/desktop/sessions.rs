@@ -1,5 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use super::*;
 
 const WALLET_SYNC_TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -7,19 +9,57 @@ const WALLET_SYNC_TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub struct WalletSessionStore {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
+    active_wallet_scope: AsyncMutex<ActiveWalletScope>,
+}
+
+#[derive(Default)]
+struct ActiveWalletScope {
+    generation: u64,
+    wallet_id: Option<String>,
+}
+
+impl ActiveWalletScope {
+    fn requires_replacement(&self, generation: u64, wallet_id: &str) -> Result<bool> {
+        if generation < self.generation {
+            return Err(eyre!(
+                "wallet session scope generation {generation} was superseded by {}",
+                self.generation
+            ));
+        }
+        if generation == self.generation
+            && self
+                .wallet_id
+                .as_deref()
+                .is_some_and(|active_wallet_id| active_wallet_id != wallet_id)
+        {
+            return Err(eyre!(
+                "wallet session scope generation {generation} is already owned by another wallet"
+            ));
+        }
+        Ok(generation > self.generation || self.wallet_id.as_deref() != Some(wallet_id))
+    }
+
+    fn replace(&mut self, generation: u64, wallet_id: String) {
+        self.generation = generation;
+        self.wallet_id = Some(wallet_id);
+    }
 }
 
 impl WalletSessionStore {
-    pub fn open(db_path: PathBuf) -> Result<Self> {
+    pub fn open(db_path: PathBuf, poi_policy: PoiReadSource) -> Result<Self> {
         let db = Arc::new(DbStore::open(DbConfig { root_dir: db_path }).wrap_err("open local db")?);
-        Ok(Self::from_db(db))
+        Ok(Self::from_db(db, poi_policy))
     }
 
     #[must_use]
-    pub fn from_db(db: Arc<DbStore>) -> Self {
-        let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
+    pub fn from_db(db: Arc<DbStore>, poi_policy: PoiReadSource) -> Self {
+        let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db), poi_policy));
 
-        Self { db, sync_manager }
+        Self {
+            db,
+            sync_manager,
+            active_wallet_scope: AsyncMutex::new(ActiveWalletScope::default()),
+        }
     }
 
     pub async fn start_view_wallet_session(
@@ -42,6 +82,10 @@ impl WalletSessionStore {
             .await
     }
 
+    pub async fn reset_public_sync_caches(&self) -> PublicSyncCachesResetReport {
+        self.sync_manager.reset_public_sync_caches().await
+    }
+
     async fn start_view_wallet_session_with_wait(
         &self,
         request: ViewWalletChainSessionRequest,
@@ -49,8 +93,14 @@ impl WalletSessionStore {
         http: &HttpContext,
         wait_until_ready: bool,
     ) -> Result<WalletSession> {
+        let wallet_id = request.view_session.wallet_id().to_owned();
+        let mut active_scope = self.active_wallet_scope.lock().await;
+        if active_scope.requires_replacement(request.wallet_scope_generation, &wallet_id)? {
+            self.sync_manager.remove_all_wallets().await;
+            active_scope.replace(request.wallet_scope_generation, wallet_id);
+        }
+
         let chain_id = request.chain_id;
-        let poi_rpc_url = request.poi_rpc_url.clone();
         let synced = setup_synced_view_wallet_with_store(
             request.view_session,
             chain_id,
@@ -60,8 +110,6 @@ impl WalletSessionStore {
             request.use_indexed_wallet_catch_up,
             request.effective_chain.clone(),
             request.poi_read_source.clone(),
-            request.poi_rpc_url.clone(),
-            request.local_poi_caches.clone(),
             request.rewind_wallet_cache,
             rpc_url_override,
             http,
@@ -72,7 +120,7 @@ impl WalletSessionStore {
         )
         .await?;
 
-        wallet_session_from_view_synced(chain_id, poi_rpc_url, synced).await
+        wallet_session_from_view_synced(chain_id, request.poi_read_source, synced).await
     }
 
     pub async fn shutdown(&self) {
@@ -82,65 +130,126 @@ impl WalletSessionStore {
 
 async fn wallet_session_from_view_synced(
     chain_id: u64,
-    poi_rpc_url: Url,
+    poi_read_source: PoiReadSource,
     synced: SyncedViewWallet,
 ) -> Result<WalletSession> {
     wallet_session_from_parts(
         chain_id,
-        poi_rpc_url,
+        poi_read_source,
         synced.db,
         synced.sync_manager,
         synced.chain_key,
         synced.start_block,
         synced.handle,
+        synced.public_data_plane,
     )
     .await
 }
 
 async fn wallet_session_from_parts(
     chain_id: u64,
-    poi_rpc_url: Url,
+    poi_read_source: PoiReadSource,
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     chain_key: ChainKey,
     start_block: u64,
     handle: WalletHandle,
+    public_data_plane: PublicDataPlaneHandle,
 ) -> Result<WalletSession> {
-    let mut rev_rx = handle.rev_rx.clone();
-    let initial_snapshot = Arc::new(snapshot_from_handle(chain_id, &handle).await);
-    let (snapshots_tx, snapshots_rx) = watch::channel(initial_snapshot);
-    let cache_key = handle.cache_key.clone();
-    let ready_rx = handle.ready_rx.clone();
-    let sync_tip_rx =
-        spawn_wallet_sync_tip_task(handle.clone(), sync_manager.chain_handle(&chain_key).await);
-    let poi_refreshing_rx = handle.poi_refreshing_rx.clone();
-    let snapshot_handle = handle.clone();
-    tokio::spawn(async move {
+    let mut core_observation_rx = handle.subscribe_observation();
+    let core_observation = core_observation_rx.borrow_and_update().clone();
+    let initial_observation =
+        wallet_session_observation(chain_id, &handle.cache_key, &core_observation)?;
+    let (observation_tx, observation_rx) = watch::channel(initial_observation);
+    let (projection_cancel_tx, mut projection_cancel_rx) = watch::channel(false);
+    let snapshot_cache_key = handle.cache_key.clone();
+    let projection_join = tokio::spawn(async move {
         loop {
-            if rev_rx.changed().await.is_err() {
-                break;
-            }
-            let snapshot = Arc::new(snapshot_from_handle(chain_id, &snapshot_handle).await);
-            if snapshots_tx.send(snapshot).is_err() {
-                break;
+            tokio::select! {
+                changed = core_observation_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let core_observation = core_observation_rx.borrow_and_update().clone();
+                    let terminal = core_observation.readiness() == &WalletReadiness::Shutdown;
+                    let observation = wallet_session_observation(
+                        chain_id,
+                        &snapshot_cache_key,
+                        &core_observation,
+                    )
+                    .expect("published wallet observation satisfies projection invariants");
+                    if observation_tx.send(observation).is_err() || terminal {
+                        break;
+                    }
+                }
+                changed = projection_cancel_rx.changed() => {
+                    if changed.is_err() || *projection_cancel_rx.borrow() {
+                        break;
+                    }
+                }
             }
         }
     });
+    let cache_key = handle.cache_key.to_string();
+    let sync_tip_rx =
+        spawn_wallet_sync_tip_task(handle.clone(), sync_manager.chain_handle(&chain_key).await);
+    let poi_refreshing_rx = handle.poi_refreshing_rx.clone();
+    let poi_artifact_cache_progress_rx = public_data_plane.poi_artifact_cache_progress_rx();
 
     Ok(WalletSession {
         chain_id,
-        poi_rpc_url,
+        poi_read_source,
         cache_key,
         start_block,
-        ready_rx,
-        snapshots_rx,
+        observation_rx,
         sync_tip_rx,
         poi_refreshing_rx,
+        poi_artifact_cache_progress_rx,
         db,
         sync_manager,
         chain_key,
         handle,
+        public_data_plane,
+        projection_cancel_tx,
+        projection_join: Mutex::new(Some(projection_join)),
     })
+}
+
+fn wallet_session_observation(
+    chain_id: u64,
+    cache_key: &str,
+    observation: &WalletObservation,
+) -> Result<WalletSessionObservation> {
+    let snapshot = Arc::new(match observation.view() {
+        WalletViewState::Current(_) => snapshot_from_view(chain_id, cache_key, observation.view())
+            .expect("observed current wallet view contains a snapshot"),
+        WalletViewState::ResetPending { .. } => empty_wallet_snapshot(chain_id, cache_key),
+        WalletViewState::Inactive { reason, .. } => {
+            if observation.readiness() != &WalletReadiness::Shutdown {
+                return Err(eyre!(
+                    "inactive wallet observation is not shut down: {reason:?}"
+                ));
+            }
+            empty_wallet_snapshot(chain_id, cache_key)
+        }
+    });
+    Ok(WalletSessionObservation {
+        snapshot,
+        readiness: observation.readiness().clone(),
+    })
+}
+
+fn empty_wallet_snapshot(chain_id: u64, cache_key: &str) -> ListUtxosOutput {
+    ListUtxosOutput {
+        chain_id,
+        cache_key: cache_key.to_string(),
+        utxo_count: 0,
+        unspent_count: 0,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: Vec::new(),
+        totals: Vec::new(),
+    }
 }
 
 fn spawn_wallet_sync_tip_task(
@@ -286,8 +395,8 @@ fn publish_wallet_sync_tip(
     true
 }
 
-fn wallet_sync_tip_from_blocks(
-    last_scanned_block: u64,
+const fn wallet_sync_tip_from_blocks(
+    last_scanned_block: Option<u64>,
     head_block: u64,
     safe_head_block: u64,
     head_last_advanced_at_unix_secs: Option<u64>,
@@ -302,7 +411,7 @@ fn wallet_sync_tip_from_blocks(
     }
 }
 
-fn update_head_advance_state(
+const fn update_head_advance_state(
     max_observed_head_block: &mut u64,
     head_last_advanced_at_unix_secs: &mut Option<u64>,
     head_block: u64,
@@ -329,6 +438,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_wallet_scope_rejects_stale_and_same_generation_replacement() {
+        let mut scope = ActiveWalletScope::default();
+        assert!(
+            scope
+                .requires_replacement(0, "wallet-a")
+                .expect("initial scope")
+        );
+        scope.replace(0, "wallet-a".to_string());
+        assert!(
+            !scope
+                .requires_replacement(0, "wallet-a")
+                .expect("same scope")
+        );
+        assert!(scope.requires_replacement(0, "wallet-b").is_err());
+        assert!(
+            scope
+                .requires_replacement(1, "wallet-a")
+                .expect("new generation of same wallet")
+        );
+
+        assert!(
+            scope
+                .requires_replacement(1, "wallet-b")
+                .expect("new scope")
+        );
+        scope.replace(1, "wallet-b".to_string());
+        assert!(scope.requires_replacement(0, "wallet-a").is_err());
+    }
+
+    #[test]
     fn head_advance_state_uses_monotonic_observed_head() {
         let mut max_observed_head_block = 100;
         let mut advanced_at = Some(10);
@@ -349,7 +488,7 @@ mod tests {
     #[test]
     fn wallet_sync_tip_publish_forces_time_driven_refresh() {
         let tip = WalletSyncTip {
-            last_scanned_block: 100,
+            last_scanned_block: Some(100),
             head_block: Some(112),
             safe_head_block: Some(100),
             head_last_advanced_at_unix_secs: Some(10),
@@ -366,7 +505,7 @@ mod tests {
         assert_eq!(*rx.borrow_and_update(), tip);
 
         let advanced_tip = WalletSyncTip {
-            last_scanned_block: 101,
+            last_scanned_block: Some(101),
             ..tip
         };
         assert!(publish_wallet_sync_tip(

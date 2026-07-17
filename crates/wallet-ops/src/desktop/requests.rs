@@ -53,6 +53,22 @@ pub enum DesktopWalletSyncStartPolicy {
     CurrentSafeHeadNoBackfill,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatedWalletChainInitPolicy {
+    InitialCreate,
+    Resumed,
+}
+
+impl CreatedWalletChainInitPolicy {
+    #[must_use]
+    pub const fn sync_start_policy(self) -> DesktopWalletSyncStartPolicy {
+        match self {
+            Self::InitialCreate => DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill,
+            Self::Resumed => DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+        }
+    }
+}
+
 impl From<vault::WalletSource> for DesktopWalletSyncStartPolicy {
     fn from(_value: vault::WalletSource) -> Self {
         Self::ImportedHistoricalBackfill
@@ -134,6 +150,7 @@ impl DesktopPrivateSpendAuthorization {
 
 pub struct ViewWalletChainSessionRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
+    pub wallet_scope_generation: u64,
     pub chain_id: u64,
     pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub sync_start_policy: DesktopWalletSyncStartPolicy,
@@ -141,8 +158,6 @@ pub struct ViewWalletChainSessionRequest {
     pub sync_to_block: Option<u64>,
     pub use_indexed_wallet_catch_up: bool,
     pub poi_read_source: PoiReadSource,
-    pub poi_rpc_url: Url,
-    pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub rewind_wallet_cache: bool,
     pub progress_tx: Option<SyncProgressSender>,
 }

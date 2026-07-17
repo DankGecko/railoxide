@@ -1,3 +1,4 @@
+use super::wallet_metadata::wallet_metadata_update_guard;
 use super::{
     BTreeSet, DesktopVaultStore, DesktopViewSession, EncryptedRecord, HARDWARE_PROFILE_PREFIX,
     HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareDerivationDescriptor, HardwareDeviceKind,
@@ -8,7 +9,8 @@ use super::{
     VaultError, VaultRecordEntries, ViewUnlock, WalletKeys, WalletMetadataBundle, WalletSource,
     WalletViewBundle, generate_opaque_id, hardware_profile_record_entry,
     hardware_wallet_account_index_record_entry, sort_hardware_profile_metadata, unlock_view,
-    wallet_metadata_record_entry, wallet_metadata_record_key, wallet_view_record_key,
+    wallet_chain_index_complete_record_entry, wallet_metadata_record_entry,
+    wallet_metadata_record_key, wallet_view_record_key,
 };
 
 fn hardware_wallet_receive_address(wallet: &WalletKeys) -> Result<String, VaultError> {
@@ -106,7 +108,7 @@ impl DesktopVaultStore {
         wallet_id: &str,
         view_access_key: &HardwareViewAccessKey,
     ) -> Result<DesktopViewSession, VaultError> {
-        let mut metadata = self.load_wallet_metadata_with_view(password_view, wallet_id)?;
+        let metadata = self.load_wallet_metadata_with_view(password_view, wallet_id)?;
         {
             let account = metadata
                 .hardware_account
@@ -140,10 +142,17 @@ impl DesktopVaultStore {
                 account.receive_address.as_deref() != Some(receive_address.as_str())
             });
         if needs_receive_address_update {
-            if let Some(account) = metadata.hardware_account.as_mut() {
+            let _guard = wallet_metadata_update_guard();
+            let mut current = self.load_wallet_metadata_with_view(password_view, wallet_id)?;
+            let account = current
+                .hardware_account
+                .as_mut()
+                .ok_or(VaultError::HardwareWalletIdentityMismatch)?;
+            hardware_session.verify_account(account)?;
+            if account.receive_address.as_deref() != Some(receive_address.as_str()) {
                 account.receive_address = Some(receive_address);
+                self.store_wallet_metadata_with_view(password_view, &current)?;
             }
-            self.store_wallet_metadata_with_view(password_view, &metadata)?;
         }
         Ok(session)
     }
@@ -647,6 +656,7 @@ impl DesktopVaultStore {
         let records = vec![
             view_record.to_record_entry(view_record_key.clone())?,
             wallet_metadata_record_entry(view, &stored_metadata)?,
+            wallet_chain_index_complete_record_entry(&stored_metadata.wallet_uuid)?,
             hardware_profile_record_entry(view, &profile)?,
             hardware_wallet_account_index_record_entry(view, &generate_opaque_id()?, &reservation)?,
         ];

@@ -84,7 +84,7 @@ async fn generate_pre_transaction_pois_for_lists(
     if poi_list_keys.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let proof_source = wallet_poi_merkle_proof_source(session, http)?;
+    let proof_source = wallet_poi_merkle_proof_source(session, http).await?;
     generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
         chunks,
         chain_type: 0,
@@ -113,22 +113,40 @@ impl WalletPoiMerkleProofSourceSelection {
     }
 }
 
-fn wallet_poi_merkle_proof_source(
+async fn wallet_poi_merkle_proof_source(
     session: &WalletSession,
     http: &HttpContext,
 ) -> Result<WalletPoiMerkleProofSourceSelection> {
-    match session.handle.poi_read_source() {
-        PoiReadSource::IndexedArtifacts(_) => {
-            let caches = session
-                .handle
-                .local_poi_caches()
-                .ok_or_else(|| eyre!("artifact POI read source missing local cache handle"))?;
-            Ok(WalletPoiMerkleProofSourceSelection::IndexedArtifacts(
-                LocalPoiMerkleProofSource::new(caches),
-            ))
+    match &session.poi_read_source {
+        PoiReadSource::IndexedArtifacts {
+            wallet_read_fallback,
+            ..
+        } => {
+            match session
+                .public_data_plane
+                .local_poi_merkle_proof_source(DEFAULT_TXID_VERSION)
+                .await
+            {
+                Ok(source) => Ok(WalletPoiMerkleProofSourceSelection::IndexedArtifacts(
+                    source,
+                )),
+                Err(error) if wallet_read_fallback.is_enabled() => {
+                    tracing::warn!(%error, "local POI proof source unavailable; using configured privacy-degraded proxy fallback");
+                    Ok(WalletPoiMerkleProofSourceSelection::PoiProxy(
+                        PoiRpcClient::with_http_client(
+                            session.poi_read_source.rpc_url().clone(),
+                            http.client.clone(),
+                        ),
+                    ))
+                }
+                Err(error) => Err(error.into()),
+            }
         }
-        PoiReadSource::PoiProxy => Ok(WalletPoiMerkleProofSourceSelection::PoiProxy(
-            PoiRpcClient::with_http_client(session.poi_rpc_url.clone(), http.client.clone()),
+        PoiReadSource::PoiProxy { .. } => Ok(WalletPoiMerkleProofSourceSelection::PoiProxy(
+            PoiRpcClient::with_http_client(
+                session.poi_read_source.rpc_url().clone(),
+                http.client.clone(),
+            ),
         )),
     }
 }
@@ -264,10 +282,8 @@ pub(crate) fn pending_unshield_output_role_plans(
     plans
 }
 
-pub(crate) fn persist_pending_send_output_poi_contexts(
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
+pub(crate) async fn persist_pending_send_output_poi_contexts(
+    session: &WalletSession,
     chunks: &[TransactionPlanChunk],
     pre_transaction_pois: &PreTransactionPoiMap,
     poi_list_keys: &[FixedBytes<32>],
@@ -276,21 +292,19 @@ pub(crate) fn persist_pending_send_output_poi_contexts(
 ) -> Result<usize> {
     let created_at = now_epoch_secs()?;
     let records = build_pending_output_poi_context_records(
-        chain_id,
-        wallet_id,
+        session.chain_id,
+        &session.cache_key,
         created_at,
         chunks,
         pre_transaction_pois,
         poi_list_keys,
         &pending_send_output_role_plans(include_broadcaster_fee, separate_fee_token),
     )?;
-    persist_pending_output_poi_context_records(db, &records)
+    create_pending_output_poi_contexts(session, &records).await
 }
 
-pub(crate) fn persist_pending_unshield_output_poi_contexts(
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
+pub(crate) async fn persist_pending_unshield_output_poi_contexts(
+    session: &WalletSession,
     chunks: &[TransactionPlanChunk],
     pre_transaction_pois: &PreTransactionPoiMap,
     poi_list_keys: &[FixedBytes<32>],
@@ -299,21 +313,19 @@ pub(crate) fn persist_pending_unshield_output_poi_contexts(
 ) -> Result<usize> {
     let created_at = now_epoch_secs()?;
     let records = build_pending_output_poi_context_records(
-        chain_id,
-        wallet_id,
+        session.chain_id,
+        &session.cache_key,
         created_at,
         chunks,
         pre_transaction_pois,
         poi_list_keys,
         &pending_unshield_output_role_plans(include_broadcaster_fee, separate_fee_token),
     )?;
-    persist_pending_output_poi_context_records(db, &records)
+    create_pending_output_poi_contexts(session, &records).await
 }
 
-pub(crate) fn persist_pending_composite_unshield_output_poi_contexts(
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
+pub(crate) async fn persist_pending_composite_unshield_output_poi_contexts(
+    session: &WalletSession,
     chunks: &[TransactionPlanChunk],
     private_output_roles: &[CompositePrivateOutputRole],
     pre_transaction_pois: &PreTransactionPoiMap,
@@ -331,15 +343,15 @@ pub(crate) fn persist_pending_composite_unshield_output_poi_contexts(
             .get(output_role.output_index)
             .ok_or_else(|| eyre!("composite output role references missing private output"))?;
         records.push(pending_output_poi_context_record(
-            chain_id,
-            wallet_id,
+            session.chain_id,
+            &session.cache_key,
             created_at,
             &chunk_context,
             note,
             pending_output_role_from_composite(output_role.role),
         ));
     }
-    persist_pending_output_poi_context_records(db, &records)
+    create_pending_output_poi_contexts(session, &records).await
 }
 
 const fn pending_output_role_from_composite(
@@ -470,7 +482,80 @@ fn pending_output_poi_context_record(
     }
 }
 
-fn persist_pending_output_poi_context_records(
+async fn create_pending_output_poi_contexts(
+    session: &WalletSession,
+    records: &[PendingOutputPoiContextRecord],
+) -> Result<usize> {
+    let intents = records
+        .iter()
+        .map(|record| PendingOutputPoiContextIntent {
+            txid_version: record.txid_version.clone(),
+            output_commitment: record.output_commitment,
+            output_npk: record.output_npk,
+            utxo_tree_in: record.utxo_tree_in,
+            railgun_txid: record.railgun_txid,
+            pre_transaction_pois_per_txid_leaf_per_list: record
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .clone(),
+            required_poi_list_keys: record.required_poi_list_keys.clone(),
+            output_role: record.output_role,
+        })
+        .collect();
+    session
+        .handle
+        .create_pending_output_poi_contexts(intents)
+        .await
+        .wrap_err("create pending output POI contexts through wallet actor")
+}
+
+#[cfg(test)]
+pub(crate) fn persist_pending_send_output_poi_contexts_for_test(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    chunks: &[TransactionPlanChunk],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+    include_broadcaster_fee: bool,
+    separate_fee_token: bool,
+) -> Result<usize> {
+    let records = build_pending_output_poi_context_records(
+        chain_id,
+        wallet_id,
+        now_epoch_secs()?,
+        chunks,
+        pre_transaction_pois,
+        poi_list_keys,
+        &pending_send_output_role_plans(include_broadcaster_fee, separate_fee_token),
+    )?;
+    persist_pending_output_poi_context_records_for_test(db, &records)
+}
+
+#[cfg(test)]
+pub(crate) fn persist_pending_unshield_output_poi_contexts_for_test(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    chunks: &[TransactionPlanChunk],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+    include_broadcaster_fee: bool,
+    separate_fee_token: bool,
+) -> Result<usize> {
+    let records = build_pending_output_poi_context_records(
+        chain_id,
+        wallet_id,
+        now_epoch_secs()?,
+        chunks,
+        pre_transaction_pois,
+        poi_list_keys,
+        &pending_unshield_output_role_plans(include_broadcaster_fee, separate_fee_token),
+    )?;
+    persist_pending_output_poi_context_records_for_test(db, &records)
+}
+
+#[cfg(test)]
+fn persist_pending_output_poi_context_records_for_test(
     db: &DbStore,
     records: &[PendingOutputPoiContextRecord],
 ) -> Result<usize> {

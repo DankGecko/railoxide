@@ -6,9 +6,11 @@ use super::{
 };
 
 impl WalletRoot {
+    // GPUI requires a mutable context for Entity::update even though it is only forwarded here.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(in crate::root) fn clear_settings_transient_status(&mut self, cx: &mut Context<'_, Self>) {
         if let Some(editor) = self.settings_editor.clone() {
-            let _ = editor.update(cx, |editor, cx| {
+            editor.update(cx, |editor, cx| {
                 editor.clear_transient_status(cx);
             });
         }

@@ -1,4 +1,4 @@
-pub(super) use std::collections::BTreeMap;
+pub(super) use std::collections::{BTreeMap, BTreeSet};
 pub(super) use std::fs;
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::Arc;
@@ -39,12 +39,13 @@ pub(super) use crate::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareE
 pub(super) use crate::{
     ApproximateTransactionShape, BlockedShieldRescueUtxoId, BroadcasterFeePolicy,
     BroadcasterFeePolicyStatus, CompositeRelayAction, CompositeRelayActionToken,
-    CompositeUnshieldLegRole, CompositeUnshieldRecipient, DesktopNativeTopUpPlan,
-    DesktopWalletChainStart, DesktopWalletSyncStartPolicy, FeeHandlingMode, ListUtxosOutput,
-    PublicBroadcasterCandidate, PublicBroadcasterFeeMargin, PublicBroadcasterResultKind,
-    PublicBroadcasterSelection, PublicBroadcasterTrustFilter, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-    SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection,
-    SelfBroadcastTipFallback, TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
+    CompositeUnshieldLegRole, CompositeUnshieldRecipient, CreatedWalletChainInitPolicy,
+    DesktopNativeTopUpPlan, DesktopWalletChainStart, DesktopWalletSyncStartPolicy, FeeHandlingMode,
+    ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
+    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
+    SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput,
+    WalletPendingOverlay, WalletPendingSpent, WalletPendingSpentMarkOutcome,
     apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
     approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
     buffered_public_broadcaster_fee, decode_public_broadcaster_response,
@@ -125,6 +126,7 @@ pub(super) fn hardware_wallet_metadata(
         display_order: 0,
         hardware_descriptor: Some(descriptor),
         hardware_account: None,
+        pending_create_new_chain_ids: BTreeSet::new(),
     }
 }
 

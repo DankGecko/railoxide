@@ -1,5 +1,17 @@
 #[cfg(feature = "hardware")]
-use super::*;
+use super::{
+    Arc, Context, DesktopVaultStore, Focusable, HardwareDerivationError, HardwareDeviceKind,
+    HardwareProfilePickerView, HardwareProfileProgressUpdate, HardwareProfileSession,
+    HardwareProfileStep, HardwareProfileStepStatus, HardwareProfileUnlockPurpose, ParentElement,
+    ScrollableElement, Styled, TrezorPassphraseMode, TrezorPinMatrixPromptState,
+    TrezorPinMatrixProvider, VaultError, ViewUnlock, WalletRoot, Window, WindowExt, Zeroize,
+    Zeroizing, app_strong_text, default_hardware_profile_label, default_hardware_profile_steps,
+    dismiss_hardware_profile_unlock_state, div, hardware_device_kind_from_source,
+    hardware_device_label, hardware_profile_hardware_error_message,
+    hardware_profile_should_reconnect_after_error, hardware_session_needs_trezor_app_passphrase,
+    hardware_wallet_creation_result_is_current, mpsc, px, secondary_dialog_content_width,
+    trezor_pin_matrix_provider, trezor_session_stale_error_message, vault_error_message,
+};
 #[cfg(not(feature = "hardware"))]
 use super::{Context, WalletRoot};
 
@@ -80,6 +92,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.next_hardware_profile_action_generation();
+        self.manage_wallets.finish_hardware_delete_unlock_dialog();
         dismiss_hardware_profile_unlock_state(&mut self.hardware_profile_unlock);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
         cx.notify();
@@ -511,6 +524,37 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.open_hardware_profile_unlock_dialog_for_wallet_purpose(
+            wallet_id,
+            HardwareProfileUnlockPurpose::Open,
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(feature = "hardware")]
+    pub(in crate::root) fn open_hardware_profile_unlock_dialog_for_wallet_deletion(
+        &mut self,
+        wallet_id: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.open_hardware_profile_unlock_dialog_for_wallet_purpose(
+            wallet_id,
+            HardwareProfileUnlockPurpose::Delete,
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(feature = "hardware")]
+    fn open_hardware_profile_unlock_dialog_for_wallet_purpose(
+        &mut self,
+        wallet_id: Arc<str>,
+        purpose: HardwareProfileUnlockPurpose,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Some(wallet) = self
             .wallet_metadata
             .iter()
@@ -523,13 +567,7 @@ impl WalletRoot {
             self.set_vault_error("Selected wallet is not hardware-derived", cx);
             return;
         };
-        self.open_hardware_profile_unlock_dialog(
-            Some(wallet_id),
-            device_kind,
-            HardwareProfileUnlockPurpose::OpenWallet,
-            window,
-            cx,
-        );
+        self.open_hardware_profile_unlock_dialog(Some(wallet_id), device_kind, purpose, window, cx);
     }
 
     #[cfg(feature = "hardware")]

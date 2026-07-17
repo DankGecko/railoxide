@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -10,6 +11,7 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr};
+use futures_util::future::join_all;
 use railgun_ui::{
     NativeUsdAnchorInfo, TokenAnchorInfo, TokenAnchorSource, lookup_token,
     native_usd_anchor_entries, native_usd_micro_value, token_anchor_entries, token_usd_micro_value,
@@ -18,7 +20,7 @@ use sync_service::ChainConfigDefaults;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval};
+use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PriceAnchorSettings};
 use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_client};
@@ -26,7 +28,10 @@ use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_
 const ANCHOR_OUTLIER_THRESHOLD_BPS: U256 = alloy::uint!(5_000_U256);
 const BPS_DENOMINATOR: U256 = alloy::uint!(10_000_U256);
 const TOKEN_ANCHOR_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
+const TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 sol! {
     interface AggregatorInterface {
@@ -316,15 +321,14 @@ async fn run_token_anchor_refresh_worker(
     )
     .await;
     let mut last_refresh = Instant::now();
-
-    let mut refresh_interval = interval(TOKEN_ANCHOR_REFRESH_INTERVAL);
-    refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    refresh_interval.tick().await;
+    let mut next_refresh =
+        last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
     loop {
         tokio::select! {
-            _ = refresh_interval.tick() => {
+            () = sleep_until(next_refresh) => {
                 refresh_token_anchor_rates(&cache, &chain_ids, &effective_chains, &token_registry, &http).await;
                 last_refresh = Instant::now();
+                next_refresh = last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
             }
             changed = wake_rx.changed() => {
                 if changed.is_err() {
@@ -333,9 +337,28 @@ async fn run_token_anchor_refresh_worker(
                 if last_refresh.elapsed() >= TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL {
                     refresh_token_anchor_rates(&cache, &chain_ids, &effective_chains, &token_registry, &http).await;
                     last_refresh = Instant::now();
+                    next_refresh = last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
                 }
             }
         }
+    }
+}
+
+fn token_anchor_refresh_delay(
+    cache: &TokenAnchorRateCache,
+    chain_ids: &[u64],
+    token_registry: &EffectiveTokenRegistry,
+) -> Duration {
+    let missing_native_rate = chain_ids
+        .iter()
+        .any(|chain_id| cache.cached_native_usd_rate(*chain_id).is_none());
+    let missing_token_rate = token_anchor_entries_for_chains(chain_ids, token_registry)
+        .into_iter()
+        .any(|entry| cache.cached_rate(entry.chain_id, entry.token).is_none());
+    if missing_native_rate || missing_token_rate {
+        TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL
+    } else {
+        TOKEN_ANCHOR_REFRESH_INTERVAL
     }
 }
 
@@ -346,6 +369,10 @@ pub async fn refresh_token_anchor_rates(
     token_registry: &EffectiveTokenRegistry,
     http: &HttpContext,
 ) {
+    tracing::debug!(
+        chain_count = chain_ids.len(),
+        "token anchor refresh started"
+    );
     let mut entries_by_chain: BTreeMap<u64, Vec<RuntimeTokenAnchorInfo>> = BTreeMap::new();
     for entry in token_anchor_entries_for_chains(chain_ids, token_registry) {
         entries_by_chain
@@ -367,21 +394,45 @@ pub async fn refresh_token_anchor_rates(
         .chain(native_entries_by_chain.keys())
         .copied()
         .collect::<BTreeSet<_>>();
+    let mut refreshes = Vec::with_capacity(refresh_chain_ids.len());
     for chain_id in refresh_chain_ids {
         let entries = entries_by_chain.remove(&chain_id).unwrap_or_default();
         let native_entries = native_entries_by_chain
             .remove(&chain_id)
             .unwrap_or_default();
-        refresh_token_anchor_rates_for_chain(
-            cache,
-            chain_id,
-            &entries,
-            &native_entries,
-            effective_chains,
-            http,
-        )
-        .await;
+        refreshes.push(async move {
+            if timeout(
+                TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT,
+                refresh_token_anchor_rates_for_chain(
+                    cache,
+                    chain_id,
+                    &entries,
+                    &native_entries,
+                    effective_chains,
+                    http,
+                ),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    chain_id,
+                    timeout_secs = TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT.as_secs(),
+                    "token anchor chain refresh timed out"
+                );
+            }
+        });
     }
+    join_all(refreshes).await;
+    let missing_native_usd_rates = chain_ids
+        .iter()
+        .filter(|chain_id| cache.cached_native_usd_rate(**chain_id).is_none())
+        .count();
+    tracing::debug!(
+        chain_count = chain_ids.len(),
+        missing_native_usd_rates,
+        "token anchor refresh complete"
+    );
     cache.notify_refreshed();
 }
 
@@ -395,23 +446,52 @@ async fn refresh_token_anchor_rates_for_chain(
 ) {
     let oracle_addresses_by_chain =
         oracle_addresses_for_token_and_native_entries(entries, native_entries);
+    refresh_token_anchor_rates_for_chain_with_fetch(
+        cache,
+        chain_id,
+        entries,
+        native_entries,
+        oracle_addresses_by_chain,
+        move |oracle_chain_id, oracle_addresses| async move {
+            fetch_oracle_answers_for_chain(
+                oracle_chain_id,
+                &oracle_addresses,
+                effective_chains,
+                http,
+            )
+            .await
+        },
+    )
+    .await;
+}
+
+async fn refresh_token_anchor_rates_for_chain_with_fetch<F, Fut>(
+    cache: &TokenAnchorRateCache,
+    chain_id: u64,
+    entries: &[RuntimeTokenAnchorInfo],
+    native_entries: &[RuntimeNativeUsdAnchorInfo],
+    oracle_addresses_by_chain: BTreeMap<u64, Vec<Address>>,
+    mut fetch_oracle_answers: F,
+) where
+    F: FnMut(u64, Vec<Address>) -> Fut,
+    Fut: Future<Output = Result<BTreeMap<Address, U256>>>,
+{
     let mut oracle_answers = BTreeMap::new();
     for (oracle_chain_id, oracle_addresses) in oracle_addresses_by_chain {
-        match fetch_oracle_answers_for_chain(
-            oracle_chain_id,
-            &oracle_addresses,
-            effective_chains,
-            http,
-        )
-        .await
-        {
+        match fetch_oracle_answers(oracle_chain_id, oracle_addresses).await {
             Ok(answers) => {
                 for (oracle_address, answer) in answers {
                     oracle_answers.insert((oracle_chain_id, oracle_address), answer);
                 }
+                store_anchor_rates_from_entries(cache, entries, &oracle_answers);
+                store_native_usd_rates_from_entries(cache, native_entries, &oracle_answers);
             }
-            Err(error) => {
-                tracing::warn!(chain_id, oracle_chain_id, %error, "failed to refresh token anchor oracles");
+            Err(_) => {
+                tracing::warn!(
+                    chain_id,
+                    oracle_chain_id,
+                    "failed to refresh token anchor oracles"
+                );
             }
         }
     }
@@ -424,6 +504,23 @@ async fn fetch_oracle_answers_for_chain(
     oracle_addresses: &[Address],
     effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
     http: &HttpContext,
+) -> Result<BTreeMap<Address, U256>> {
+    fetch_oracle_answers_for_chain_with_timeout(
+        chain_id,
+        oracle_addresses,
+        effective_chains,
+        http,
+        TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+async fn fetch_oracle_answers_for_chain_with_timeout(
+    chain_id: u64,
+    oracle_addresses: &[Address],
+    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    http: &HttpContext,
+    request_timeout: Duration,
 ) -> Result<BTreeMap<Address, U256>> {
     let (query_rpc_pool, multicall_addr) = provider_for_chain(chain_id, effective_chains, http)?;
     let mut last_error = None;
@@ -444,15 +541,27 @@ async fn fetch_oracle_answers_for_chain(
             ));
         }
 
-        match multicall.try_aggregate(false).await {
-            Ok(values) => {
+        match timeout(request_timeout, multicall.try_aggregate(false)).await {
+            Ok(Ok(values)) => {
                 results = Some(values);
                 break;
             }
-            Err(error) => {
-                tracing::warn!(chain_id, %error, rpc = %provider_handle.url, "multicall anchor oracle answers failed");
+            Ok(Err(_)) => {
+                tracing::warn!(chain_id, "multicall anchor oracle answers failed");
                 query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre::eyre!("{error}"));
+                last_error = Some(eyre::eyre!("anchor oracle RPC request failed"));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    chain_id,
+                    timeout_millis = request_timeout.as_millis(),
+                    "multicall anchor oracle answers timed out"
+                );
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(eyre::eyre!(
+                    "anchor oracle multicall timed out after {} milliseconds",
+                    request_timeout.as_millis()
+                ));
             }
         }
     }
@@ -1026,6 +1135,146 @@ mod tests {
             Some(uint!(3_000_000_000_U256))
         );
         assert_eq!(cache.cached_native_usd_rate(56), None);
+    }
+
+    #[test]
+    fn missing_native_or_token_rates_use_fast_refresh_retry() {
+        let cache = TokenAnchorRateCache::new();
+        let settings = crate::settings::WalletSettings::default();
+        let token_registry = crate::settings::build_effective_token_registry(&settings)
+            .expect("effective token registry");
+
+        assert_eq!(
+            token_anchor_refresh_delay(&cache, &[1], &token_registry),
+            TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL
+        );
+
+        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+        assert_eq!(
+            token_anchor_refresh_delay(&cache, &[1], &token_registry),
+            TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL
+        );
+
+        for entry in token_anchor_entries_for_chains(&[1], &token_registry) {
+            cache.store_rate(entry.chain_id, entry.token, U256::ONE);
+        }
+        assert_eq!(
+            token_anchor_refresh_delay(&cache, &[1], &token_registry),
+            TOKEN_ANCHOR_REFRESH_INTERVAL
+        );
+        assert_eq!(
+            token_anchor_refresh_delay(&cache, &[1, 56], &token_registry),
+            TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn oracle_multicall_timeout_bounds_unresponsive_provider() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind unresponsive RPC listener");
+        let rpc_url = format!(
+            "http://{}",
+            listener.local_addr().expect("RPC listener address")
+        );
+        let settings = crate::settings::WalletSettings::default();
+        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
+            .expect("effective chain configs");
+        effective_chains
+            .get_mut(&1)
+            .expect("Ethereum config")
+            .rpc_endpoints = vec![rpc_url];
+        let data_dir = std::env::temp_dir();
+        let http = crate::build_wallet_network_context(crate::WalletNetworkConfig {
+            network_mode: Some(crate::WalletNetworkMode::Direct),
+            proxy: None,
+            data_dir: &data_dir,
+        })
+        .await
+        .expect("direct HTTP context");
+
+        let error = fetch_oracle_answers_for_chain_with_timeout(
+            1,
+            &[address!("0x0000000000000000000000000000000000000100")],
+            &effective_chains,
+            &http,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("unresponsive oracle RPC must time out");
+
+        assert!(format!("{error:#}").contains("timed out after 25 milliseconds"));
+    }
+
+    #[tokio::test]
+    async fn successful_oracle_chain_rates_survive_later_source_timeout() {
+        let cache = TokenAnchorRateCache::new();
+        let token = address!("0x0000000000000000000000000000000000000001");
+        let pending_token = address!("0x0000000000000000000000000000000000000002");
+        let successful_oracle = address!("0x0000000000000000000000000000000000000100");
+        let pending_oracle = address!("0x0000000000000000000000000000000000000200");
+        let successful_source = RuntimeTokenAnchorSource::ChainlinkOracle {
+            chain_id: 1,
+            addr: successful_oracle,
+            token_decimals: 6,
+            oracle_decimals: 8,
+            is_inversed: false,
+        };
+        let entries = [
+            RuntimeTokenAnchorInfo {
+                chain_id: 42,
+                token,
+                anchor_sources: vec![successful_source.clone()],
+            },
+            RuntimeTokenAnchorInfo {
+                chain_id: 42,
+                token: pending_token,
+                anchor_sources: vec![RuntimeTokenAnchorSource::ChainlinkOracle {
+                    chain_id: 2,
+                    addr: pending_oracle,
+                    token_decimals: 6,
+                    oracle_decimals: 8,
+                    is_inversed: false,
+                }],
+            },
+        ];
+        let native_entries = [RuntimeNativeUsdAnchorInfo {
+            chain_id: 42,
+            anchor_sources: vec![successful_source],
+        }];
+        let oracle_addresses_by_chain =
+            oracle_addresses_for_token_and_native_entries(&entries, &native_entries);
+
+        let refresh = refresh_token_anchor_rates_for_chain_with_fetch(
+            &cache,
+            42,
+            &entries,
+            &native_entries,
+            oracle_addresses_by_chain,
+            move |oracle_chain_id, oracle_addresses| async move {
+                if oracle_chain_id == 1 {
+                    assert_eq!(oracle_addresses, vec![successful_oracle]);
+                    Ok(BTreeMap::from([(
+                        successful_oracle,
+                        uint!(3_000_00000000_U256),
+                    )]))
+                } else {
+                    assert_eq!(oracle_chain_id, 2);
+                    assert_eq!(oracle_addresses, vec![pending_oracle]);
+                    std::future::pending().await
+                }
+            },
+        );
+
+        assert!(timeout(Duration::from_millis(25), refresh).await.is_err());
+        assert_eq!(
+            cache.cached_rate(42, token),
+            Some(uint!(3_000_000_000_U256))
+        );
+        assert_eq!(
+            cache.cached_native_usd_rate(42),
+            Some(uint!(3_000_000_000_U256))
+        );
+        assert_eq!(cache.cached_rate(42, pending_token), None);
     }
 
     #[test]

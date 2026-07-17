@@ -1,5 +1,11 @@
 use super::helpers::*;
 
+fn wallet_cache_key(label: &str) -> String {
+    local_db::WalletCacheKey::from_opaque_bytes(label.as_bytes())
+        .expect("non-empty test wallet cache key")
+        .to_string()
+}
+
 #[test]
 fn manual_send_pending_output_contexts_persist_without_tx_hash() {
     let root_dir = temp_db_root();
@@ -19,10 +25,10 @@ fn manual_send_pending_output_contexts_persist_without_tx_hash() {
     let poi_list_keys = default_active_poi_list_keys();
     let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
 
-    let count = crate::persist_pending_send_output_poi_contexts(
+    let count = crate::poi_contexts::persist_pending_send_output_poi_contexts_for_test(
         &store,
         1,
-        "wallet-1",
+        &wallet_cache_key("wallet-1"),
         &[chunk],
         &pre_transaction_pois,
         &poi_list_keys,
@@ -33,14 +39,14 @@ fn manual_send_pending_output_contexts_persist_without_tx_hash() {
 
     assert_eq!(count, 2);
     let records = store
-        .list_pending_output_poi_contexts(1)
+        .list_pending_output_poi_contexts(1, &wallet_cache_key("wallet-1"))
         .expect("list pending output POI contexts");
     assert_eq!(records.len(), 2);
     let recipient = records
         .iter()
         .find(|record| record.output_role == PendingOutputPoiRole::Recipient)
         .expect("recipient context");
-    assert_eq!(recipient.wallet_id, "wallet-1");
+    assert_eq!(recipient.wallet_id, wallet_cache_key("wallet-1"));
     assert_eq!(
         recipient.output_commitment,
         FixedBytes::from(recipient_note.commitment().to_be_bytes::<32>())
@@ -80,10 +86,10 @@ fn manual_unshield_pending_output_contexts_skip_public_output_without_tx_hash() 
     let poi_list_keys = default_active_poi_list_keys();
     let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
 
-    let count = crate::persist_pending_unshield_output_poi_contexts(
+    let count = crate::poi_contexts::persist_pending_unshield_output_poi_contexts_for_test(
         &store,
         1,
-        "wallet-1",
+        &wallet_cache_key("wallet-1"),
         &[chunk],
         &pre_transaction_pois,
         &poi_list_keys,
@@ -94,7 +100,7 @@ fn manual_unshield_pending_output_contexts_skip_public_output_without_tx_hash() 
 
     assert_eq!(count, 1);
     let records = store
-        .list_pending_output_poi_contexts(1)
+        .list_pending_output_poi_contexts(1, &wallet_cache_key("wallet-1"))
         .expect("list pending output POI contexts");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].output_role, PendingOutputPoiRole::Change);
@@ -133,10 +139,10 @@ fn public_broadcaster_pending_output_contexts_include_fee_outputs() {
     let poi_list_keys = default_active_poi_list_keys();
     let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
 
-    let count = crate::persist_pending_send_output_poi_contexts(
+    let count = crate::poi_contexts::persist_pending_send_output_poi_contexts_for_test(
         &store,
         1,
-        "wallet-1",
+        &wallet_cache_key("wallet-1"),
         &[chunk],
         &pre_transaction_pois,
         &poi_list_keys,
@@ -147,7 +153,7 @@ fn public_broadcaster_pending_output_contexts_include_fee_outputs() {
 
     assert_eq!(count, 3);
     let records = store
-        .list_pending_output_poi_contexts(1)
+        .list_pending_output_poi_contexts(1, &wallet_cache_key("wallet-1"))
         .expect("list pending output POI contexts");
     assert_eq!(records.len(), 3);
     assert!(records.iter().any(|record| record.output_role
@@ -179,10 +185,10 @@ fn public_broadcaster_unshield_pending_output_contexts_skip_public_output() {
     let poi_list_keys = default_active_poi_list_keys();
     let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
 
-    let count = crate::persist_pending_unshield_output_poi_contexts(
+    let count = crate::poi_contexts::persist_pending_unshield_output_poi_contexts_for_test(
         &store,
         1,
-        "wallet-1",
+        &wallet_cache_key("wallet-1"),
         &[chunk],
         &pre_transaction_pois,
         &poi_list_keys,
@@ -193,7 +199,7 @@ fn public_broadcaster_unshield_pending_output_contexts_skip_public_output() {
 
     assert_eq!(count, 2);
     let records = store
-        .list_pending_output_poi_contexts(1)
+        .list_pending_output_poi_contexts(1, &wallet_cache_key("wallet-1"))
         .expect("list pending output POI contexts");
     assert_eq!(records.len(), 2);
     assert!(

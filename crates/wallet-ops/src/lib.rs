@@ -24,8 +24,12 @@ use broadcaster_core::transact::{
 use broadcaster_core::transact_response::DecryptedTransactResponse;
 use broadcaster_monitor::FeeRow;
 use eyre::{Report, Result, WrapErr, eyre};
-use local_db::{DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole};
+use local_db::{
+    DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletCacheKey,
+    WalletMeta,
+};
 use merkletree::tree::MerkleForest;
+pub use poi::SensitiveUrl;
 use poi::poi::{PoiRpcClient, default_active_poi_list_keys};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::prover::build_prover_cache_with_progress;
@@ -53,18 +57,25 @@ use railgun_wallet::{
 use rand::seq::IndexedRandom;
 use reqwest::Url;
 use serde::Serialize;
+pub use sync_service::types::{
+    WalletObservation, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
+};
 use sync_service::{
-    ChainConfig, ChainConfigDefaults, ChainKey, LocalPoiMerkleProofSource, SyncManager,
-    SyncProgressSender, WalletConfig, WalletHandle, WalletLocalPoiCaches, WalletPendingOverlay,
-    WalletPendingSpent,
+    ChainConfig, ChainConfigDefaults, ChainKey, LocalPoiMerkleProofSource,
+    PendingOutputPoiContextIntent, PoiArtifactCacheRetry as CorePoiArtifactCacheRetry,
+    PublicDataPlaneHandle, SyncManager, SyncProgressSender, WalletConfig, WalletHandle,
+    WalletPendingOverlay, WalletPendingSpent, WalletPendingSpentMarkOutcome, WalletViewState,
 };
 pub use sync_service::{
-    PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
-    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCacheService, PoiReadSource,
+    ChainPublicSyncCacheReset, ChainPublicSyncCacheResetResult, GlobalPoiPolicy as PoiReadSource,
+    PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
+    PersistedPublicSyncCacheResetReport, PoiArtifactCacheAttemptId, PoiArtifactCacheListProgress,
+    PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactManifestSource,
+    PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource, PublicSyncCachesResetReport,
     SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus,
+    WalletIndexedCatchUpStatus, reset_persisted_public_sync_caches,
 };
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use waku_relay::client::Client as WakuClient;
 use waku_relay::msg::ContentTopic;

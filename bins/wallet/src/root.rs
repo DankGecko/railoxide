@@ -19,9 +19,8 @@ use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
-    PoiCacheService, PoiReadSource, ProverCacheBuildProgress, PublicBalanceSnapshot,
-    PublicBroadcasterWakuClient, TokenAnchorRateCache, TokenAnchorRefreshHandle,
-    WalletNetworkHealth,
+    PoiReadSource, ProverCacheBuildProgress, PublicBalanceSnapshot, PublicBroadcasterWakuClient,
+    TokenAnchorRateCache, TokenAnchorRefreshHandle, WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
@@ -45,6 +44,7 @@ mod chain_load;
 mod dialogs;
 mod gas_fee;
 mod key_export;
+mod maintenance;
 mod manage_wallets;
 mod network;
 mod platform_attention;
@@ -83,10 +83,10 @@ use broadcaster_preferences::{
 use broadcaster_view::{BroadcasterActivityTab, BroadcasterPreferenceListKind};
 use chain_load::{
     ChainUtxoState, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, chain_load_overrides,
-    start_shared_poi_cache_service,
 };
 use gas_fee::Eip1559GasFeeEditorState;
 use key_export::KeyExportState;
+use maintenance::WalletMaintenanceController;
 use manage_wallets::ManageWalletsState;
 use network::TorExitIpQueryState;
 use private_action::{
@@ -108,7 +108,7 @@ use public_broadcaster::{
     unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
 };
 use settings::WalletSettingsEditor;
-use shell::WalletTab;
+use shell::{PoiArtifactCacheRetryAttempts, WalletTab};
 use sidebar::Activity;
 use spend_authorization::{SpendAuthorizationCache, SpendAuthorizationLifetime};
 use startup::WalletStartupRoot;
@@ -311,7 +311,6 @@ pub(crate) struct WalletRoot {
     options: WalletAppOptions,
     vault_store: Option<Arc<DesktopVaultStore>>,
     poi_read_source: PoiReadSource,
-    poi_rpc_url: reqwest::Url,
     effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
@@ -371,6 +370,7 @@ pub(crate) struct WalletRoot {
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
     logs: Entity<LogsPane>,
     settings_editor: Option<Entity<WalletSettingsEditor>>,
+    maintenance_controller: Entity<WalletMaintenanceController>,
     settings_error: Option<Arc<str>>,
     active_activity: Activity,
     active_wallet_tab: WalletTab,
@@ -390,11 +390,11 @@ pub(crate) struct WalletRoot {
     ui_state: WalletUiState,
     chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
-    poi_cache_service: Option<Arc<PoiCacheService>>,
     poi_artifact_cache_progress: BTreeMap<u64, PoiArtifactCacheProgress>,
-    poi_artifact_cache_retrying_chains: BTreeSet<u64>,
+    poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts,
     wallet_sync_lifecycle: WalletSyncLifecycle,
     wallet_sync_cleanup_tasks: Vec<WalletSyncLifecycleCleanupTask>,
+    public_sync_cache_resetting: bool,
     merkle_forest_cache_resetting: bool,
     unlock_password_input: Entity<InputState>,
     new_password_input: Entity<InputState>,
@@ -454,9 +454,6 @@ pub(crate) struct WalletRoot {
 impl Drop for WalletRoot {
     fn drop(&mut self) {
         let _ = self.waku_worker_shutdown.send(true);
-        if let Some(service) = self.poi_cache_service.as_ref() {
-            service.shutdown();
-        }
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         let _ = cleanup.spawn(&self.runtime);
     }
@@ -534,35 +531,6 @@ impl WalletRoot {
         .detach();
     }
 
-    fn spawn_poi_artifact_cache_progress_monitor(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(service) = self.poi_cache_service.as_ref().cloned() else {
-            return;
-        };
-        let mut progress_rx = service.progress_rx();
-        self.poi_artifact_cache_progress = progress_rx.borrow().clone();
-        cx.spawn(async move |this, cx| {
-            loop {
-                if progress_rx.changed().await.is_err() {
-                    break;
-                }
-                let progress = progress_rx.borrow().clone();
-                if this
-                    .update(cx, |root, cx| {
-                        for chain_id in progress.keys() {
-                            root.poi_artifact_cache_retrying_chains.remove(chain_id);
-                        }
-                        root.poi_artifact_cache_progress = progress;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
     fn set_prover_cache_build_progress(
         &mut self,
         progress: Option<ProverCacheBuildProgress>,
@@ -615,7 +583,6 @@ impl WalletRoot {
         public_broadcaster_republish_interval: Duration,
         default_allow_suspicious_broadcasters: bool,
         poi_read_source: PoiReadSource,
-        poi_rpc_url: reqwest::Url,
         runtime: Handle,
         monitor_state: Shared,
         waku: Arc<PublicBroadcasterWakuClient>,
@@ -624,7 +591,8 @@ impl WalletRoot {
         mut monitor_event_rx: EventRx,
         monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
         logs: Entity<LogsPane>,
-        startup_root: &Entity<WalletStartupRoot>,
+        startup_root: &gpui::WeakEntity<WalletStartupRoot>,
+        maintenance_controller: &Entity<WalletMaintenanceController>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -641,15 +609,15 @@ impl WalletRoot {
         for chain_id in chain_ids {
             chain_states.insert(*chain_id, ChainUtxoState::Idle);
         }
+        let active_root = cx.weak_entity();
+        maintenance_controller.update(cx, |controller, _cx| {
+            controller.set_active_root(active_root.clone());
+        });
+        let merkle_forest_cache_resetting =
+            maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Merkle;
+        let public_sync_cache_resetting =
+            maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Public;
         let vault_store = Some(vault_store);
-        let poi_cache_service = start_shared_poi_cache_service(
-            &poi_read_source,
-            &poi_rpc_url,
-            vault_store.as_ref(),
-            &http,
-            &runtime,
-            chain_ids,
-        );
         let (settings_editor, settings_error) = match vault_store.as_ref() {
             Some(store) => {
                 let db = store.db();
@@ -659,14 +627,17 @@ impl WalletRoot {
                             let store = Arc::clone(store);
                             let runtime = runtime.clone();
                             let startup_root = startup_root.clone();
-                            let active_root = cx.weak_entity();
-                            move |_| {
+                            let maintenance_controller = maintenance_controller.clone();
+                            let active_root = active_root.clone();
+                            move |cx| {
                                 WalletSettingsEditor::new(
                                     store,
                                     runtime,
                                     settings,
+                                    maintenance_controller,
                                     Some(startup_root),
                                     Some(active_root),
+                                    cx,
                                 )
                             }
                         })),
@@ -848,12 +819,11 @@ impl WalletRoot {
         let mut public_broadcaster_sort_seed = [0_u8; 32];
         rand::rng().fill(public_broadcaster_sort_seed.as_mut_slice());
         let mut anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
-        let mut root = Self {
+        let root = Self {
             selected_chain: initial_chain_id,
             options,
             vault_store,
             poi_read_source,
-            poi_rpc_url,
             effective_chain_configs,
             effective_token_registry,
             public_balance_refresh_interval,
@@ -913,6 +883,7 @@ impl WalletRoot {
             monitor,
             logs,
             settings_editor,
+            maintenance_controller: maintenance_controller.clone(),
             settings_error,
             active_activity: Activity::Wallet,
             active_wallet_tab: WalletTab::default(),
@@ -931,12 +902,12 @@ impl WalletRoot {
             ui_state,
             chain_select: chain_select.clone(),
             chain_states,
-            poi_cache_service,
             poi_artifact_cache_progress: BTreeMap::new(),
-            poi_artifact_cache_retrying_chains: BTreeSet::new(),
+            poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts::default(),
             wallet_sync_lifecycle: WalletSyncLifecycle::new(),
             wallet_sync_cleanup_tasks: Vec::new(),
-            merkle_forest_cache_resetting: false,
+            public_sync_cache_resetting,
+            merkle_forest_cache_resetting,
             unlock_password_input,
             new_password_input,
             confirm_password_input,
@@ -1409,7 +1380,6 @@ impl WalletRoot {
             }
         })
         .detach();
-        root.spawn_poi_artifact_cache_progress_monitor(cx);
         root.spawn_network_health_monitor(cx);
         root
     }

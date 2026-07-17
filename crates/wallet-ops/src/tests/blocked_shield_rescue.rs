@@ -80,6 +80,7 @@ fn blocked_shield_rescue_candidate_rejects_ineligible_utxos() {
         pending_spent: vec![WalletPendingSpent {
             tree: blocked.utxo.tree,
             position: blocked.utxo.position,
+            stable_identity: None,
             tx_hash: Some(FixedBytes::from([0x99; 32])),
             block_number: Some(20),
             block_timestamp: Some(1_700_000_020),

@@ -17,7 +17,9 @@ pub(super) const WALLET_METADATA_PREFIX: &str = "wallet-meta|";
 pub(super) const WALLET_VIEW_PREFIX: &str = "wallet-view|";
 pub(super) const WALLET_SPEND_PREFIX: &str = "wallet-spend|";
 pub(super) const WALLET_CHAIN_METADATA_PREFIX: &str = "wallet-chain-meta|";
-pub(super) const WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
+pub(super) const WALLET_CHAIN_INDEX_PREFIX: &str = "wallet-chain-index|";
+pub(super) const WALLET_CHAIN_INDEX_COMPLETE_PREFIX: &str = "wallet-chain-index-complete|";
+pub(super) const WALLET_CHAIN_INDEX_COMPLETE_VERSION: u8 = 1;
 pub(super) const HARDWARE_PROFILE_PREFIX: &str = "hardware-profile|";
 pub(super) const HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX: &str = "hardware-wallet-account-index|";
 pub const MAX_HARDWARE_RECOVERY_RANGE_COUNT: u32 = 255;
@@ -48,12 +50,19 @@ pub enum VaultError {
     Encrypt,
     #[error("decryption failed")]
     Decrypt,
+    #[error("wallet-private migration conflict for {kind}: {reason}")]
+    WalletPrivateMigrationConflict {
+        kind: &'static str,
+        reason: &'static str,
+    },
     #[error("encode failed: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("decode failed: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
     #[error("db failed: {0}")]
     Db(#[from] local_db::DbError),
+    #[error("invalid wallet cache key: {0}")]
+    InvalidWalletCacheKey(#[from] local_db::WalletCacheKeyError),
     #[error("io failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("wallet key failed: {0}")]
@@ -122,6 +131,8 @@ pub enum VaultError {
     HardwareWalletIdentityMismatch,
     #[error("hardware wallet view requires device unlock")]
     HardwareWalletViewRequiresDevice,
+    #[error("wallet-chain metadata ownership is unavailable")]
+    WalletChainMetadataUnavailable,
     #[error("wallet mnemonic is unavailable")]
     WalletMnemonicUnavailable,
     #[error("unsupported hardware custody backend {0}")]
@@ -190,6 +201,8 @@ pub enum RecordKind {
     WalletMetadata,
     WalletChainMetadata,
     WalletCacheRow,
+    PendingOutputPoiContext,
+    OutputPoiRecovery,
     HardwareProfileMetadata,
     HardwareWalletAccountIndexReservation,
     PublicAccountMetadata,
@@ -213,6 +226,8 @@ impl RecordKind {
             Self::WalletMetadata => "wallet-metadata",
             Self::WalletChainMetadata => "wallet-chain-metadata",
             Self::WalletCacheRow => "wallet-cache-row",
+            Self::PendingOutputPoiContext => "pending-output-poi-context",
+            Self::OutputPoiRecovery => "output-poi-recovery",
             Self::HardwareProfileMetadata => "hardware-profile-metadata",
             Self::HardwareWalletAccountIndexReservation => {
                 "hardware-wallet-account-index-reservation"
@@ -317,7 +332,6 @@ pub struct SoftwareRailgunSpendSigner {
 
 pub struct DesktopEncryptedWalletCacheStore {
     pub(super) db: Arc<DbStore>,
-    pub(super) view_session: Arc<DesktopViewSession>,
     pub(super) metadata: Mutex<WalletChainMetadataBundle>,
     pub(super) cache_keys: CacheKeys,
 }

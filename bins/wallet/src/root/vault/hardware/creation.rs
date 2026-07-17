@@ -1,7 +1,31 @@
+#[cfg(feature = "hardware")]
+use std::collections::BTreeSet;
+
 #[cfg(not(feature = "hardware"))]
 use super::WalletRoot;
 #[cfg(feature = "hardware")]
-use super::*;
+use super::{
+    Arc, Context, DEFAULT_HARDWARE_DERIVATION_PATH, DesktopVaultStore, DesktopViewSession,
+    Focusable, HARDWARE_PROFILE_READINESS_RETRY_INTERVAL, HardwareDerivationDescriptor,
+    HardwareDeviceKind, HardwareProfileMetadata, HardwareProfileProgressUpdate,
+    HardwareProfileSession, HardwareProfileStep, HardwareProfileStepStatus,
+    HardwareRailgunAccountMetadata, HardwareSetupErrorFocus, HardwareViewAccessKey,
+    HardwareWalletCreationError, HardwareWalletCreationResult, HardwareWalletProfile,
+    HardwareWalletSyncIntent, LedgerHardwareDerivationClient, SyntheticRailgunEntropy,
+    TrezorHardwareDerivationClient, TrezorPassphraseMode, VaultError, VaultState, ViewUnlock,
+    WalletMetadataBundle, WalletRoot, WalletSetupMode, Window, Zeroizing,
+    default_hardware_profile_label, effective_trezor_passphrase_mode, generate_opaque_id,
+    hardware_approval_error, hardware_profile_approval_prompt_for_descriptor,
+    hardware_profile_detection_should_retry,
+    hardware_profile_detection_should_suppress_initial_ledger_progress,
+    hardware_profile_detection_should_suppress_initial_trezor_progress,
+    hardware_setup_error_preserves_password, hardware_setup_vault_error_focus,
+    hardware_setup_vault_error_message, hardware_setup_vault_error_preserves_password,
+    hardware_view_access_key_from_hardware_output, mpsc, parse_bip32_path,
+    send_hardware_profile_approval_progress, send_hardware_profile_progress,
+    send_hardware_profile_readiness_progress, send_trezor_passphrase_policy_progress, sleep,
+    synthetic_entropy_from_hardware_output, trezor_pin_matrix_provider, vault_error_kind,
+};
 
 #[cfg(any(feature = "hardware", test))]
 pub(in crate::root) const fn hardware_wallet_creation_result_is_current(
@@ -56,6 +80,7 @@ impl WalletRoot {
                 return;
             }
         };
+        let pending_create_new_chain_ids = self.enabled_chain_ids_for_created_wallet();
 
         window.blur();
         self.focus_vault_input_on_render = false;
@@ -74,6 +99,7 @@ impl WalletRoot {
             device_kind,
             sync_intent,
             explicit_account_index,
+            pending_create_new_chain_ids,
         ));
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
@@ -459,6 +485,7 @@ pub(super) async fn create_hardware_profile_accounts(
     mut hardware_session: HardwareProfileSession,
     account_indices: Vec<u32>,
     sync_intent: HardwareWalletSyncIntent,
+    pending_create_new_chain_ids: BTreeSet<u64>,
     trezor_mode: TrezorPassphraseMode,
     trezor_app_passphrase: Option<Zeroizing<String>>,
     progress_tx: mpsc::UnboundedSender<HardwareProfileProgressUpdate>,
@@ -516,6 +543,7 @@ pub(super) async fn create_hardware_profile_accounts(
                     &view_access_key,
                     &hardware_session,
                     &profile_metadata,
+                    &pending_create_new_chain_ids,
                 )?);
             }
         }
@@ -573,6 +601,7 @@ pub(super) async fn create_hardware_profile_accounts(
                     &view_access_key,
                     &hardware_session,
                     &profile_metadata,
+                    &pending_create_new_chain_ids,
                 )?);
             }
         }
@@ -594,6 +623,7 @@ fn store_hardware_profile_account(
     view_access_key: &HardwareViewAccessKey,
     hardware_session: &HardwareProfileSession,
     profile_metadata: &HardwareProfileMetadata,
+    pending_create_new_chain_ids: &BTreeSet<u64>,
 ) -> Result<HardwareWalletCreationResult, HardwareWalletCreationError> {
     let wallet_id = generate_opaque_id()?;
     let label = if total == 1 {
@@ -601,12 +631,14 @@ fn store_hardware_profile_account(
     } else {
         format!("{label_prefix} account {account_index} recovery")
     };
-    let metadata = store.new_hardware_wallet_metadata_with_view_unlock(
-        vault_view_unlock,
-        &wallet_id,
-        &label,
-        descriptor,
-    )?;
+    let metadata = store
+        .new_hardware_wallet_metadata_with_pending_create_new_chain_ids_for_view_unlock(
+            vault_view_unlock,
+            &wallet_id,
+            &label,
+            descriptor,
+            pending_create_new_chain_ids.clone(),
+        )?;
     store.store_hardware_derived_wallet_from_entropy_with_metadata_for_view(
         vault_view_unlock,
         &wallet_id,
@@ -635,6 +667,7 @@ pub(super) async fn create_hardware_derived_wallet(
     device_kind: HardwareDeviceKind,
     sync_intent: HardwareWalletSyncIntent,
     explicit_account_index: Option<u32>,
+    pending_create_new_chain_ids: BTreeSet<u64>,
 ) -> Result<HardwareWalletCreationResult, HardwareWalletCreationError> {
     let path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)?;
     let (descriptor, entropy, view_access_key) = match device_kind {
@@ -695,6 +728,7 @@ pub(super) async fn create_hardware_derived_wallet(
         descriptor,
         &entropy,
         &view_access_key,
+        pending_create_new_chain_ids,
     )?;
     Ok((session, metadata))
 }
@@ -722,11 +756,18 @@ fn store_hardware_wallet(
     descriptor: HardwareDerivationDescriptor,
     entropy: &SyntheticRailgunEntropy,
     view_access_key: &HardwareViewAccessKey,
+    pending_create_new_chain_ids: BTreeSet<u64>,
 ) -> Result<(DesktopViewSession, Vec<WalletMetadataBundle>), HardwareWalletCreationError> {
     let account_index = descriptor.account_index;
     let device_kind = descriptor.device_kind;
     let profile_fingerprint = descriptor.profile_fingerprint.clone();
-    let metadata = store.new_hardware_wallet_metadata(password, wallet_id, label, descriptor)?;
+    let metadata = store.new_hardware_wallet_metadata_with_pending_create_new_chain_ids(
+        password,
+        wallet_id,
+        label,
+        descriptor,
+        pending_create_new_chain_ids,
+    )?;
     store.store_hardware_derived_wallet_from_entropy_with_metadata(
         password,
         wallet_id,

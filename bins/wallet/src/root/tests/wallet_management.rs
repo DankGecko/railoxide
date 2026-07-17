@@ -1,5 +1,118 @@
 use super::*;
-use crate::root::manage_wallets::wallet_management_switch_requires_device;
+use crate::root::manage_wallets::{
+    restart_selected_wallet_sync_after_deletion, wallet_management_delete_requires_device,
+    wallet_management_preserves_hidden_delete_session, wallet_management_switch_requires_device,
+};
+use crate::root::vault::vault_lock_is_allowed;
+
+#[test]
+fn selected_wallet_deletion_restarts_sync_after_every_failure() {
+    assert!(restart_selected_wallet_sync_after_deletion(true, false));
+    assert!(!restart_selected_wallet_sync_after_deletion(true, true));
+    assert!(!restart_selected_wallet_sync_after_deletion(false, false));
+}
+
+#[test]
+fn root_replacement_is_blocked_for_the_full_wallet_deletion() {
+    let mut state = ManageWalletsState::default();
+    assert!(state.root_replacement_is_allowed());
+
+    state.deleting_wallet_id = Some(Arc::from("deleting"));
+    assert!(!state.root_replacement_is_allowed());
+}
+
+#[test]
+fn vault_lock_is_blocked_by_maintenance_or_wallet_deletion() {
+    assert!(vault_lock_is_allowed(true, false));
+    assert!(!vault_lock_is_allowed(false, false));
+    assert!(!vault_lock_is_allowed(true, true));
+    assert!(!vault_lock_is_allowed(false, true));
+}
+
+#[test]
+fn hardware_delete_requires_matching_open_session() {
+    assert!(wallet_management_delete_requires_device(
+        "hardware-wallet",
+        WalletSource::LedgerDerived,
+        None,
+    ));
+    assert!(wallet_management_delete_requires_device(
+        "hardware-wallet",
+        WalletSource::TrezorDerived,
+        Some("different-wallet"),
+    ));
+    assert!(!wallet_management_delete_requires_device(
+        "hardware-wallet",
+        WalletSource::LedgerDerived,
+        Some("hardware-wallet"),
+    ));
+    assert!(!wallet_management_delete_requires_device(
+        "software-wallet",
+        WalletSource::Generated,
+        None,
+    ));
+}
+
+#[test]
+fn hidden_hardware_delete_session_survives_management_refresh() {
+    assert!(wallet_management_preserves_hidden_delete_session(
+        Some("hardware-wallet"),
+        Some("hardware-wallet"),
+        Some("hardware-wallet"),
+    ));
+    assert!(!wallet_management_preserves_hidden_delete_session(
+        Some("hardware-wallet"),
+        Some("other-wallet"),
+        Some("hardware-wallet"),
+    ));
+    assert!(!wallet_management_preserves_hidden_delete_session(
+        None,
+        Some("hardware-wallet"),
+        Some("hardware-wallet"),
+    ));
+}
+
+#[test]
+fn reopening_management_preserves_in_flight_deletion_guard() {
+    let mut state = ManageWalletsState::default();
+    state.editing_wallet_id = Some(Arc::from("editing"));
+    state.pending_delete_wallet_id = Some(Arc::from("pending"));
+    state.deleting_wallet_id = Some(Arc::from("deleting"));
+    state.hardware_delete_wallet_id = Some(Arc::from("hardware"));
+    state.error = Some(Arc::from("error"));
+
+    state.reset_for_open();
+
+    assert_eq!(state.deleting_wallet_id.as_deref(), Some("deleting"));
+    assert_eq!(state.hardware_delete_wallet_id.as_deref(), Some("hardware"));
+    assert!(state.editing_wallet_id.is_none());
+    assert!(state.pending_delete_wallet_id.is_none());
+    assert!(state.error.is_none());
+}
+
+#[test]
+fn cancelled_hardware_delete_unlock_clears_intent() {
+    let mut state = ManageWalletsState::default();
+    state.begin_hardware_delete_unlock(Arc::from("hardware-wallet"));
+
+    state.finish_hardware_delete_unlock_dialog();
+
+    assert!(state.hardware_delete_wallet_id.is_none());
+}
+
+#[test]
+fn completed_hardware_delete_target_open_preserves_intent_on_dialog_close() {
+    let mut state = ManageWalletsState::default();
+    state.begin_hardware_delete_unlock(Arc::from("hardware-wallet"));
+    state.mark_hardware_delete_target_opened("hardware-wallet");
+
+    state.finish_hardware_delete_unlock_dialog();
+
+    assert_eq!(
+        state.hardware_delete_wallet_id.as_deref(),
+        Some("hardware-wallet")
+    );
+}
 
 const RESTORE_TEST_PASSWORD: &str = "restore test password";
 const RESTORE_TEST_MNEMONIC: &str =
@@ -246,7 +359,7 @@ fn no_remembered_wallet_falls_back_to_first_loadable_wallet() {
 #[test]
 fn targeted_hardware_restore_auto_opens_only_remembered_account() {
     let mut state = HardwareProfileUnlockState::default();
-    state.purpose = HardwareProfileUnlockPurpose::OpenWallet;
+    state.purpose = HardwareProfileUnlockPurpose::Open;
     state.device_kind = Some(wallet_ops::hardware::HardwareDeviceKind::Ledger);
     state.target_wallet_id = Some(Arc::from("wallet-b"));
     state.accounts = vec![
@@ -265,7 +378,7 @@ fn targeted_hardware_restore_auto_opens_only_remembered_account() {
 #[test]
 fn dismissed_hardware_restore_clears_unlock_progress_state() {
     let mut state = HardwareProfileUnlockState::default();
-    state.purpose = HardwareProfileUnlockPurpose::OpenWallet;
+    state.purpose = HardwareProfileUnlockPurpose::Open;
     state.device_kind = Some(wallet_ops::hardware::HardwareDeviceKind::Ledger);
     state.target_wallet_id = Some(Arc::from("wallet-b"));
     state.in_progress = true;
@@ -756,6 +869,8 @@ fn hardware_profile_picker_filters_to_unlocked_profile_and_locks_others() {
         &[wallet_a, wallet_b],
         &profile_a.profile_id,
         Some("wallet-a"),
+        HardwareProfileUnlockPurpose::Open,
+        Some("wallet-a"),
     );
 
     assert_eq!(matching.len(), 1);
@@ -793,8 +908,13 @@ fn hardware_profile_auto_open_respects_target_wallet() {
         .expect("hardware account")
         .profile_id
         .clone();
-    let (accounts, locked) =
-        crate::root::vault::hardware_account_picker_rows(&[wallet_a, wallet_b], &profile_id, None);
+    let (accounts, locked) = crate::root::vault::hardware_account_picker_rows(
+        &[wallet_a, wallet_b],
+        &profile_id,
+        None,
+        HardwareProfileUnlockPurpose::Open,
+        Some("wallet-b"),
+    );
     assert!(locked.is_empty());
     assert_eq!(accounts.len(), 2);
 
@@ -826,7 +946,7 @@ fn hardware_profile_auto_open_respects_target_wallet() {
         "wallet-a"
     );
 
-    state.purpose = crate::root::vault::HardwareProfileUnlockPurpose::AddWallet;
+    state.purpose = crate::root::vault::HardwareProfileUnlockPurpose::Add;
     assert!(
         crate::root::vault::hardware_profile_auto_open_wallet_id(&state)
             .expect("add-wallet purpose is valid")
@@ -847,6 +967,73 @@ fn hardware_profile_auto_open_respects_target_wallet() {
         crate::root::vault::hardware_profile_auto_open_wallet_id(&state)
             .expect_err("missing target mismatches profile")
             .contains("does not match")
+    );
+}
+
+#[cfg(feature = "hardware")]
+#[test]
+fn hardware_profile_deletion_admits_only_the_inactive_target() {
+    let profile_fingerprint = "ledger:evm:0x1111111111111111111111111111111111111111";
+    let active = hardware_wallet_metadata(
+        "wallet-active",
+        "Active account",
+        wallet_ops::hardware::HardwareDeviceKind::Ledger,
+        WalletStatus::Active,
+        0,
+        0,
+        profile_fingerprint,
+    );
+    let deletion_target = hardware_wallet_metadata(
+        "wallet-delete",
+        "Hidden deletion target",
+        wallet_ops::hardware::HardwareDeviceKind::Ledger,
+        WalletStatus::Inactive,
+        1,
+        1,
+        profile_fingerprint,
+    );
+    let unrelated_inactive = hardware_wallet_metadata(
+        "wallet-hidden",
+        "Other hidden account",
+        wallet_ops::hardware::HardwareDeviceKind::Ledger,
+        WalletStatus::Inactive,
+        2,
+        2,
+        profile_fingerprint,
+    );
+    let profile_id = active
+        .hardware_account
+        .as_ref()
+        .expect("hardware account")
+        .profile_id
+        .clone();
+
+    let (accounts, locked) = crate::root::vault::hardware_account_picker_rows(
+        &[active, deletion_target, unrelated_inactive],
+        &profile_id,
+        None,
+        HardwareProfileUnlockPurpose::Delete,
+        Some("wallet-delete"),
+    );
+
+    assert!(locked.is_empty());
+    assert_eq!(
+        accounts
+            .iter()
+            .map(|row| row.wallet_id.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["wallet-active", "wallet-delete"]
+    );
+    let mut state = HardwareProfileUnlockState::default();
+    state.purpose = HardwareProfileUnlockPurpose::Delete;
+    state.target_wallet_id = Some(Arc::from("wallet-delete"));
+    state.accounts = accounts;
+    assert_eq!(
+        hardware_profile_auto_open_wallet_id(&state)
+            .expect("deletion target is eligible")
+            .expect("deletion target auto-opens")
+            .as_ref(),
+        "wallet-delete"
     );
 }
 
@@ -885,8 +1072,13 @@ fn hardware_profile_picker_marks_unsupported_backend_non_actionable() {
         custody_backend: HardwareRailgunAccountCustodyBackend::NativeRailgunV1,
     });
 
-    let (matching, locked) =
-        crate::root::vault::hardware_account_picker_rows(&[wallet], &profile.profile_id, None);
+    let (matching, locked) = crate::root::vault::hardware_account_picker_rows(
+        &[wallet],
+        &profile.profile_id,
+        None,
+        HardwareProfileUnlockPurpose::Open,
+        None,
+    );
 
     assert!(locked.is_empty());
     assert_eq!(matching.len(), 1);

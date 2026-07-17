@@ -172,6 +172,7 @@ fn trezor_model_kind(model: &str) -> TrezorModelKind {
     }
 }
 
+#[must_use]
 pub fn classify_trezor_typed_data_signing_mode(
     info: &TrezorDeviceInfo,
 ) -> HardwareTypedDataSigningMode {
@@ -333,7 +334,7 @@ pub(super) fn trezor_typed_data_value(
     };
     for index in path {
         value = trezor_typed_data_descend(
-            value,
+            &value,
             usize::try_from(*index).map_err(|_| {
                 HardwareDerivationError::InvalidDescriptor(
                     "Trezor EIP-712 member path is too large",
@@ -341,11 +342,11 @@ pub(super) fn trezor_typed_data_value(
             })?,
         )?;
     }
-    trezor_typed_data_encode_value(value)
+    trezor_typed_data_encode_value(&value)
 }
 
 fn trezor_typed_data_descend<'a>(
-    value: TrezorTypedDataValueRef<'a>,
+    value: &TrezorTypedDataValueRef<'a>,
     index: usize,
 ) -> Result<TrezorTypedDataValueRef<'a>, HardwareDerivationError> {
     match value {
@@ -380,7 +381,7 @@ fn trezor_typed_data_descend<'a>(
 }
 
 fn trezor_typed_data_encode_value(
-    value: TrezorTypedDataValueRef<'_>,
+    value: &TrezorTypedDataValueRef<'_>,
 ) -> Result<Vec<u8>, HardwareDerivationError> {
     match value {
         TrezorTypedDataValueRef::Value(HardwareEip712Value::Bool(value)) => {
@@ -395,8 +396,9 @@ fn trezor_typed_data_encode_value(
         TrezorTypedDataValueRef::Value(HardwareEip712Value::Address(value)) => {
             Ok(value.as_slice().to_vec())
         }
-        TrezorTypedDataValueRef::Value(HardwareEip712Value::FixedBytes { bytes, .. })
-        | TrezorTypedDataValueRef::Value(HardwareEip712Value::Bytes(bytes)) => Ok(bytes.clone()),
+        TrezorTypedDataValueRef::Value(
+            HardwareEip712Value::FixedBytes { bytes, .. } | HardwareEip712Value::Bytes(bytes),
+        ) => Ok(bytes.clone()),
         TrezorTypedDataValueRef::Value(HardwareEip712Value::String(value)) => {
             Ok(value.as_bytes().to_vec())
         }
@@ -460,7 +462,7 @@ fn trezor_typed_data_signature_to_alloy(
 }
 
 fn trezor_integer_byte_size(bits: usize) -> Result<u32, HardwareDerivationError> {
-    if bits == 0 || bits > 256 || bits % 8 != 0 {
+    if bits == 0 || bits > 256 || !bits.is_multiple_of(8) {
         return Err(HardwareDerivationError::InvalidDescriptor(
             "Trezor EIP-712 integer size is invalid",
         ));

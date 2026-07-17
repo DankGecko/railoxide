@@ -1,5 +1,9 @@
 #[cfg(feature = "hardware")]
-use super::*;
+use super::{
+    Arc, DesktopViewSession, HardwareDerivationError, HardwareDeviceKind, HardwareProfileMetadata,
+    HardwareProfileSession, HardwareRailgunAccountMetadata, TrezorPassphraseMode,
+    TrezorPinMatrixRequestKind, VaultError, ViewUnlock, WalletMetadataBundle, Zeroize, Zeroizing,
+};
 
 #[cfg(feature = "hardware")]
 pub(super) enum HardwareWalletCreationError {
@@ -40,8 +44,9 @@ pub(in crate::root) enum HardwareProfilePickerView {
 #[cfg(feature = "hardware")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::root) enum HardwareProfileUnlockPurpose {
-    OpenWallet,
-    AddWallet,
+    Open,
+    Add,
+    Delete,
 }
 
 #[cfg(feature = "hardware")]
@@ -131,7 +136,7 @@ impl Default for HardwareProfileUnlockState {
     fn default() -> Self {
         Self {
             target_wallet_id: None,
-            purpose: HardwareProfileUnlockPurpose::OpenWallet,
+            purpose: HardwareProfileUnlockPurpose::Open,
             device_kind: None,
             session: None,
             profile: None,

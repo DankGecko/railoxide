@@ -8,9 +8,11 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         VaultError::KeySeparation => "key_separation",
         VaultError::Encrypt => "encrypt",
         VaultError::Decrypt => "decrypt",
+        VaultError::WalletPrivateMigrationConflict { .. } => "wallet_private_migration_conflict",
         VaultError::Encode(_) => "encode",
         VaultError::Decode(_) => "decode",
         VaultError::Db(_) => "db",
+        VaultError::InvalidWalletCacheKey(_) => "invalid_wallet_cache_key",
         VaultError::Io(_) => "io",
         VaultError::Key(_) => "key",
         VaultError::UnsupportedVersion(_) => "unsupported_version",
@@ -51,6 +53,7 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         }
         VaultError::HardwareWalletIdentityMismatch => "hardware_wallet_identity_mismatch",
         VaultError::HardwareWalletViewRequiresDevice => "hardware_wallet_view_requires_device",
+        VaultError::WalletChainMetadataUnavailable => "wallet_chain_metadata_unavailable",
         VaultError::WalletMnemonicUnavailable => "wallet_mnemonic_unavailable",
         VaultError::UnsupportedHardwareCustodyBackend(_) => "unsupported_hardware_custody_backend",
         VaultError::InvalidHardwareAccountRecoveryRange => {
@@ -79,6 +82,9 @@ pub(in crate::root) fn vault_error_message(error: &VaultError) -> Arc<str> {
         }
         VaultError::HardwareWalletViewRequiresDevice => {
             "Connect the matching hardware wallet to view this account.".into()
+        }
+        VaultError::WalletChainMetadataUnavailable => {
+            "Wallet sync metadata could not be verified. Open each wallet to finish migration, then retry.".into()
         }
         VaultError::WalletMnemonicUnavailable => {
             "Mnemonic seed export is unavailable for hardware-derived wallets.".into()

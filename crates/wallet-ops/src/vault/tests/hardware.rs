@@ -8,12 +8,14 @@ fn hardware_derived_wallet_stores_view_and_descriptor_without_spend_entropy() {
     let wallet_id = "hardware-wallet";
     let descriptor = test_hardware_descriptor(0);
     let wallet = test_hardware_wallet(descriptor.account_index);
+    let pending_chain_ids = BTreeSet::from([1, 137]);
     let metadata = store
-        .new_hardware_wallet_metadata(
+        .new_hardware_wallet_metadata_with_pending_create_new_chain_ids(
             TEST_PASSWORD,
             wallet_id,
             "Ledger wallet",
             descriptor.clone(),
+            pending_chain_ids.clone(),
         )
         .expect("hardware metadata");
 
@@ -49,6 +51,7 @@ fn hardware_derived_wallet_stores_view_and_descriptor_without_spend_entropy() {
         .expect("load hardware metadata");
     assert_eq!(loaded.source, WalletSource::LedgerDerived);
     assert_eq!(loaded.hardware_descriptor, Some(descriptor.clone()));
+    assert_eq!(loaded.pending_create_new_chain_ids, pending_chain_ids);
     let hardware_account = loaded
         .hardware_account
         .as_ref()
@@ -98,6 +101,29 @@ fn hardware_derived_wallet_stores_view_and_descriptor_without_spend_entropy() {
         store.load_spend_bundle(&mut grant, wallet_id),
         Err(VaultError::VaultNotFound)
     ));
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn recovered_hardware_wallet_metadata_never_infers_pending_create_new_chains() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let mut descriptor = test_hardware_descriptor(0);
+    descriptor.sync_intent = HardwareWalletSyncIntent::RecoverExisting;
+
+    let metadata = store
+        .new_hardware_wallet_metadata_with_pending_create_new_chain_ids(
+            TEST_PASSWORD,
+            "recovered-hardware-wallet",
+            "Recovered hardware",
+            descriptor,
+            BTreeSet::from([1, 137]),
+        )
+        .expect("create recovered hardware metadata");
+
+    assert!(metadata.pending_create_new_chain_ids.is_empty());
 
     drop(store);
     drop(db);
@@ -273,9 +299,10 @@ fn hardware_cache_keys_require_hardware_view_context() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 #[test]
-fn chain_metadata_lookup_skips_foreign_view_records() {
+fn unindexed_hardware_metadata_does_not_require_hiding_for_software_deletion() {
     let (root_dir, db, store) = desktop_store_with_vault();
-    let software_session = import_wallet_with_metadata(&store, "chain-software", "Software");
+    let software_wallet_id = "11111111111111111111111111111111";
+    let software_session = import_wallet_with_metadata(&store, software_wallet_id, "Software");
     let descriptor = test_hardware_descriptor(0);
     let wallet = test_hardware_wallet(0);
     let hardware_metadata = store
@@ -314,9 +341,63 @@ fn chain_metadata_lookup_skips_foreign_view_records() {
             },
         )
         .expect("store hardware chain metadata");
+    let later_hardware_chain = WalletChainMetadataBundle {
+        wallet_chain_uuid: "999-hardware-chain".to_owned(),
+        wallet_uuid: "chain-hardware".to_owned(),
+        chain_type: 0,
+        chain_id: 56,
+        contract: "0x3333333333333333333333333333333333333333".to_owned(),
+        start_block: 2,
+        last_scanned_block: 1,
+        last_scanned_block_hash: None,
+        poi_read_source: None,
+    };
+    store
+        .store_wallet_chain_metadata_with_session(&hardware_session, &later_hardware_chain)
+        .expect("store later hardware chain metadata");
+    for key in [
+        wallet_chain_index_record_key("chain-hardware", "000-hardware-chain"),
+        wallet_chain_index_record_key("chain-hardware", &later_hardware_chain.wallet_chain_uuid),
+        wallet_chain_index_complete_record_key("chain-hardware"),
+    ] {
+        db.delete_desktop_wallet_vault_record(&key)
+            .expect("remove legacy ownership record");
+    }
+    store
+        .find_wallet_chain_metadata_for_session(
+            &hardware_session,
+            0,
+            1,
+            "0x1111111111111111111111111111111111111111",
+        )
+        .expect("scan legacy hardware metadata")
+        .expect("requested hardware metadata");
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_index_record_key(
+            "chain-hardware",
+            &later_hardware_chain.wallet_chain_uuid,
+        ))
+        .expect("load later hardware ownership index")
+        .is_some()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_index_complete_record_key(
+            "chain-hardware",
+        ))
+        .expect("load hardware ownership completeness")
+        .is_some()
+    );
+    let unindexed_hardware_key =
+        wallet_chain_index_record_key("chain-hardware", "000-hardware-chain");
+    db.delete_desktop_wallet_vault_record(&unindexed_hardware_key)
+        .expect("remove foreign hardware ownership index");
+    db.delete_desktop_wallet_vault_record(&wallet_chain_index_complete_record_key(
+        software_wallet_id,
+    ))
+    .expect("remove software creation-time completeness");
     let expected = WalletChainMetadataBundle {
-        wallet_chain_uuid: "999-software-chain".to_owned(),
-        wallet_uuid: "chain-software".to_owned(),
+        wallet_chain_uuid: "22222222222222222222222222222222".to_owned(),
+        wallet_uuid: software_wallet_id.to_owned(),
         chain_type: 0,
         chain_id: 1,
         contract: "0x2222222222222222222222222222222222222222".to_owned(),
@@ -345,6 +426,35 @@ fn chain_metadata_lookup_skips_foreign_view_records() {
     assert_eq!(found.contract, expected.contract);
     assert_eq!(found.start_block, expected.start_block);
     assert_eq!(found.last_scanned_block, expected.last_scanned_block);
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_index_complete_record_key(
+            software_wallet_id,
+        ))
+        .expect("load software ownership completeness")
+        .is_some()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&unindexed_hardware_key)
+            .expect("load foreign hardware ownership index")
+            .is_none()
+    );
+
+    store
+        .delete_wallet_for_session(&software_session, software_wallet_id)
+        .expect("delete software wallet with foreign hardware metadata");
+    let first_hardware_metadata_key = wallet_chain_metadata_record_key("000-hardware-chain");
+    assert!(
+        db.get_desktop_wallet_vault_record(&first_hardware_metadata_key)
+            .expect("load retained first hardware metadata")
+            .is_some()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_metadata_record_key(
+            &later_hardware_chain.wallet_chain_uuid,
+        ))
+        .expect("load retained later hardware metadata")
+        .is_some()
+    );
 
     drop(store);
     drop(db);
@@ -863,6 +973,12 @@ fn deleted_hardware_wallet_account_index_remains_reserved() {
     store
         .delete_wallet_for_session(&hardware_session, "hardware-wallet-0")
         .expect("delete hardware wallet");
+    assert_eq!(
+        db.list_desktop_wallet_vault_records(HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX)
+            .expect("list deletion-time hardware index reservation")
+            .len(),
+        1
+    );
 
     assert_eq!(
         store
@@ -1005,7 +1121,7 @@ fn permanent_wallet_delete_purges_hardware_private_chain_cache_records() {
     let (root_dir, db, store) = desktop_store_with_vault();
     let _software_session =
         import_wallet_with_metadata(&store, "software-delete-survivor", "Software");
-    let hardware_wallet_id = "hardware-delete-wallet";
+    let hardware_wallet_id = "68617264776172652d64656c65746521";
     let descriptor = test_hardware_descriptor(0);
     let wallet = test_hardware_wallet(0);
     let metadata = store
@@ -1037,8 +1153,10 @@ fn permanent_wallet_delete_purges_hardware_private_chain_cache_records() {
         )
         .expect("hardware chain metadata");
     let wallet_chain_uuid = chain_metadata.wallet_chain_uuid;
-    let cache_row_key = wallet_cache_row_record_key(&wallet_chain_uuid, &[0x33; KEY_LEN]);
-    db.put_desktop_wallet_vault_record(&cache_row_key, b"hardware cache row")
+    let wallet_cache_key = wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .expect("hardware wallet cache key");
+    db.put_wallet_utxo(&wallet_cache_key, "hardware-row", b"hardware cache row")
         .expect("store hardware cache row");
     assert!(
         store
@@ -1055,7 +1173,6 @@ fn permanent_wallet_delete_purges_hardware_private_chain_cache_records() {
         wallet_metadata_record_key(hardware_wallet_id),
         wallet_view_record_key(hardware_wallet_id),
         wallet_chain_metadata_record_key(&wallet_chain_uuid),
-        cache_row_key,
     ] {
         assert!(
             db.get_desktop_wallet_vault_record(&key)
@@ -1064,15 +1181,20 @@ fn permanent_wallet_delete_purges_hardware_private_chain_cache_records() {
             "expected {key} to be deleted"
         );
     }
+    assert!(
+        db.list_wallet_utxos(&wallet_cache_key)
+            .expect("list deleted hardware cache")
+            .is_empty()
+    );
 
     drop(store);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 #[test]
-fn permanent_wallet_delete_with_password_view_deletes_hardware_metadata() {
+fn permanent_wallet_delete_refuses_password_or_wrong_wallet_session() {
     let (root_dir, db, store) = desktop_store_with_vault();
-    let _software_session =
+    let software_session =
         import_wallet_with_metadata(&store, "software-delete-survivor", "Software");
     let hardware_wallet_id = "hardware-delete-password-view";
     let descriptor = test_hardware_descriptor(0);
@@ -1106,30 +1228,43 @@ fn permanent_wallet_delete_with_password_view_deletes_hardware_metadata() {
         )
         .expect("hardware chain metadata");
     let wallet_chain_uuid = chain_metadata.wallet_chain_uuid;
-    let cache_row_key = wallet_cache_row_record_key(&wallet_chain_uuid, &[0x33; KEY_LEN]);
-    db.put_desktop_wallet_vault_record(&cache_row_key, b"hardware cache row")
+    let wallet_cache_key = wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .expect("hardware wallet cache key");
+    db.put_wallet_utxo(&wallet_cache_key, "hardware-row", b"hardware cache row")
         .expect("store hardware cache row");
 
+    assert!(matches!(
+        store.delete_wallet_for_session(&software_session, hardware_wallet_id),
+        Err(VaultError::HardwareWalletIdentityMismatch)
+    ));
     let view = store.unlock_view(TEST_PASSWORD).expect("password view");
-    let deleted = store
-        .delete_wallet_with_view_unlock(&view, hardware_wallet_id)
-        .expect("delete hardware wallet metadata");
-
-    assert_eq!(deleted.wallet_uuid, hardware_wallet_id);
+    assert!(matches!(
+        store.delete_wallet_with_view_unlock(&view, hardware_wallet_id),
+        Err(VaultError::HardwareWalletViewRequiresDevice)
+    ));
+    let mut account_only_metadata = store
+        .list_wallet_metadata_with_view_unlock(&view, true)
+        .expect("list hardware metadata")
+        .into_iter()
+        .find(|metadata| metadata.wallet_uuid == hardware_wallet_id)
+        .expect("hardware metadata present");
+    account_only_metadata.hardware_descriptor = None;
+    store
+        .store_wallet_metadata(TEST_PASSWORD, &account_only_metadata)
+        .expect("store account-only hardware metadata");
+    assert!(matches!(
+        store.delete_wallet_with_view_unlock(&view, hardware_wallet_id),
+        Err(VaultError::HardwareWalletViewRequiresDevice)
+    ));
+    assert!(matches!(
+        store.delete_wallet_for_session(&software_session, hardware_wallet_id),
+        Err(VaultError::HardwareWalletIdentityMismatch)
+    ));
     for key in [
         wallet_metadata_record_key(hardware_wallet_id),
         wallet_view_record_key(hardware_wallet_id),
-    ] {
-        assert!(
-            db.get_desktop_wallet_vault_record(&key)
-                .expect("load deleted hardware metadata record")
-                .is_none(),
-            "expected {key} to be deleted"
-        );
-    }
-    for key in [
         wallet_chain_metadata_record_key(&wallet_chain_uuid),
-        cache_row_key,
     ] {
         assert!(
             db.get_desktop_wallet_vault_record(&key)
@@ -1138,6 +1273,12 @@ fn permanent_wallet_delete_with_password_view_deletes_hardware_metadata() {
             "expected {key} to remain without hardware private view"
         );
     }
+    assert_eq!(
+        db.list_wallet_utxos(&wallet_cache_key)
+            .expect("list retained hardware private cache")
+            .len(),
+        1
+    );
 
     drop(store);
     drop(db);

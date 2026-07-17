@@ -55,6 +55,7 @@ use wallet_ops::{
 use crate::assets::RailgunActionIcon;
 
 use super::WalletRoot;
+use super::maintenance::{WalletMaintenanceController, WalletMaintenanceReset};
 use super::startup::WalletStartupRoot;
 use super::ui_helpers::{
     ConfirmationDialogProps, confirmation_dialog, dialog_content_max_height, dialog_max_height,

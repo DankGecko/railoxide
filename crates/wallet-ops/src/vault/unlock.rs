@@ -4,8 +4,8 @@ use super::{
     Mac, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret,
     PublicAddressBookEntry, RecordKind, SecretKey, VaultError, WalletChainMetadataBundle,
     WalletConnectRelayIdentity, WalletConnectSessionRecord, WalletMetadataBundle,
-    WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload,
-    decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
+    WalletMetadataWire, WalletPrivateRecordKind, WalletSpendBundle, WalletViewBundle, Zeroizing,
+    decrypt_payload, decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -123,6 +123,7 @@ impl ViewUnlock {
                 display_order: wire.display_order.unwrap_or_default(),
                 hardware_descriptor: wire.hardware_descriptor,
                 hardware_account: wire.hardware_account,
+                pending_create_new_chain_ids: wire.pending_create_new_chain_ids,
             },
             missing_lifecycle_fields,
             missing_display_order,
@@ -464,6 +465,20 @@ pub struct CacheKeys {
 }
 
 impl CacheKeys {
+    const fn private_record_kind(kind: WalletPrivateRecordKind) -> RecordKind {
+        match kind {
+            WalletPrivateRecordKind::PendingOutputPoiContext => RecordKind::PendingOutputPoiContext,
+            WalletPrivateRecordKind::OutputPoiRecovery => RecordKind::OutputPoiRecovery,
+        }
+    }
+
+    const fn private_record_domain(kind: WalletPrivateRecordKind) -> &'static [u8] {
+        match kind {
+            WalletPrivateRecordKind::PendingOutputPoiContext => b"pending-output-poi-context",
+            WalletPrivateRecordKind::OutputPoiRecovery => b"output-poi-recovery",
+        }
+    }
+
     /// # Panics
     ///
     /// Panics only if HMAC rejects a fixed-size SHA-256 key, which should be
@@ -505,6 +520,60 @@ impl CacheKeys {
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         let record_id = Self::row_record_id(row_id);
         decrypt_payload(&self.data, RecordKind::WalletCacheRow, &record_id, record)
+    }
+
+    /// # Panics
+    ///
+    /// Panics only if HMAC rejects a fixed-size SHA-256 key, which should be
+    /// unreachable for the selected MAC implementation.
+    #[must_use]
+    pub fn private_row_id(
+        &self,
+        kind: WalletPrivateRecordKind,
+        wallet_chain_namespace: &str,
+        semantic_id: &[u8],
+    ) -> [u8; KEY_LEN] {
+        let mut mac = HmacSha256::new_from_slice(self.index.expose_secret())
+            .expect("HMAC accepts any key length");
+        mac.update(b"wallet-private-row:v2");
+        mac.update(Self::private_record_domain(kind));
+        mac.update(&(wallet_chain_namespace.len() as u64).to_be_bytes());
+        mac.update(wallet_chain_namespace.as_bytes());
+        mac.update(&(semantic_id.len() as u64).to_be_bytes());
+        mac.update(semantic_id);
+        mac.finalize().into_bytes().into()
+    }
+
+    pub fn encrypt_private_row(
+        &self,
+        kind: WalletPrivateRecordKind,
+        wallet_chain_namespace: &str,
+        row_id: &[u8; KEY_LEN],
+        plaintext: &[u8],
+    ) -> Result<EncryptedRecord, VaultError> {
+        let record_id = format!("{wallet_chain_namespace}:{}", Self::row_record_id(row_id));
+        encrypt_payload(
+            &self.data,
+            Self::private_record_kind(kind),
+            &record_id,
+            plaintext,
+        )
+    }
+
+    pub fn decrypt_private_row(
+        &self,
+        kind: WalletPrivateRecordKind,
+        wallet_chain_namespace: &str,
+        row_id: &[u8; KEY_LEN],
+        record: &EncryptedRecord,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        let record_id = format!("{wallet_chain_namespace}:{}", Self::row_record_id(row_id));
+        decrypt_payload(
+            &self.data,
+            Self::private_record_kind(kind),
+            &record_id,
+            record,
+        )
     }
 }
 

@@ -8,12 +8,12 @@ use broadcaster_monitor_waku::{
 };
 use eyre::WrapErr;
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
-    div, img, prelude::FluentBuilder as _, px, rgb,
+    App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
+    Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    IconName, Root, Sizable, WindowExt, button::ButtonVariants, progress::Progress as UiProgress,
-    spinner::Spinner,
+    Disableable, IconName, Root, Sizable, WindowExt, button::ButtonVariants,
+    progress::Progress as UiProgress, spinner::Spinner,
 };
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -39,7 +39,10 @@ use super::settings::{
     startup_settings_action_state,
 };
 use super::shell::{WalletAppOptions, render_wallet_hero_screen, render_wallet_window_frame};
-use super::{WalletRoot, format_report_chain, rgb_with_alpha, scrollable_dialog_content};
+use super::{
+    WalletMaintenanceController, WalletRoot, format_report_chain, rgb_with_alpha,
+    scrollable_dialog_content,
+};
 
 struct WalletStartupReady {
     http: HttpContext,
@@ -57,7 +60,6 @@ struct WalletStartupReady {
     public_broadcaster_republish_interval: Duration,
     default_allow_suspicious_broadcasters: bool,
     poi_read_source: PoiReadSource,
-    poi_rpc_url: reqwest::Url,
 }
 
 enum StartupNetworkContext {
@@ -77,6 +79,7 @@ pub(super) struct WalletStartupRoot {
     error: Option<Arc<str>>,
     vault_store: Option<Arc<DesktopVaultStore>>,
     wallet_root: Option<Entity<WalletRoot>>,
+    maintenance_controller: Entity<WalletMaintenanceController>,
     startup_generation: u64,
 }
 
@@ -90,7 +93,7 @@ impl WalletStartupRoot {
         chain_ids: &[u64],
         logs: LogStore,
         window: &Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
         let chain_ids = chain_ids.to_vec();
         let progress = WalletNetworkProgress::initial();
@@ -103,6 +106,14 @@ impl WalletStartupRoot {
                 ))),
             ),
         };
+        let maintenance_controller = cx.new({
+            let runtime = runtime.clone();
+            move |_| WalletMaintenanceController::new(runtime)
+        });
+        cx.observe(&maintenance_controller, |_root, _controller, cx| {
+            cx.notify();
+        })
+        .detach();
         let root = Self {
             options,
             runtime,
@@ -115,6 +126,7 @@ impl WalletStartupRoot {
             error,
             vault_store: vault_store.clone(),
             wallet_root: None,
+            maintenance_controller,
             startup_generation: 1,
         };
         if let Some(vault_store) = vault_store {
@@ -243,7 +255,8 @@ impl WalletStartupRoot {
             )
         });
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
-        let startup_root = cx.entity();
+        let startup_root = cx.weak_entity();
+        let maintenance_controller = self.maintenance_controller.clone();
         let root = cx.new(|cx| {
             WalletRoot::new(
                 self.options.clone(),
@@ -261,7 +274,6 @@ impl WalletStartupRoot {
                 ready.public_broadcaster_republish_interval,
                 ready.default_allow_suspicious_broadcasters,
                 ready.poi_read_source,
-                ready.poi_rpc_url,
                 self.runtime.clone(),
                 monitor_state,
                 ready.waku,
@@ -271,6 +283,7 @@ impl WalletStartupRoot {
                 monitor,
                 logs,
                 &startup_root,
+                &maintenance_controller,
                 window,
                 cx,
             )
@@ -301,7 +314,16 @@ impl WalletStartupRoot {
     }
 
     pub(super) fn retry_startup(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        if !self.maintenance_controller.read(cx).is_idle() {
+            return;
+        }
         self.retry_startup_with_network_context(None, window, cx);
+    }
+
+    pub(super) fn root_replacement_is_allowed(&self, cx: &App) -> bool {
+        self.wallet_root
+            .as_ref()
+            .is_none_or(|root| root.read(cx).root_replacement_is_allowed())
     }
 
     pub(super) fn retry_startup_with_network_context(
@@ -310,6 +332,12 @@ impl WalletStartupRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.maintenance_controller.read(cx).is_idle() {
+            return;
+        }
+        if !self.root_replacement_is_allowed(cx) {
+            return;
+        }
         let vault_store = match self.startup_vault_store() {
             Ok(store) => store,
             Err(message) => {
@@ -319,6 +347,9 @@ impl WalletStartupRoot {
             }
         };
         self.startup_generation = self.startup_generation.saturating_add(1);
+        self.maintenance_controller.update(cx, |controller, _cx| {
+            controller.clear_active_root();
+        });
         self.wallet_root = None;
         self.error = None;
         self.progress = WalletNetworkProgress::initial();
@@ -342,6 +373,9 @@ impl WalletStartupRoot {
     }
 
     fn reset_settings_and_retry(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        if !self.maintenance_controller.read(cx).is_idle() {
+            return;
+        }
         let store = match self.startup_vault_store() {
             Ok(store) => store,
             Err(message) => {
@@ -367,15 +401,18 @@ impl WalletStartupRoot {
                 match load_wallet_settings(db.as_ref()) {
                     Ok(settings) => {
                         let runtime = self.runtime.clone();
-                        let startup_root = root.clone();
+                        let startup_root = root.downgrade();
+                        let maintenance_controller = self.maintenance_controller.clone();
                         (
-                            Some(cx.new(move |_| {
+                            Some(cx.new(move |cx| {
                                 WalletSettingsEditor::new(
                                     store,
                                     runtime,
                                     settings,
+                                    maintenance_controller,
                                     Some(startup_root),
                                     None,
+                                    cx,
                                 )
                             })),
                             None,
@@ -400,7 +437,8 @@ impl WalletStartupRoot {
             ),
         };
         let (dialog_width, content_height, dialog_max_height) = settings_dialog_dimensions(window);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        let maintenance_controller = self.maintenance_controller.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let reset_root = root.clone();
             let retry_root = root.clone();
             let content = if let Some(editor) = editor.clone() {
@@ -428,18 +466,19 @@ impl WalletStartupRoot {
                             .justify_end()
                             .gap_2()
                             .child(
-                                app_button("startup-settings-reset", "Reset settings").on_click(
-                                    move |_event, window, cx| {
+                                app_button("startup-settings-reset", "Reset settings")
+                                    .disabled(!maintenance_controller.read(&*cx).is_idle())
+                                    .on_click(move |_event, window, cx| {
                                         window.close_all_dialogs(cx);
                                         reset_root.update(cx, |root, cx| {
                                             root.reset_settings_and_retry(window, cx);
                                         });
-                                    },
-                                ),
+                                    }),
                             )
                             .child(
                                 app_button("startup-settings-retry", "Retry startup")
                                     .primary()
+                                    .disabled(!maintenance_controller.read(&*cx).is_idle())
                                     .on_click(move |_event, window, cx| {
                                         window.close_all_dialogs(cx);
                                         retry_root.update(cx, |root, cx| {
@@ -468,7 +507,9 @@ impl WalletStartupRoot {
             theme::INFO
         };
         let percent = self.progress.percent.unwrap_or(0);
-        let action_state = startup_settings_action_state(has_error);
+        let maintenance_idle = self.maintenance_controller.read(cx).is_idle();
+        let maintenance_status = self.maintenance_controller.read(cx).status();
+        let action_state = startup_settings_action_state(has_error, maintenance_idle);
         let stage = if has_error {
             "Network startup failed"
         } else {
@@ -535,6 +576,19 @@ impl WalletStartupRoot {
                             ),
                     ),
             )
+            .when_some(maintenance_status, |this, status| {
+                this.child(
+                    div()
+                        .mt(px(14.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .bg(rgb(theme::SURFACE))
+                        .p(px(12.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(SharedString::from(status.to_string())),
+                )
+            })
             .child(
                 div()
                     .mt(px(16.0))
@@ -580,6 +634,7 @@ impl WalletStartupRoot {
                         .when(action_state.reset, |this| {
                             this.child(
                                 app_button("wallet-startup-reset-settings", "Reset settings")
+                                    .disabled(!action_state.maintenance_actions_enabled)
                                     .on_click(move |_event, window, cx| {
                                         reset_root.update(cx, |root, cx| {
                                             root.reset_settings_and_retry(window, cx);
@@ -591,6 +646,7 @@ impl WalletStartupRoot {
                             this.child(
                                 app_button("wallet-startup-retry", "Retry startup")
                                     .primary()
+                                    .disabled(!action_state.maintenance_actions_enabled)
                                     .on_click(move |_event, window, cx| {
                                         retry_root.update(cx, |root, cx| {
                                             root.retry_startup(window, cx);
@@ -697,10 +753,6 @@ async fn build_wallet_startup(
     let poi_read_source = settings
         .poi_read_source()
         .map_err(|error| eyre::eyre!("wallet POI settings are invalid: {error}"))?;
-    let poi_rpc_url = settings
-        .poi_rpc_url()
-        .map_err(|error| eyre::eyre!("wallet POI RPC settings are invalid: {error}"))?;
-
     let http = startup_http_context(
         &options,
         &settings,
@@ -797,7 +849,6 @@ async fn build_wallet_startup(
             .broadcaster
             .allow_suspicious_broadcasters_by_default,
         poi_read_source,
-        poi_rpc_url,
     })
 }
 

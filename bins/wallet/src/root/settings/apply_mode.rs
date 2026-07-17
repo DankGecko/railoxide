@@ -57,8 +57,9 @@ pub(in crate::root) fn settings_restart_action_enabled(
     saved: &WalletSettings,
     draft: &WalletSettings,
     has_validation_error: bool,
+    root_replacement_allowed: bool,
 ) -> bool {
-    !has_validation_error && draft != saved
+    root_replacement_allowed && !has_validation_error && draft != saved
 }
 
 pub(in crate::root) fn settings_restart_reuses_active_network(

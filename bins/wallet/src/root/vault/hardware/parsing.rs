@@ -1,7 +1,9 @@
 #[cfg(not(feature = "hardware"))]
 use super::HardwareWalletSyncIntent;
 #[cfg(feature = "hardware")]
-use super::*;
+use super::{
+    Address, HardwareProfileBindingKind, HardwareProfileSession, HardwareWalletSyncIntent,
+};
 
 #[cfg(any(feature = "hardware", test))]
 use wallet_ops::hardware::HARDENED_BIP32_INDEX;

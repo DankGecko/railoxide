@@ -22,11 +22,21 @@ fn serializes_relay_publish_rpc() {
         ttl: 300,
         tag: 1102,
     };
-    let serialized = serde_json::to_string(&rpc.request(7)).unwrap();
+    let serialized = serde_json::to_value(rpc.request(7)).unwrap();
 
     assert_eq!(
         serialized,
-        r#"{"id":"7","jsonrpc":"2.0","method":"irn_publish","params":{"message":"payload","tag":1102,"topic":"topic-a","ttl":300}}"#
+        json!({
+            "id": "7",
+            "jsonrpc": "2.0",
+            "method": "irn_publish",
+            "params": {
+                "message": "payload",
+                "tag": 1102,
+                "topic": "topic-a",
+                "ttl": 300,
+            },
+        })
     );
 }
 

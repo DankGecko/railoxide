@@ -179,10 +179,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    pub(super) fn retry_poi_recovery(
-        session: Option<Arc<wallet_ops::WalletSession>>,
-        cx: &mut App,
-    ) {
+    pub(super) fn retry_poi_recovery(session: Option<Arc<wallet_ops::WalletSession>>, cx: &App) {
         let Some(session) = session else {
             return;
         };

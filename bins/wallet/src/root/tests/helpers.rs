@@ -1,4 +1,4 @@
-pub(super) use std::collections::BTreeMap;
+pub(super) use std::collections::{BTreeMap, BTreeSet};
 pub(super) use std::fs;
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::Arc;
@@ -245,5 +245,6 @@ pub(super) fn wallet_metadata(
         display_order,
         hardware_descriptor: None,
         hardware_account: None,
+        pending_create_new_chain_ids: BTreeSet::new(),
     }
 }

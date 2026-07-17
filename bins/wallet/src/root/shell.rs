@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -27,8 +30,8 @@ use ui::icons;
 use ui::logs::LogStore;
 use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
-    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletNetworkMode, WalletSyncTip,
+    PoiArtifactCacheAttemptId, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
+    PoiArtifactCacheProgress, PublicScanSource, WalletNetworkMode, WalletSyncTip,
 };
 
 use crate::assets::{
@@ -59,6 +62,93 @@ pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
 pub(super) const LINK_COPIED_MESSAGE: &str = "Link copied to clipboard!";
 pub(super) const RAILOXIDE_REPOSITORY_URL: &str = "https://github.com/triamazikamno/railoxide";
 pub(super) const TELEGRAM_URL: &str = "https://t.me/railoxide";
+
+#[derive(Default)]
+pub(super) struct PoiArtifactCacheRetryAttempts {
+    active: BTreeMap<u64, PoiArtifactCacheRetryAttempt>,
+    next_request_token: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PoiArtifactCacheRetryAttempt {
+    request_token: Option<u64>,
+    attempt_id: Option<PoiArtifactCacheAttemptId>,
+}
+
+impl PoiArtifactCacheRetryAttempts {
+    pub(super) fn begin(&mut self, chain_id: u64) -> Option<u64> {
+        let request_token = self.next_request_token.checked_add(1)?;
+        match self.active.entry(chain_id) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(entry) => {
+                self.next_request_token = request_token;
+                entry.insert(PoiArtifactCacheRetryAttempt {
+                    request_token: Some(request_token),
+                    attempt_id: None,
+                });
+                Some(request_token)
+            }
+        }
+    }
+
+    pub(super) fn bind(
+        &mut self,
+        chain_id: u64,
+        request_token: u64,
+        attempt_id: PoiArtifactCacheAttemptId,
+    ) -> bool {
+        let Some(attempt) = self.active.get_mut(&chain_id) else {
+            return false;
+        };
+        if attempt.request_token != Some(request_token) || attempt.attempt_id.is_some() {
+            return false;
+        }
+        attempt.request_token = None;
+        attempt.attempt_id = Some(attempt_id);
+        true
+    }
+
+    pub(super) fn cancel_pending(&mut self, chain_id: u64, request_token: u64) -> bool {
+        match self.active.entry(chain_id) {
+            Entry::Occupied(entry)
+                if entry.get().request_token == Some(request_token)
+                    && entry.get().attempt_id.is_none() =>
+            {
+                entry.remove();
+                true
+            }
+            Entry::Occupied(_) | Entry::Vacant(_) => false,
+        }
+    }
+
+    pub(super) fn finish(&mut self, chain_id: u64, attempt_id: PoiArtifactCacheAttemptId) -> bool {
+        match self.active.entry(chain_id) {
+            Entry::Occupied(entry) if entry.get().attempt_id == Some(attempt_id) => {
+                entry.remove();
+                true
+            }
+            Entry::Occupied(_) | Entry::Vacant(_) => false,
+        }
+    }
+
+    pub(super) fn matches_progress(
+        &self,
+        chain_id: u64,
+        progress: &PoiArtifactCacheProgress,
+    ) -> bool {
+        self.active
+            .get(&chain_id)
+            .is_some_and(|attempt| attempt.attempt_id == Some(progress.attempt_id))
+    }
+
+    pub(super) fn contains(&self, chain_id: u64) -> bool {
+        self.active.contains_key(&chain_id)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.active.clear();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum WalletTab {
@@ -672,7 +762,7 @@ impl WalletRoot {
         ppoi_presence_status(
             state.poi_refreshing(),
             state.poi_refresh_session().is_some(),
-            self.poi_cache_service.is_some(),
+            self.poi_read_source.is_indexed_artifacts(),
             self.selected_chain_poi_artifact_progress(),
             counts,
         )
@@ -690,28 +780,91 @@ impl WalletRoot {
 
     fn retry_selected_poi_artifact_cache_refresh(&mut self, cx: &mut Context<'_, Self>) {
         let chain_id = self.selected_chain;
-        if !self.poi_artifact_cache_retrying_chains.insert(chain_id) {
+        let Some(request_token) = self.poi_artifact_cache_retry_attempts.begin(chain_id) else {
             return;
-        }
+        };
         cx.notify();
 
-        let Some(service) = self.poi_cache_service.clone() else {
-            self.poi_artifact_cache_retrying_chains.remove(&chain_id);
+        let Some(session) = self
+            .chain_states
+            .get(&chain_id)
+            .and_then(ChainUtxoState::poi_refresh_session)
+        else {
+            self.poi_artifact_cache_retry_attempts
+                .cancel_pending(chain_id, request_token);
             cx.notify();
             return;
         };
+        let retry_wallet_generation = self.active_wallet_generation;
+        let retry_session = session.clone();
         cx.spawn(async move |root, cx| {
-            let started = service.retry_poi_artifact_cache_refresh(chain_id).await;
-            if !started {
-                tracing::debug!(
-                    chain_id,
-                    "skipping POI artifact cache retry without active cache service"
-                );
-                let _ = root.update(cx, |root, cx| {
-                    root.poi_artifact_cache_retrying_chains.remove(&chain_id);
+            let retry = match session.retry_poi_artifact_cache().await {
+                Ok(retry) => retry,
+                Err(error) => {
+                    let _ = root.update(cx, |root, cx| {
+                        let attempt_released = root
+                            .poi_artifact_cache_retry_attempts
+                            .cancel_pending(chain_id, request_token);
+                        if attempt_released {
+                            cx.notify();
+                        }
+                        let session_is_current = root
+                            .chain_states
+                            .get(&chain_id)
+                            .and_then(ChainUtxoState::poi_refresh_session)
+                            .is_some_and(|current| Arc::ptr_eq(&current, &retry_session));
+                        if attempt_released
+                            && ppoi_retry_completion_is_current(
+                                root.active_wallet_generation,
+                                retry_wallet_generation,
+                                session_is_current,
+                            )
+                        {
+                            tracing::warn!(
+                                chain_id,
+                                %error,
+                                "failed to admit PPOI corpus refresh retry"
+                            );
+                        }
+                    });
+                    return;
+                }
+            };
+            let attempt_id = retry.attempt_id();
+            let _ = root.update(cx, |root, cx| {
+                if root
+                    .poi_artifact_cache_retry_attempts
+                    .bind(chain_id, request_token, attempt_id)
+                {
                     cx.notify();
-                });
-            }
+                }
+            });
+            let result = retry.wait().await;
+            let _ = root.update(cx, |root, cx| {
+                let attempt_released = root
+                    .poi_artifact_cache_retry_attempts
+                    .finish(chain_id, attempt_id);
+                if attempt_released {
+                    cx.notify();
+                }
+                let session_is_current = root
+                    .chain_states
+                    .get(&chain_id)
+                    .and_then(ChainUtxoState::poi_refresh_session)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &retry_session));
+                if !attempt_released
+                    || !ppoi_retry_completion_is_current(
+                        root.active_wallet_generation,
+                        retry_wallet_generation,
+                        session_is_current,
+                    )
+                {
+                    return;
+                }
+                if let Err(error) = result {
+                    tracing::warn!(chain_id, %error, "failed to retry PPOI corpus refresh");
+                }
+            });
         })
         .detach();
     }
@@ -727,7 +880,11 @@ impl WalletRoot {
         let mut chips = Vec::new();
 
         if counts.ppoi_attention_count() > 0 {
-            chips.push(self.render_ppoi_status_indicator(root, ppoi_status, counts));
+            chips.push(Self::render_ppoi_status_indicator(
+                root,
+                ppoi_status,
+                counts,
+            ));
         } else {
             chips.push(
                 render_ppoi_status_hover_target(root, "wallet-status-ppoi")
@@ -744,7 +901,6 @@ impl WalletRoot {
     }
 
     fn render_ppoi_status_indicator(
-        &self,
         root: &Entity<Self>,
         status: PresenceStatus,
         counts: WalletStatusCounts,
@@ -906,6 +1062,14 @@ impl WalletRoot {
     }
 }
 
+pub(super) const fn ppoi_retry_completion_is_current(
+    current_wallet_generation: u64,
+    retry_wallet_generation: u64,
+    session_is_current: bool,
+) -> bool {
+    current_wallet_generation == retry_wallet_generation && session_is_current
+}
+
 fn status_presence_text(label: &'static str, status: PresenceStatus) -> gpui::Div {
     div()
         .h(px(24.0))
@@ -948,27 +1112,26 @@ impl BalancesStatusHoverCard {
 impl Render for BalancesStatusHoverCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let now = now_epoch_secs();
-        let (status, labels, sync_tip, indexed_catch_up, issue, counts, network_mode) = {
+        let (status, labels, sync_tip, data_source, issue, counts, network_mode) = {
             let root = self.root.read(cx);
             let chain_id = root.selected_chain;
             let state = root.chain_states.get(&chain_id);
             let counts = root
                 .wallet_status_counts(state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref));
-            let labels = state.and_then(|state| {
-                let context = match state {
-                    ChainUtxoState::Loading { .. } => SyncStatusContext::Loading,
-                    ChainUtxoState::Syncing { .. } => SyncStatusContext::Syncing,
-                    ChainUtxoState::Idle
-                    | ChainUtxoState::Ready { .. }
-                    | ChainUtxoState::Error { .. } => return None,
-                };
-                Some(sync_status_labels(context, state.progress()))
+            let context = state.and_then(|state| match state {
+                ChainUtxoState::Loading { .. } => Some(SyncStatusContext::Loading),
+                ChainUtxoState::Syncing { .. } => Some(SyncStatusContext::Syncing),
+                ChainUtxoState::Idle
+                | ChainUtxoState::Ready { .. }
+                | ChainUtxoState::Error { .. } => None,
             });
+            let progress = state.and_then(ChainUtxoState::progress);
+            let labels = context.map(|context| sync_status_labels(context, progress));
             let status = state.map_or(PresenceStatus::Unknown, |state| {
                 root.balances_status_for_state(state)
             });
             let sync_tip = state.and_then(ChainUtxoState::sync_tip);
-            let indexed_catch_up = sync_tip.and_then(|tip| tip.indexed_catch_up);
+            let data_source = balance_sync_data_source(context, progress);
             let issue = state
                 .filter(|state| matches!(state, ChainUtxoState::Ready { .. }))
                 .and_then(|_| balance_sync_issue(sync_tip, chain_id, now));
@@ -976,7 +1139,7 @@ impl Render for BalancesStatusHoverCard {
                 status,
                 labels,
                 sync_tip,
-                indexed_catch_up,
+                data_source,
                 issue,
                 counts,
                 root.http.network_mode(),
@@ -1022,10 +1185,7 @@ impl Render for BalancesStatusHoverCard {
                     )),
             )
             .when_some(labels.as_ref(), |this, labels| {
-                this.child(render_balance_sync_progress_section(labels))
-            })
-            .when_some(indexed_catch_up, |this, catch_up| {
-                this.child(render_balance_indexed_catch_up_note(catch_up))
+                this.child(render_balance_sync_progress_section(labels, data_source))
             })
             .when_some(sync_tip, |this, sync_tip| {
                 this.child(render_balance_sync_tip_section(sync_tip, now))
@@ -1074,14 +1234,17 @@ impl Render for PpoiStatusHoverCard {
                 root.ppoi_status_for_state(state, counts)
             });
             let refreshing = state.is_some_and(ChainUtxoState::poi_refreshing);
-            (
-                status,
-                root.selected_chain_poi_artifact_progress().cloned(),
-                refreshing,
-                counts,
-                root.poi_artifact_cache_retrying_chains
-                    .contains(&root.selected_chain),
-            )
+            let progress = root.selected_chain_poi_artifact_progress().cloned();
+            let retrying = root
+                .poi_artifact_cache_retry_attempts
+                .contains(root.selected_chain);
+            debug_assert!(
+                !progress.as_ref().is_some_and(|progress| {
+                    root.poi_artifact_cache_retry_attempts
+                        .matches_progress(root.selected_chain, progress)
+                }) || retrying
+            );
+            (status, progress, refreshing, counts, retrying)
         };
         let color = presence_status_color(status);
         let event_label = ppoi_event_header_label(progress.as_ref());
@@ -1137,7 +1300,10 @@ impl Render for PpoiStatusHoverCard {
                     .text_size(px(12.0))
                     .line_height(px(18.0))
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .child(ppoi_hover_detail(status, progress.as_ref(), refreshing)),
+                    .when_some(
+                        ppoi_hover_detail(status, progress.as_ref(), refreshing),
+                        |this, val| this.child(val),
+                    ),
             )
             .when_some(
                 progress
@@ -1171,7 +1337,7 @@ impl Render for PpoiStatusHoverCard {
                 this.child(render_ppoi_hover_action_note(
                     self.root.clone(),
                     "Needs review",
-                    ppoi_attention_detail(counts),
+                    &ppoi_attention_detail(counts),
                     ppoi_attention_hover_color(counts),
                 ))
             })
@@ -1337,17 +1503,17 @@ fn render_ppoi_hover_note(title: &str, detail: &str, color: u32) -> gpui::Div {
 fn render_ppoi_hover_action_note(
     root: Entity<WalletRoot>,
     title: &'static str,
-    detail: String,
+    detail: &str,
     color: u32,
 ) -> gpui::Stateful<gpui::Div> {
-    render_ppoi_hover_note_base(title, &detail, color, 0.08)
+    render_ppoi_hover_note_base(title, detail, color, 0.08)
         .id("wallet-status-ppoi-needs-review")
         .cursor_pointer()
         .hover(move |this| this.bg(rgb_with_alpha(color, 0.14)))
         .on_click(move |_event, window, cx| {
             cx.stop_propagation();
-            root.update(cx, |root, cx| {
-                root.open_private_pending_status_dialog(window, cx);
+            root.update(cx, |_root, cx| {
+                WalletRoot::open_private_pending_status_dialog(window, cx);
             });
         })
 }
@@ -1427,7 +1593,10 @@ fn balances_hover_detail(
     .to_string()
 }
 
-fn render_balance_sync_progress_section(labels: &SyncStatusLabels) -> gpui::Div {
+fn render_balance_sync_progress_section(
+    labels: &SyncStatusLabels,
+    data_source: Option<PublicScanSource>,
+) -> gpui::Div {
     div()
         .rounded_md()
         .border_1()
@@ -1464,38 +1633,31 @@ fn render_balance_sync_progress_section(labels: &SyncStatusLabels) -> gpui::Div 
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(labels.detail.clone()),
         )
+        .when_some(data_source, |section, source| {
+            section.child(render_balance_sync_tip_row(
+                "Data source",
+                balance_sync_source_label(source).to_string(),
+            ))
+        })
 }
 
-fn render_balance_indexed_catch_up_note(catch_up: WalletIndexedCatchUpStatus) -> gpui::Div {
-    render_status_hover_note_base(
-        balance_indexed_catch_up_note_title(catch_up.source),
-        &balance_indexed_catch_up_note_detail(catch_up.source),
-        theme::WARNING,
-        0.08,
-    )
-    .child(render_balance_sync_tip_row(
-        "Catch-up range",
-        format!("{} -> {}", catch_up.from_block, catch_up.target_block),
-    ))
-}
-
-fn balance_indexed_catch_up_note_title(source: WalletIndexedCatchUpSource) -> &'static str {
+pub(super) const fn balance_sync_source_label(source: PublicScanSource) -> &'static str {
     match source {
-        WalletIndexedCatchUpSource::Squid => "Using Squid catch-up",
-        WalletIndexedCatchUpSource::IndexedArtifacts => "Using artifact catch-up",
+        PublicScanSource::CachedCoverage => "Local cache",
+        PublicScanSource::IndexedArtifacts => "Verified artifacts",
+        PublicScanSource::Squid => "Squid index",
+        PublicScanSource::Rpc => "RPC",
+        PublicScanSource::ArchiveRpc => "Archive RPC",
     }
 }
 
-fn balance_indexed_catch_up_note_detail(source: WalletIndexedCatchUpSource) -> String {
-    match source {
-        WalletIndexedCatchUpSource::Squid => {
-            "RPC log sync is behind, so balances are catching up from the Squid indexed wallet source."
-                .to_string()
-        }
-        WalletIndexedCatchUpSource::IndexedArtifacts => {
-            "Squid catch-up is unavailable, so balances are catching up from verified indexed artifacts."
-                .to_string()
-        }
+pub(super) const fn balance_sync_data_source(
+    context: Option<SyncStatusContext>,
+    progress: Option<wallet_ops::SyncProgressUpdate>,
+) -> Option<PublicScanSource> {
+    match (context, progress) {
+        (Some(_), Some(progress)) => progress.source,
+        _ => None,
     }
 }
 
@@ -1517,7 +1679,7 @@ fn render_balance_sync_tip_section(sync_tip: WalletSyncTip, now_secs: u64) -> gp
         )
         .child(render_balance_sync_tip_row(
             "Wallet state",
-            format_block_label(Some(sync_tip.last_scanned_block)),
+            format_block_label(sync_tip.last_scanned_block),
         ))
         .child(render_balance_sync_tip_row(
             "Safe head",
@@ -1564,7 +1726,7 @@ fn render_balance_sync_tip_row(label: &'static str, value: String) -> gpui::Div 
         )
 }
 
-fn balance_sync_issue_heading(issue: BalanceSyncIssue) -> &'static str {
+const fn balance_sync_issue_heading(issue: BalanceSyncIssue) -> &'static str {
     match issue {
         BalanceSyncIssue::HeadUnavailable => "Balance head unavailable",
         BalanceSyncIssue::HeadStalled { .. } => "Balance source stale",
@@ -1596,7 +1758,7 @@ pub(super) fn balance_sync_issue_detail(
     }
 }
 
-fn balance_sync_issue_suggestion(network_mode: WalletNetworkMode) -> &'static str {
+const fn balance_sync_issue_suggestion(network_mode: WalletNetworkMode) -> &'static str {
     match network_mode {
         WalletNetworkMode::Tor => "Consider generating a new Tor session or using premium RPCs.",
         WalletNetworkMode::Proxy | WalletNetworkMode::Direct => "Consider using premium RPCs.",
@@ -1676,31 +1838,33 @@ fn ppoi_hover_heading(
     }
 }
 
-fn ppoi_hover_detail(
+const fn ppoi_hover_detail(
     status: PresenceStatus,
     progress: Option<&PoiArtifactCacheProgress>,
     refreshing: bool,
-) -> &'static str {
+) -> Option<&'static str> {
     if let Some(progress) = progress {
         if progress.is_error() {
             return if progress.ready_for_wallet_checks {
-                "Using last ready cache state."
+                Some("Using last ready cache state.")
             } else {
-                "No ready local POI cache is available."
+                Some("No ready local POI cache is available.")
             };
         }
         if progress.is_active() {
-            return "Private-output PPOI checks wait for this cache before refreshing.";
+            return None;
         }
     }
     if refreshing {
-        return "Checking private-output PPOI status and retrying recoverable outputs.";
+        return Some("Checking private-output PPOI status and retrying recoverable outputs.");
     }
     match status {
-        PresenceStatus::Healthy => "Up to date and following the source.",
-        PresenceStatus::Active => "Catching up with the PPOI source.",
-        PresenceStatus::Error => "PPOI checks are blocked until the artifact cache rebuilds.",
-        PresenceStatus::Unknown => "PPOI source or artifact-cache status is not available yet.",
+        PresenceStatus::Healthy => Some("Up to date and following the source."),
+        PresenceStatus::Active => Some("Catching up with the PPOI source."),
+        PresenceStatus::Error => Some("PPOI checks are blocked until the artifact cache rebuilds."),
+        PresenceStatus::Unknown => {
+            Some("PPOI source or artifact-cache status is not available yet.")
+        }
     }
 }
 
@@ -1911,12 +2075,12 @@ fn healthy_presence_dot() -> gpui::Div {
                         .repeat()
                         .with_easing(bounce(ease_in_out)),
                     |this, delta| {
-                        let size = 9.0 + delta * 7.0;
+                        let size = delta.mul_add(7.0, 9.0);
                         let offset = (SLOT_SIZE - size) / 2.0;
                         this.size(px(size))
                             .top(px(offset))
                             .left(px(offset))
-                            .opacity(0.52 - delta * 0.34)
+                            .opacity(delta.mul_add(-0.34, 0.52))
                     },
                 ),
         )

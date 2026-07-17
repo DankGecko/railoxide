@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::{
     BroadcasterFeePolicy, GAS_LIMIT_BUFFER, GAS_PRICE_BUFFER_DENOMINATOR,
     GAS_PRICE_BUFFER_NUMERATOR, PUBLIC_BROADCASTER_REPUBLISH_INTERVAL, PoiArtifactManifestSource,
-    PoiArtifactSourceConfig, PoiReadSource, WalletNetworkMode,
+    PoiArtifactSourceConfig, PoiProxyFallback, PoiReadSource, SensitiveUrl, WalletNetworkMode,
     public_balance_refresh_interval_secs,
 };
 use sync_service::ChainConfigDefaults;

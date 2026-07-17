@@ -37,6 +37,7 @@ impl Render for WalletSettingsEditor {
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let editor = cx.entity();
+        let root_replacement_allowed = self.root_replacement_is_allowed(cx);
         let network_mode = Self::dropdown_field(
             editor.clone(),
             vec![
@@ -724,7 +725,7 @@ impl Render for WalletSettingsEditor {
                     .item(settings_section_header("Local caches"))
                     .item(
                         SettingItem::new(
-                            "Reset local POI cache",
+                            "Reset public sync caches",
                             SettingField::<SharedString>::render(move |_options, _window, cx| {
                                 Self::render_local_poi_cache_reset_action(
                                     &poi_cache_reset_editor,
@@ -753,11 +754,11 @@ impl Render for WalletSettingsEditor {
             .flex()
             .flex_col()
             .gap_3()
-            .child(self.render_status_indicator())
+            .child(self.render_status_indicator(cx))
             .when_some(self.validation_error.clone(), |this, error| {
                 this.child(settings_danger_banner(error.to_string()))
             })
-            .when_some(self.render_status_message(), |this, status| {
+            .when_some(self.render_status_message(cx), |this, status| {
                 this.child(status)
             })
             .child(
@@ -806,11 +807,14 @@ impl Render for WalletSettingsEditor {
                     )
                     .child(
                         app_button("wallet-settings-save", "Save")
-                            .disabled(!settings_save_action_enabled(
-                                &self.saved,
-                                &self.draft,
-                                self.validation_error.is_some(),
-                            ))
+                            .disabled(
+                                !self.maintenance_controller.read(cx).is_idle()
+                                    || !settings_save_action_enabled(
+                                        &self.saved,
+                                        &self.draft,
+                                        self.validation_error.is_some(),
+                                    ),
+                            )
                             .on_click(move |_event, _window, cx| {
                                 save_editor.update(cx, |editor, cx| {
                                     editor.save_draft(cx);
@@ -820,11 +824,15 @@ impl Render for WalletSettingsEditor {
                     .child(
                         app_button("wallet-settings-apply-restart", "Apply")
                             .primary()
-                            .disabled(!settings_restart_action_enabled(
-                                &self.saved,
-                                &self.draft,
-                                self.validation_error.is_some(),
-                            ))
+                            .disabled(
+                                !self.maintenance_controller.read(cx).is_idle()
+                                    || !settings_restart_action_enabled(
+                                        &self.saved,
+                                        &self.draft,
+                                        self.validation_error.is_some(),
+                                        root_replacement_allowed,
+                                    ),
+                            )
                             .on_click(move |_event, window, cx| {
                                 apply_editor.update(cx, |editor, cx| {
                                     editor.apply_and_restart(window, cx);

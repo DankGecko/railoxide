@@ -13,7 +13,10 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use getrandom::fill;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
-use local_db::{DbConfig, DbStore, WalletMeta};
+use local_db::{
+    DbConfig, DbStore, WalletCacheKey, WalletMeta, WalletPrivateNamespaceId,
+    WalletPrivateRecordKind,
+};
 use railgun_wallet::keys::KeyError;
 use railgun_wallet::wallet_cache::{
     WalletCacheError, deserialize_wallet_utxo, serialize_wallet_utxo, wallet_utxo_stable_identity,
@@ -30,7 +33,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::hardware::{
     ConfirmedHardwarePublicAccount, HardwareDerivationDescriptor, HardwareDeviceKind,
-    HardwarePublicAccountDescriptor, HardwareViewAccessKey,
+    HardwarePublicAccountDescriptor, HardwareViewAccessKey, HardwareWalletSyncIntent,
 };
 
 mod core;
@@ -40,6 +43,7 @@ mod records;
 mod store;
 mod unlock;
 mod view_cache;
+mod view_cache_migration;
 
 pub use core::*;
 pub use crypto::*;

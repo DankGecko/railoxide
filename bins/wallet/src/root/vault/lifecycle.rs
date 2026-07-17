@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 #[cfg(not(feature = "hardware"))]
 use super::hardware_device_wallet_select_label;
 use super::{
@@ -10,6 +12,13 @@ use super::{
     wallet_options_from_metadata, wallet_select_items_from_metadata,
     wallet_select_value_for_selected_wallet,
 };
+
+pub(in crate::root) const fn vault_lock_is_allowed(
+    maintenance_idle: bool,
+    wallet_deletion_in_progress: bool,
+) -> bool {
+    maintenance_idle && !wallet_deletion_in_progress
+}
 #[cfg(feature = "hardware")]
 use super::{
     HardwareProfileMetadata, HardwareProfileUnlockPurpose, HardwareProfileUnlockState,
@@ -23,12 +32,16 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.manage_wallets.deleting_wallet_id.is_some() {
+            self.sync_wallet_select(window, cx);
+            return;
+        }
         if let Some(device_kind) = hardware_device_kind_from_wallet_select_value(wallet_id) {
             #[cfg(feature = "hardware")]
             {
                 self.open_hardware_profile_unlock_dialog_for_device(
                     device_kind,
-                    HardwareProfileUnlockPurpose::OpenWallet,
+                    HardwareProfileUnlockPurpose::Open,
                     window,
                     cx,
                 );
@@ -105,6 +118,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.manage_wallets.deleting_wallet_id.is_some() {
+            self.sync_wallet_select(window, cx);
+            return;
+        }
         #[cfg(feature = "hardware")]
         if self.wallet_metadata.iter().any(|metadata| {
             metadata.wallet_uuid == wallet_id
@@ -170,7 +187,7 @@ impl WalletRoot {
     fn open_wallet_from_vault_view_unlock(
         &mut self,
         wallet_id: &str,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         let Some(store) = self.vault_store.clone() else {
@@ -272,7 +289,14 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.install_view_session_with_dialog_policy(session, metadata, true, None, window, cx);
+        self.install_view_session_with_dialog_policy(
+            session,
+            metadata,
+            true,
+            wallet_ops::CreatedWalletChainInitPolicy::Resumed,
+            window,
+            cx,
+        );
     }
 
     pub(in crate::root) fn install_view_session_after_management(
@@ -282,7 +306,14 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.install_view_session_with_dialog_policy(session, metadata, false, None, window, cx);
+        self.install_view_session_with_dialog_policy(
+            session,
+            metadata,
+            false,
+            wallet_ops::CreatedWalletChainInitPolicy::Resumed,
+            window,
+            cx,
+        );
     }
 
     #[cfg(feature = "hardware")]
@@ -312,11 +343,15 @@ impl WalletRoot {
         session: DesktopViewSession,
         metadata: Vec<WalletMetadataBundle>,
         close_dialogs: bool,
-        initial_sync_start_policy: Option<wallet_ops::DesktopWalletSyncStartPolicy>,
+        created_wallet_init_policy: wallet_ops::CreatedWalletChainInitPolicy,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.shutdown_wallet_session_store();
+        if self.manage_wallets.deleting_wallet_id.is_some() {
+            self.sync_wallet_select(window, cx);
+            return;
+        }
+        self.supersede_wallet_sessions();
         let vault_view_unlock = Arc::new(session.clone_vault_view_unlock());
         let session = Arc::new(session);
         let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
@@ -362,9 +397,10 @@ impl WalletRoot {
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.ensure_chain_load_with_start_policy(
             self.selected_chain,
-            initial_sync_start_policy,
+            Some(created_wallet_init_policy.sync_start_policy()),
             cx,
         );
+        self.initialize_created_wallet_chain_metadata(created_wallet_init_policy);
         cx.notify();
     }
 
@@ -409,14 +445,24 @@ impl WalletRoot {
             session,
             metadata,
             true,
-            Some(wallet_ops::DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill),
+            wallet_ops::CreatedWalletChainInitPolicy::InitialCreate,
             window,
             cx,
         );
-        self.initialize_created_wallet_chain_metadata();
     }
 
-    fn initialize_created_wallet_chain_metadata(&self) {
+    pub(super) fn enabled_chain_ids_for_created_wallet(&self) -> BTreeSet<u64> {
+        self.effective_chain_configs
+            .values()
+            .filter(|chain| chain.enabled)
+            .map(|chain| chain.chain_id)
+            .collect()
+    }
+
+    fn initialize_created_wallet_chain_metadata(
+        &mut self,
+        init_policy: wallet_ops::CreatedWalletChainInitPolicy,
+    ) {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
@@ -428,16 +474,18 @@ impl WalletRoot {
         let http = self.http.clone();
         let skip_chain_id = Some(self.selected_chain);
 
-        self.runtime.spawn(async move {
+        let task = self.runtime.spawn(async move {
             wallet_ops::initialize_created_wallet_chain_metadata_for_session(
                 view_session,
                 effective_chains,
                 db,
                 http,
                 skip_chain_id,
+                init_policy,
             )
             .await;
         });
+        self.wallet_sync_lifecycle.track_wallet_task(task);
     }
 
     pub(in crate::root) fn enter_password_metadata_unlocked(
@@ -493,6 +541,12 @@ impl WalletRoot {
     }
 
     pub(in crate::root) fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !vault_lock_is_allowed(
+            self.maintenance_controller.read(cx).is_idle(),
+            self.manage_wallets.deleting_wallet_id.is_some(),
+        ) {
+            return;
+        }
         self.shutdown_wallet_session_store();
         window.close_all_dialogs(cx);
         self.clear_spend_authorization(cx);

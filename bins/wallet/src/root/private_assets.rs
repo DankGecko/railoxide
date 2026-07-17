@@ -421,7 +421,7 @@ fn private_pending_summary(
     })
 }
 
-fn private_pending_summary_detail(summary: &PrivatePendingSummary) -> &'static str {
+const fn private_pending_summary_detail(summary: &PrivatePendingSummary) -> &'static str {
     if !summary.blocked_shield_rows.is_empty() {
         if summary.blocked_shield_rows.len() == 1 {
             "A blocked Shield can be reviewed and refunded."
@@ -441,7 +441,7 @@ fn private_pending_summary_detail(summary: &PrivatePendingSummary) -> &'static s
     }
 }
 
-fn private_pending_summary_title(summary: &PrivatePendingSummary) -> &'static str {
+const fn private_pending_summary_title(summary: &PrivatePendingSummary) -> &'static str {
     if summary.blocked_shield_rows.is_empty() {
         "Private balance update pending"
     } else {
@@ -638,10 +638,7 @@ impl WalletRoot {
                         ))
                     })
                     .when_some(pending_summary, |column, summary| {
-                        column.child(Self::render_private_pending_status_card(
-                            root.clone(),
-                            summary,
-                        ))
+                        column.child(Self::render_private_pending_status_card(root, &summary))
                     })
                     .children(assets.into_iter().enumerate().map(|(ix, asset)| {
                         Self::render_private_asset_row(
@@ -713,7 +710,6 @@ impl WalletRoot {
     }
 
     pub(super) fn open_private_pending_status_dialog(
-        &self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -732,8 +728,8 @@ impl WalletRoot {
                     || private_pending_status_empty(content_width),
                     |summary| {
                         Self::render_private_pending_status_dialog_content(
-                            content_root.clone(),
-                            summary,
+                            &content_root,
+                            &summary,
                             content_width,
                         )
                     },
@@ -777,8 +773,8 @@ impl WalletRoot {
     }
 
     fn render_private_pending_status_card(
-        root: Entity<Self>,
-        summary: PrivatePendingSummary,
+        root: &Entity<Self>,
+        summary: &PrivatePendingSummary,
     ) -> gpui::Div {
         let details_root = root.clone();
 
@@ -809,9 +805,9 @@ impl WalletRoot {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(app_strong_text(private_pending_summary_title(&summary)))
+                            .child(app_strong_text(private_pending_summary_title(summary)))
                             .child(
-                                app_muted_text(private_pending_summary_detail(&summary))
+                                app_muted_text(private_pending_summary_detail(summary))
                                     .line_height(px(18.0))
                                     .whitespace_normal(),
                             ),
@@ -823,8 +819,8 @@ impl WalletRoot {
                             .compact()
                             .child("Details")
                             .on_click(move |_event, window, cx| {
-                                details_root.update(cx, |root, cx| {
-                                    root.open_private_pending_status_dialog(window, cx);
+                                details_root.update(cx, |_root, cx| {
+                                    Self::open_private_pending_status_dialog(window, cx);
                                 });
                             }),
                     ),
@@ -832,8 +828,8 @@ impl WalletRoot {
     }
 
     fn render_private_pending_status_dialog_content(
-        root: Entity<Self>,
-        summary: PrivatePendingSummary,
+        root: &Entity<Self>,
+        summary: &PrivatePendingSummary,
         content_width: Pixels,
     ) -> gpui::Div {
         let retry_session = summary.poi_refresh_session.clone();
@@ -849,7 +845,7 @@ impl WalletRoot {
             .child(private_pending_dialog_intro())
             .when(!summary.blocked_shield_rows.is_empty(), |this| {
                 this.child(private_blocked_shield_detail_section(
-                    root.clone(),
+                    root,
                     &summary.blocked_shield_rows,
                 ))
             })
@@ -1304,7 +1300,7 @@ fn private_pending_section_header(
 }
 
 fn private_blocked_shield_detail_section(
-    root: Entity<WalletRoot>,
+    root: &Entity<WalletRoot>,
     rows: &[UtxoDisplayRow],
 ) -> gpui::Div {
     let content = div()
@@ -1325,23 +1321,23 @@ fn private_blocked_shield_detail_section(
         )
         .children(
             rows.iter()
-                .cloned()
                 .enumerate()
-                .map(|(ix, row)| private_blocked_shield_row(root.clone(), ix, row)),
+                .map(|(ix, row)| private_blocked_shield_row(root, ix, row)),
         );
     private_pending_section_card(theme::DANGER, content)
 }
 
 fn private_blocked_shield_row(
-    root: Entity<WalletRoot>,
+    root: &Entity<WalletRoot>,
     ix: usize,
-    row: UtxoDisplayRow,
+    row: &UtxoDisplayRow,
 ) -> gpui::Div {
-    let status = blocked_shield_status_label(&row);
-    let action_available = blocked_shield_refund_action_available(&row);
-    let resolving = blocked_shield_refund_origin_resolving(&row);
-    let action_label = blocked_shield_action_label(&row);
+    let status = blocked_shield_status_label(row);
+    let action_available = blocked_shield_refund_action_available(row);
+    let resolving = blocked_shield_refund_origin_resolving(row);
+    let action_label = blocked_shield_action_label(row);
     let action_row = row.clone();
+    let action_root = root.clone();
     let mut action = app_button(
         SharedString::from(format!("wallet-private-blocked-shield-action-{ix}")),
         action_label,
@@ -1360,7 +1356,7 @@ fn private_blocked_shield_row(
     if action_available {
         action = action.on_click(move |_event, window, cx| {
             let row = action_row.clone();
-            root.update(cx, |root, cx| {
+            action_root.update(cx, |root, cx| {
                 root.begin_blocked_shield_refund(&row, window, cx);
             });
         });

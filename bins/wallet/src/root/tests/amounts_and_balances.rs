@@ -1,8 +1,54 @@
 use super::*;
+use crate::root::chain_load::SyncStatusContext;
 use crate::root::public_action::public_action_progress_steps_for_source;
 use crate::root::public_balances::{
     public_account_usd_total_label_for_chain, public_balance_entry_for_chain,
 };
+use crate::root::shell::{balance_sync_data_source, balance_sync_source_label};
+use wallet_ops::{PublicScanSource, SyncProgressStage, SyncProgressUpdate};
+
+#[test]
+fn balance_sync_source_labels_cover_every_public_scan_source() {
+    assert_eq!(
+        balance_sync_source_label(PublicScanSource::CachedCoverage),
+        "Local cache"
+    );
+    assert_eq!(
+        balance_sync_source_label(PublicScanSource::IndexedArtifacts),
+        "Verified artifacts"
+    );
+    assert_eq!(
+        balance_sync_source_label(PublicScanSource::Squid),
+        "Squid index"
+    );
+    assert_eq!(balance_sync_source_label(PublicScanSource::Rpc), "RPC");
+    assert_eq!(
+        balance_sync_source_label(PublicScanSource::ArchiveRpc),
+        "Archive RPC"
+    );
+}
+
+#[test]
+fn balance_sync_data_source_is_active_and_progress_scoped() {
+    let sourced_progress = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 150, 200)
+        .with_source(PublicScanSource::Rpc);
+    let source_free_progress =
+        SyncProgressUpdate::artifact_preparation(SyncProgressStage::PreparingUtxoIndex, 1, 10);
+
+    assert_eq!(
+        balance_sync_data_source(Some(SyncStatusContext::Syncing), Some(sourced_progress)),
+        Some(PublicScanSource::Rpc)
+    );
+    assert_eq!(
+        balance_sync_data_source(Some(SyncStatusContext::Loading), Some(source_free_progress)),
+        None
+    );
+    assert_eq!(balance_sync_data_source(None, Some(sourced_progress)), None);
+    assert_eq!(
+        balance_sync_data_source(Some(SyncStatusContext::Syncing), None),
+        None
+    );
+}
 
 #[test]
 fn private_action_metrics_hide_values_matching_total() {

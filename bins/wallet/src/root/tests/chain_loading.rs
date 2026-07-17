@@ -1,15 +1,69 @@
 use super::*;
-use crate::root::chain_load::{WalletSyncLifecycle, WalletSyncLifecycleCleanupWaitGroup};
+use crate::root::chain_load::{
+    ChainProgressProjection, InstalledObserverProjection, WalletReadinessDisposition,
+    WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, WalletSyncLifecycleCleanupWaitGroup,
+    chain_load_start_is_allowed, chain_progress_update_is_current,
+    destructive_cache_reset_admission_is_allowed, installed_observer_is_exact_current,
+    installed_observer_terminal_transition, retain_auxiliary_stream, wallet_readiness_disposition,
+    wallet_sync_maintenance_allows_start,
+};
+use crate::root::shell::{PoiArtifactCacheRetryAttempts, ppoi_retry_completion_is_current};
 use wallet_ops::{
-    PoiArtifactCachePhase, PoiArtifactCacheProgress, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus, WalletNetworkMode, WalletSessionStore, WalletSyncTip,
+    PoiArtifactCacheAttemptId, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletNetworkMode, WalletReadiness,
+    WalletReadinessError, WalletSessionStore, WalletSyncTip,
 };
 
+#[test]
+fn terminal_wallet_readiness_is_not_projected_as_syncing() {
+    assert_eq!(
+        wallet_readiness_disposition(&WalletReadiness::Failed(
+            WalletReadinessError::PersistenceFailed,
+        )),
+        WalletReadinessDisposition::Error(Arc::from("wallet sync state could not be persisted")),
+    );
+    assert_eq!(
+        wallet_readiness_disposition(&WalletReadiness::Shutdown),
+        WalletReadinessDisposition::Error(Arc::from("wallet sync session stopped")),
+    );
+}
+
+#[test]
+fn chain_load_start_is_blocked_only_for_selected_wallet_deletion() {
+    assert!(!chain_load_start_is_allowed(
+        Some("selected-wallet"),
+        Some("selected-wallet")
+    ));
+    assert!(chain_load_start_is_allowed(
+        Some("hidden-wallet"),
+        Some("selected-wallet")
+    ));
+    assert!(chain_load_start_is_allowed(None, Some("selected-wallet")));
+}
+
+#[test]
+fn wallet_sync_start_is_blocked_during_either_destructive_cache_reset() {
+    assert!(wallet_sync_maintenance_allows_start(false, false));
+    assert!(!wallet_sync_maintenance_allows_start(true, false));
+    assert!(!wallet_sync_maintenance_allows_start(false, true));
+    assert!(!wallet_sync_maintenance_allows_start(true, true));
+}
+
+#[test]
+fn destructive_cache_reset_admission_rejects_deletion_and_pending_cleanup() {
+    assert!(destructive_cache_reset_admission_is_allowed(false, false));
+    assert!(!destructive_cache_reset_admission_is_allowed(true, false));
+    assert!(!destructive_cache_reset_admission_is_allowed(false, true));
+    assert!(!destructive_cache_reset_admission_is_allowed(true, true));
+}
+
 fn poi_artifact_progress(
+    attempt_id: PoiArtifactCacheAttemptId,
     phase: PoiArtifactCachePhase,
     ready_for_wallet_checks: bool,
 ) -> PoiArtifactCacheProgress {
     PoiArtifactCacheProgress {
+        attempt_id,
         chain_id: 1,
         phase,
         completed_lists: usize::from(ready_for_wallet_checks),
@@ -21,6 +75,10 @@ fn poi_artifact_progress(
         ready_for_wallet_checks,
         last_error: None,
     }
+}
+
+fn poi_artifact_attempt_id(value: u64) -> PoiArtifactCacheAttemptId {
+    PoiArtifactCacheAttemptId::from_u64(value).expect("nonzero test attempt ID")
 }
 
 #[test]
@@ -74,26 +132,524 @@ async fn wallet_sync_lifecycle_cleanup_aborts_in_flight_startups() {
         .expect("abort notification");
 }
 
-#[test]
-fn wallet_sync_lifecycle_keeps_syncing_installation_current_until_ready() {
+#[tokio::test]
+async fn wallet_sync_lifecycle_cleanup_aborts_wallet_scoped_tasks() {
+    struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    lifecycle.track_wallet_task(tokio::spawn(async move {
+        let _notify = NotifyOnDrop(Some(dropped_tx));
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+    }));
+
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("wallet task notification timeout")
+        .expect("wallet task notification");
+    let report = lifecycle
+        .supersede_wallet()
+        .shutdown()
+        .await
+        .expect("shutdown lifecycle");
+
+    assert_eq!(report.stopped_startup_tasks, 1);
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("wallet task abort notification timeout")
+        .expect("wallet task abort notification");
+}
+
+#[tokio::test]
+async fn wallet_sync_lifecycle_supersede_retains_session_store() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let first = lifecycle.prepare_startup(1);
+    let first_store = Arc::clone(&first.session_store);
+
+    let cleanup = lifecycle.supersede_wallet();
+    let second = lifecycle.prepare_startup(1);
+    let report = cleanup.shutdown().await.expect("cleanup superseded wallet");
+
+    assert!(Arc::ptr_eq(&first_store, &second.session_store));
+    assert_eq!(second.generation, first.generation + 1);
+    assert!(!report.shut_down_session_store);
+}
+
+#[tokio::test]
+async fn wallet_sync_lifecycle_reset_inventory_survives_loading_and_error_without_session() {
+    const PASSWORD: &str = "sync reset test password";
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    let root_dir = temp_wallet_db_root("wallet-sync-reset-lifecycle");
+    let vault_store =
+        wallet_ops::vault::DesktopVaultStore::open(root_dir.clone()).expect("open wallet store");
+    vault_store
+        .create_vault_with_params(PASSWORD, wallet_ops::vault::KdfParams::new(1024, 1, 1))
+        .expect("create vault");
+    let wallet_id = "sync-reset-wallet";
+    let metadata = vault_store
+        .new_wallet_metadata(
+            PASSWORD,
+            wallet_id,
+            0,
+            wallet_ops::vault::WalletSource::Imported,
+            "Sync reset wallet",
+        )
+        .expect("wallet metadata");
+    vault_store
+        .import_wallet_mnemonic_with_metadata(
+            PASSWORD, wallet_id, 0, "english", MNEMONIC, &metadata,
+        )
+        .expect("import wallet");
+    let view_session = Arc::new(
+        vault_store
+            .load_view_session(PASSWORD, wallet_id)
+            .expect("load view session"),
+    );
+    let poi_rpc_url = reqwest::Url::parse("http://127.0.0.1:1").expect("POI RPC URL");
+    let poi_policy = wallet_ops::PoiReadSource::PoiProxy {
+        rpc_url: poi_rpc_url.clone().into(),
+    };
+    let store = Arc::new(WalletSessionStore::from_db(
+        vault_store.db(),
+        poi_policy.clone(),
+    ));
+    let http = wallet_ops::build_wallet_network_context(wallet_ops::WalletNetworkConfig {
+        network_mode: Some(WalletNetworkMode::Direct),
+        proxy: None,
+        data_dir: &root_dir,
+    })
+    .await
+    .expect("build direct HTTP context");
     let mut lifecycle = WalletSyncLifecycle::new();
     let registration = lifecycle.prepare_startup(1);
+    assert!(registration.session_store.set(Arc::clone(&store)).is_ok());
+    let session = store
+        .start_view_wallet_session_immediate(
+            wallet_ops::ViewWalletChainSessionRequest {
+                view_session,
+                wallet_scope_generation: registration.generation,
+                chain_id: 1,
+                effective_chain: None,
+                sync_start_policy:
+                    wallet_ops::DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+                init_block_number: Some(0),
+                sync_to_block: Some(0),
+                use_indexed_wallet_catch_up: false,
+                poi_read_source: poi_policy,
+                rewind_wallet_cache: false,
+                progress_tx: None,
+            },
+            Some(reqwest::Url::parse("http://127.0.0.1:1").expect("RPC URL")),
+            &http,
+        )
+        .await
+        .expect("register chain and wallet session");
+    let mut observation_rx = session.observation_rx.clone();
+    let initial_observation = observation_rx.borrow_and_update().clone();
+    assert_eq!(initial_observation.snapshot.chain_id, 1);
+    tokio::time::timeout(Duration::from_secs(1), session.stop())
+        .await
+        .expect("wallet session stop timeout")
+        .expect("stop wallet session");
+    assert_eq!(
+        observation_rx.borrow_and_update().readiness,
+        WalletReadiness::Shutdown
+    );
+    assert_eq!(observation_rx.borrow().snapshot.utxo_count, 0);
+    drop(session);
+
+    let loading = ChainUtxoState::Loading { progress: None };
+    assert!(loading.poi_refresh_session().is_none());
+    let reset_store = lifecycle
+        .public_sync_cache_reset_cell()
+        .get()
+        .cloned()
+        .expect("manager reset inventory remains available while loading");
+    let loading_report = reset_store.reset_public_sync_caches().await;
+    assert_eq!(loading_report.chains.len(), 1);
+    assert_eq!(loading_report.failed_chain_count(), 0);
+    assert_eq!(loading_report.chains[0].chain.chain_id, 1);
+    assert_eq!(
+        loading_report.chains[0]
+            .result
+            .as_ref()
+            .expect("loading reset succeeds")
+            .new_epoch
+            .value,
+        1,
+    );
+
+    let error = ChainUtxoState::Error {
+        message: Arc::from("sync failed after chain registration"),
+        start_block: Some(1),
+    };
+    assert!(error.poi_refresh_session().is_none());
+    let error_report = reset_store.reset_public_sync_caches().await;
+    assert_eq!(error_report.chains.len(), 1);
+    assert_eq!(error_report.failed_chain_count(), 0);
+    assert_eq!(
+        error_report.chains[0]
+            .result
+            .as_ref()
+            .expect("error-state reset succeeds")
+            .new_epoch
+            .value,
+        2,
+    );
+
+    lifecycle
+        .invalidate()
+        .shutdown()
+        .await
+        .expect("shutdown lifecycle");
+    drop(reset_store);
+    drop(store);
+    drop(registration);
+    drop(vault_store);
+    let _ = fs::remove_dir_all(root_dir);
+}
+
+#[test]
+fn progress_ownership_transfers_from_startup_and_survives_ready_to_syncing() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let registration = lifecycle.prepare_startup(1);
+    let startup_is_current = lifecycle.is_current_startup(
+        registration.chain_id,
+        registration.generation,
+        registration.task_id,
+    );
+
+    assert!(chain_progress_update_is_current(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        1,
+        startup_is_current,
+        Some(ChainProgressProjection::Loading),
+        &registration.observer_token,
+    ));
 
     lifecycle.finish_startup_after_session_installation(
         1,
         registration.generation,
         registration.task_id,
+    );
+    assert!(!lifecycle.is_current_startup(1, registration.generation, registration.task_id,));
+
+    for projection in [
+        ChainProgressProjection::Ready {
+            token: &registration.observer_token,
+        },
+        ChainProgressProjection::Syncing {
+            token: &registration.observer_token,
+        },
+    ] {
+        assert!(chain_progress_update_is_current(
+            Some("wallet-1"),
+            7,
+            "wallet-1",
+            7,
+            1,
+            false,
+            Some(projection),
+            &registration.observer_token,
+        ));
+    }
+
+    let replacement = lifecycle.prepare_startup(1);
+    lifecycle.finish_startup_after_session_installation(
+        1,
+        replacement.generation,
+        replacement.task_id,
+    );
+    let replacement_projection = Some(ChainProgressProjection::Syncing {
+        token: &replacement.observer_token,
+    });
+    assert!(!chain_progress_update_is_current(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        1,
         false,
-    );
-    assert!(lifecycle.is_current_startup(1, registration.generation, registration.task_id));
-
-    lifecycle.finish_startup_after_session_installation(
+        replacement_projection,
+        &registration.observer_token,
+    ));
+    assert!(chain_progress_update_is_current(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
         1,
-        registration.generation,
-        registration.task_id,
-        true,
+        false,
+        replacement_projection,
+        &replacement.observer_token,
+    ));
+    assert!(!chain_progress_update_is_current(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        2,
+        false,
+        replacement_projection,
+        &replacement.observer_token,
+    ));
+}
+
+#[test]
+fn replacement_observer_rejects_all_delayed_events_from_previous_observer() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let observer_a = lifecycle.prepare_startup(1);
+    let observer_b = lifecycle.prepare_startup(1);
+    assert_eq!(observer_a.generation, observer_b.generation);
+    assert_ne!(observer_a.observer_token, observer_b.observer_token);
+    let installed_observer = observer_b.observer_token.clone();
+    lifecycle.finish_startup_after_session_installation(
+        observer_b.chain_id,
+        observer_b.generation,
+        observer_b.task_id,
     );
-    assert!(!lifecycle.is_current_startup(1, registration.generation, registration.task_id));
+    assert!(!lifecycle.is_current_startup(
+        observer_b.chain_id,
+        observer_b.generation,
+        observer_b.task_id,
+    ));
+
+    let event_names = [
+        "snapshot",
+        "readiness",
+        "sync tip",
+        "POI refreshing",
+        "POI artifact progress",
+    ];
+    for event_name in event_names {
+        assert!(
+            !installed_observer_is_exact_current(
+                Some("wallet-1"),
+                7,
+                "wallet-1",
+                7,
+                1,
+                Some(&installed_observer),
+                &observer_a.observer_token,
+            ),
+            "delayed observer A {event_name} event must be rejected",
+        );
+        assert!(
+            installed_observer_is_exact_current(
+                Some("wallet-1"),
+                7,
+                "wallet-1",
+                7,
+                1,
+                Some(&installed_observer),
+                &observer_b.observer_token,
+            ),
+            "current observer B {event_name} event must be accepted",
+        );
+    }
+
+    assert!(!installed_observer_is_exact_current(
+        Some("wallet-2"),
+        7,
+        "wallet-1",
+        7,
+        1,
+        Some(&installed_observer),
+        &observer_b.observer_token,
+    ));
+    assert!(!installed_observer_is_exact_current(
+        Some("wallet-1"),
+        8,
+        "wallet-1",
+        7,
+        1,
+        Some(&installed_observer),
+        &observer_b.observer_token,
+    ));
+    assert!(!installed_observer_is_exact_current(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        2,
+        Some(&installed_observer),
+        &observer_b.observer_token,
+    ));
+}
+
+#[tokio::test]
+async fn replacement_cancels_and_observes_superseded_installed_observer() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let first = lifecycle.prepare_startup(1);
+    let mut first_observer = lifecycle.register_installed_observer(&first);
+
+    let second = lifecycle.prepare_startup(1);
+    first_observer
+        .cancel_rx
+        .changed()
+        .await
+        .expect("first observer cancellation");
+    assert!(*first_observer.cancel_rx.borrow());
+    let _ = first_observer.completed_tx.send(true);
+
+    let mut second_observer = lifecycle.register_installed_observer(&second);
+    let cleanup = lifecycle.supersede_wallet();
+    second_observer
+        .cancel_rx
+        .changed()
+        .await
+        .expect("second observer cancellation");
+    assert!(*second_observer.cancel_rx.borrow());
+
+    let cleanup_join = tokio::spawn(cleanup.shutdown());
+    tokio::task::yield_now().await;
+    assert!(!cleanup_join.is_finished());
+    let _ = second_observer.completed_tx.send(true);
+    cleanup_join
+        .await
+        .expect("cleanup task")
+        .expect("cleanup superseded observers");
+}
+
+#[tokio::test]
+async fn auxiliary_stream_closure_does_not_close_authoritative_observation() {
+    let (observation_tx, mut observation_rx) = tokio::sync::watch::channel(0_u64);
+    let (auxiliary_tx, auxiliary_rx) = tokio::sync::watch::channel(false);
+    let mut auxiliary_rx = Some(auxiliary_rx);
+    drop(auxiliary_tx);
+
+    let changed = auxiliary_rx
+        .as_mut()
+        .expect("auxiliary receiver")
+        .changed()
+        .await;
+    assert!(!retain_auxiliary_stream(&mut auxiliary_rx, &changed));
+    assert!(auxiliary_rx.is_none());
+
+    observation_tx.send(1).expect("authoritative observation");
+    observation_rx
+        .changed()
+        .await
+        .expect("authoritative stream remains open");
+    assert_eq!(*observation_rx.borrow(), 1);
+}
+
+#[test]
+fn observation_closure_wins_over_ready_projection() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let observer = lifecycle.prepare_startup(1);
+
+    let terminal = installed_observer_terminal_transition(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        1,
+        Some(InstalledObserverProjection::Ready {
+            token: &observer.observer_token,
+            start_block: 123,
+        }),
+        &observer.observer_token,
+        Arc::from("wallet session observation stream closed"),
+    )
+    .expect("observation closure must terminalize the exact ready observer");
+
+    assert_eq!(
+        terminal.message.as_ref(),
+        "wallet session observation stream closed"
+    );
+    assert_eq!(terminal.start_block, 123);
+}
+
+#[test]
+fn observation_closure_wins_over_syncing_projection() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let observer = lifecycle.prepare_startup(1);
+
+    let terminal = installed_observer_terminal_transition(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        1,
+        Some(InstalledObserverProjection::Syncing {
+            token: &observer.observer_token,
+            start_block: 456,
+        }),
+        &observer.observer_token,
+        Arc::from("wallet session observation stream closed"),
+    )
+    .expect("observation closure must terminalize the exact syncing observer");
+
+    assert_eq!(
+        terminal.message.as_ref(),
+        "wallet session observation stream closed"
+    );
+    assert_eq!(terminal.start_block, 456);
+}
+
+#[test]
+fn authoritative_observation_closure_terminalizes_exact_installed_observer() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let observer = lifecycle.prepare_startup(1);
+
+    let terminal = installed_observer_terminal_transition(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        1,
+        Some(InstalledObserverProjection::Ready {
+            token: &observer.observer_token,
+            start_block: 789,
+        }),
+        &observer.observer_token,
+        Arc::from("wallet session observation stream closed"),
+    )
+    .expect("observation closure must terminalize the exact observer");
+
+    assert_eq!(
+        terminal.message.as_ref(),
+        "wallet session observation stream closed"
+    );
+    assert_eq!(terminal.start_block, 789);
+}
+
+#[test]
+fn stale_stream_closure_does_not_replace_newer_observer() {
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let stale = lifecycle.prepare_startup(1);
+    let current = lifecycle.prepare_startup(1);
+
+    let terminal = installed_observer_terminal_transition(
+        Some("wallet-1"),
+        7,
+        "wallet-1",
+        7,
+        1,
+        Some(InstalledObserverProjection::Ready {
+            token: &current.observer_token,
+            start_block: 999,
+        }),
+        &stale.observer_token,
+        Arc::from("wallet session observation stream closed"),
+    );
+
+    assert_eq!(terminal, None);
 }
 
 #[tokio::test]
@@ -103,7 +659,12 @@ async fn wallet_sync_lifecycle_cleanup_detects_late_initialized_store() {
     let registration = lifecycle.prepare_startup(1);
     let old_session_store = Arc::clone(&registration.session_store);
     let cleanup = lifecycle.invalidate();
-    let store = Arc::new(WalletSessionStore::open(root_dir.clone()).expect("open session store"));
+    let poi_policy = wallet_ops::settings::WalletSettings::default()
+        .poi_read_source()
+        .expect("default POI policy");
+    let store = Arc::new(
+        WalletSessionStore::open(root_dir.clone(), poi_policy).expect("open session store"),
+    );
 
     assert!(old_session_store.set(store).is_ok());
     let report = cleanup.shutdown().await.expect("shutdown lifecycle");
@@ -117,10 +678,13 @@ async fn wallet_sync_lifecycle_cleanup_detects_late_initialized_store() {
 async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
     let mut lifecycle = WalletSyncLifecycle::new();
     let registration = lifecycle.prepare_startup(1);
-    let join = tokio::task::spawn_blocking(|| {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let join = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
         std::thread::sleep(Duration::from_millis(100));
     });
     lifecycle.track_startup(&registration, join);
+    started_rx.await.expect("blocking cleanup task started");
     let cleanup = lifecycle.invalidate();
     let cleanup_task = cleanup.spawn(&tokio::runtime::Handle::current());
 
@@ -141,10 +705,13 @@ async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
 async fn wallet_sync_lifecycle_wait_group_reuses_timed_out_cleanup() {
     let mut lifecycle = WalletSyncLifecycle::new();
     let registration = lifecycle.prepare_startup(1);
-    let join = tokio::task::spawn_blocking(|| {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let join = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
         std::thread::sleep(Duration::from_millis(100));
     });
     lifecycle.track_startup(&registration, join);
+    started_rx.await.expect("blocking cleanup task started");
     let cleanup_task = lifecycle
         .invalidate()
         .spawn(&tokio::runtime::Handle::current());
@@ -162,6 +729,18 @@ async fn wallet_sync_lifecycle_wait_group_reuses_timed_out_cleanup() {
         .await
         .expect("retry should wait on retained cleanup");
     assert_eq!(report.stopped_startup_tasks, 1);
+}
+
+#[tokio::test]
+async fn wallet_deletion_cleanup_surfaces_completion_channel_closure() {
+    let error = WalletSyncLifecycleCleanupWaitGroup::new(vec![
+        WalletSyncLifecycleCleanupTask::closed_for_test(),
+    ])
+    .shutdown_for_wallet_deletion()
+    .await
+    .expect_err("closed cleanup channel should fail deletion");
+
+    assert_eq!(error, "wallet sync cleanup task ended before completion");
 }
 
 #[test]
@@ -211,6 +790,21 @@ fn loading_summary_uses_sync_stage_and_percent() {
 }
 
 #[test]
+fn wallet_sync_labels_use_deployment_baseline_for_percentage() {
+    let progress = SyncProgressUpdate::new(
+        SyncProgressStage::IndexingUtxos,
+        14_737_691,
+        25_305_894,
+        25_537_418,
+    );
+
+    let labels = sync_status_labels(SyncStatusContext::Syncing, Some(progress));
+
+    assert_eq!(labels.percent, 97);
+    assert_eq!(labels.detail, "Block 25305894 of 25537418");
+}
+
+#[test]
 fn sync_status_labels_describe_no_progress_context() {
     assert_eq!(
         sync_status_labels(SyncStatusContext::Loading, None),
@@ -245,6 +839,35 @@ fn sync_status_labels_use_progress_when_available() {
 }
 
 #[test]
+fn syncing_status_discards_completed_chain_commitment_progress() {
+    let progress =
+        SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
+
+    assert_eq!(
+        sync_status_labels(SyncStatusContext::Syncing, Some(progress)),
+        SyncStatusLabels {
+            title: "Checking wallet sync".to_string(),
+            percent: 0,
+            detail: "Checking for new wallet events...".to_string(),
+        }
+    );
+}
+
+#[test]
+fn syncing_status_retains_wallet_indexing_progress() {
+    let progress = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 150, 300);
+
+    assert_eq!(
+        sync_status_labels(SyncStatusContext::Syncing, Some(progress)),
+        SyncStatusLabels {
+            title: "Indexing UTXOs".to_string(),
+            percent: 25,
+            detail: "Block 150 of 300".to_string(),
+        }
+    );
+}
+
+#[test]
 fn loading_chain_state_keeps_utxo_table_available() {
     let state = ChainUtxoState::Loading { progress: None };
 
@@ -266,7 +889,26 @@ fn progress_detail_uses_artifact_chunks_for_utxo_prep() {
     let progress =
         SyncProgressUpdate::artifact_chunk(SyncProgressStage::PreparingUtxoIndex, 58, 100, 7, 12);
 
-    assert_eq!(progress_detail(progress), "Artifact chunk 7 of 12");
+    assert_eq!(progress_detail(progress), "Artifact chunks ready: 7 of 12");
+}
+
+#[test]
+fn progress_detail_identifies_final_artifact_chunk_fetch() {
+    let progress =
+        SyncProgressUpdate::artifact_chunk(SyncProgressStage::PreparingUtxoIndex, 85, 100, 10, 11);
+
+    assert_eq!(
+        progress_detail(progress),
+        "Fetching final artifact chunk (10 of 11 ready)..."
+    );
+}
+
+#[test]
+fn progress_detail_marks_all_artifact_chunks_ready() {
+    let progress =
+        SyncProgressUpdate::artifact_chunk(SyncProgressStage::PreparingUtxoIndex, 90, 100, 11, 11);
+
+    assert_eq!(progress_detail(progress), "Artifact chunks ready");
 }
 
 #[test]
@@ -334,10 +976,12 @@ fn wallet_status_presence_classifies_sync_and_ppoi_health() {
         PresenceStatus::Unknown
     );
 
-    let active_cache = poi_artifact_progress(PoiArtifactCachePhase::ApplyingDeltas, false);
-    let ready_cache = poi_artifact_progress(PoiArtifactCachePhase::Ready, true);
-    let usable_error = poi_artifact_progress(PoiArtifactCachePhase::Error, true);
-    let blocking_error = poi_artifact_progress(PoiArtifactCachePhase::Error, false);
+    let attempt_id = poi_artifact_attempt_id(1);
+    let active_cache =
+        poi_artifact_progress(attempt_id, PoiArtifactCachePhase::ApplyingDeltas, false);
+    let ready_cache = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Ready, true);
+    let usable_error = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Error, true);
+    let blocking_error = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Error, false);
     assert_eq!(
         ppoi_presence_status(
             false,
@@ -399,10 +1043,89 @@ fn wallet_status_presence_classifies_sync_and_ppoi_health() {
 }
 
 #[test]
+fn ppoi_retry_completion_rejects_stale_wallet_or_session() {
+    assert!(ppoi_retry_completion_is_current(7, 7, true));
+    assert!(!ppoi_retry_completion_is_current(8, 7, true));
+    assert!(!ppoi_retry_completion_is_current(7, 7, false));
+}
+
+#[test]
+fn ppoi_retry_pending_admission_owns_chain() {
+    let mut attempts = PoiArtifactCacheRetryAttempts::default();
+    let request_token = attempts.begin(1).expect("start retry request");
+
+    assert!(attempts.contains(1));
+    assert!(attempts.begin(1).is_none());
+    assert!(attempts.cancel_pending(1, request_token));
+    assert!(!attempts.contains(1));
+}
+
+#[test]
+fn ppoi_retry_admission_binds_only_matching_provisional_request() {
+    let mut attempts = PoiArtifactCacheRetryAttempts::default();
+    let stale_request = attempts.begin(1).expect("start stale retry request");
+    attempts.clear();
+    let replacement_request = attempts.begin(1).expect("start replacement retry request");
+    let stale_attempt_id = poi_artifact_attempt_id(10);
+    let replacement_attempt_id = poi_artifact_attempt_id(11);
+
+    assert_ne!(stale_request, replacement_request);
+    assert!(!attempts.bind(1, stale_request, stale_attempt_id));
+    assert!(attempts.contains(1));
+    assert!(attempts.bind(1, replacement_request, replacement_attempt_id));
+    assert!(!attempts.cancel_pending(1, replacement_request));
+}
+
+#[test]
+fn ppoi_retry_exact_core_completion_releases_ownership() {
+    let mut attempts = PoiArtifactCacheRetryAttempts::default();
+    let request_token = attempts.begin(1).expect("start retry request");
+    let attempt_id = poi_artifact_attempt_id(20);
+    assert!(attempts.bind(1, request_token, attempt_id));
+
+    assert!(attempts.finish(1, attempt_id));
+    assert!(!attempts.contains(1));
+}
+
+#[test]
+fn ppoi_retry_stale_completion_does_not_clear_replacement() {
+    let mut attempts = PoiArtifactCacheRetryAttempts::default();
+    let stale_request = attempts.begin(1).expect("start stale retry request");
+    let stale_attempt_id = poi_artifact_attempt_id(30);
+    assert!(attempts.bind(1, stale_request, stale_attempt_id));
+    attempts.clear();
+    let replacement_request = attempts.begin(1).expect("start replacement retry request");
+    let replacement_attempt_id = poi_artifact_attempt_id(31);
+    assert!(attempts.bind(1, replacement_request, replacement_attempt_id));
+
+    assert!(!attempts.finish(1, stale_attempt_id));
+    assert!(attempts.contains(1));
+    assert!(attempts.finish(1, replacement_attempt_id));
+}
+
+#[test]
+fn ppoi_retry_unrelated_progress_attempt_does_not_match_user_retry() {
+    let mut attempts = PoiArtifactCacheRetryAttempts::default();
+    let request_token = attempts.begin(1).expect("start retry request");
+    let attempt_id = poi_artifact_attempt_id(40);
+    assert!(attempts.bind(1, request_token, attempt_id));
+    let unrelated_progress = poi_artifact_progress(
+        poi_artifact_attempt_id(41),
+        PoiArtifactCachePhase::ApplyingDeltas,
+        false,
+    );
+    let matching_progress =
+        poi_artifact_progress(attempt_id, PoiArtifactCachePhase::ApplyingDeltas, false);
+
+    assert!(!attempts.matches_progress(1, &unrelated_progress));
+    assert!(attempts.matches_progress(1, &matching_progress));
+}
+
+#[test]
 fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
     let now = 1_000;
     let fresh = WalletSyncTip {
-        last_scanned_block: 990,
+        last_scanned_block: Some(990),
         head_block: Some(1_012),
         safe_head_block: Some(1_000),
         head_last_advanced_at_unix_secs: Some(now - 30),
@@ -436,7 +1159,7 @@ fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
     );
 
     let lagging = WalletSyncTip {
-        last_scanned_block: 989,
+        last_scanned_block: Some(989),
         ..fresh
     };
     assert_eq!(

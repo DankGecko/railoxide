@@ -1,13 +1,22 @@
 use super::*;
 
+const WALLET_DELETION_APPLY_STATUS: &str =
+    "Wait for wallet deletion to finish before applying settings";
+
 impl WalletSettingsEditor {
     pub(in crate::root) fn new(
         vault_store: Arc<DesktopVaultStore>,
         runtime: Handle,
         settings: WalletSettings,
-        startup_root: Option<Entity<WalletStartupRoot>>,
+        maintenance_controller: Entity<WalletMaintenanceController>,
+        startup_root: Option<WeakEntity<WalletStartupRoot>>,
         active_root: Option<WeakEntity<WalletRoot>>,
+        cx: &mut Context<'_, Self>,
     ) -> Self {
+        cx.observe(&maintenance_controller, |_editor, _controller, cx| {
+            cx.notify();
+        })
+        .detach();
         let mut editor = Self {
             vault_store,
             runtime,
@@ -18,8 +27,7 @@ impl WalletSettingsEditor {
             status: None,
             cache_building: false,
             cache_build_progress: None,
-            poi_cache_resetting: false,
-            merkle_forest_resetting: false,
+            maintenance_controller,
             startup_root,
             active_root,
         };
@@ -54,8 +62,24 @@ impl WalletSettingsEditor {
         self.draft != self.saved
     }
 
-    pub(in crate::root) fn render_status_indicator(&self) -> gpui::Div {
-        let (label, color) = if self.validation_error.is_some() {
+    pub(in crate::root) fn root_replacement_is_allowed(&self, cx: &App) -> bool {
+        if let Some(startup_root) = self.startup_root.as_ref() {
+            return startup_root
+                .read_with(cx, WalletStartupRoot::root_replacement_is_allowed)
+                .unwrap_or(false);
+        }
+        self.active_root.as_ref().is_none_or(|root| {
+            root.read_with(cx, |root, _cx| root.root_replacement_is_allowed())
+                .unwrap_or(false)
+        })
+    }
+
+    pub(in crate::root) fn render_status_indicator(&self, cx: &App) -> gpui::Div {
+        let (label, color) = if !self.maintenance_controller.read(cx).is_idle() {
+            ("Maintenance", theme::INFO)
+        } else if !self.root_replacement_is_allowed(cx) {
+            ("Wallet deletion", theme::INFO)
+        } else if self.validation_error.is_some() {
             ("Invalid", theme::DANGER)
         } else if !self.is_dirty() {
             ("Saved", theme::SUCCESS)
@@ -81,8 +105,17 @@ impl WalletSettingsEditor {
             .child(label)
     }
 
-    pub(in crate::root) fn render_status_message(&self) -> Option<gpui::Div> {
-        let status = self.status.as_ref()?;
+    pub(in crate::root) fn render_status_message(&self, cx: &App) -> Option<gpui::Div> {
+        let controller = self.maintenance_controller.read(cx);
+        let maintenance_status = controller.status();
+        if controller.is_idle() && !self.root_replacement_is_allowed(cx) {
+            return Some(settings_info_banner(WALLET_DELETION_APPLY_STATUS));
+        }
+        let status = if controller.is_idle() {
+            self.status.as_ref().or(maintenance_status.as_ref())?
+        } else {
+            maintenance_status.as_ref().or(self.status.as_ref())?
+        };
         if status.as_ref() == "Settings saved" {
             return None;
         }
@@ -90,15 +123,25 @@ impl WalletSettingsEditor {
     }
 
     pub(in crate::root) fn clear_transient_status(&mut self, cx: &mut Context<'_, Self>) {
-        if self.cache_building || self.poi_cache_resetting || self.merkle_forest_resetting {
+        if self.cache_building || !self.maintenance_controller.read(cx).is_idle() {
             return;
         }
+        self.maintenance_controller.update(cx, |controller, cx| {
+            controller.clear_status(cx);
+        });
         if self.status.take().is_some() {
             cx.notify();
         }
     }
 
     pub(in crate::root) fn save_draft(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        if !self.maintenance_controller.read(cx).is_idle() {
+            self.status = Some(Arc::from(
+                "Wait for the active cache reset before changing settings",
+            ));
+            cx.notify();
+            return false;
+        }
         if classify_settings_apply_mode(&self.saved, &self.draft)
             == SettingsApplyMode::NetworkingRestart
         {
@@ -112,6 +155,13 @@ impl WalletSettingsEditor {
     }
 
     pub(in crate::root) fn persist_draft(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        if !self.maintenance_controller.read(cx).is_idle() {
+            self.status = Some(Arc::from(
+                "Wait for the active cache reset before changing settings",
+            ));
+            cx.notify();
+            return false;
+        }
         self.refresh_validation();
         if self.validation_error.is_some() {
             self.status = Some(Arc::from("Fix validation errors before saving settings"));
@@ -155,7 +205,7 @@ impl WalletSettingsEditor {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.poi_cache_resetting {
+        if !self.maintenance_controller.read(cx).is_idle() {
             return;
         }
         let editor = cx.entity();
@@ -167,10 +217,10 @@ impl WalletSettingsEditor {
             confirmation_dialog(
                 dialog,
                 ConfirmationDialogProps::danger(
-                    "Reset local POI cache",
-                    "Clears locally cached POI artifact proof data. The wallet will rebuild it as needed.",
+                    "Reset public sync caches",
+                    "Clears reconstructible persisted artifact chunks, POI corpus, and TXID public cache data. Active wallet sessions also discard public scan coverage and resync.",
                     Some("Wallet data, keys, and balances are not deleted."),
-                    "Reset POI cache",
+                    "Reset public cache",
                 ),
                 dialog_width,
                 dialog_max_height,
@@ -186,52 +236,12 @@ impl WalletSettingsEditor {
     }
 
     pub(in crate::root) fn confirm_local_poi_cache_reset(&mut self, cx: &mut Context<'_, Self>) {
-        if self.poi_cache_resetting {
-            return;
-        }
-        self.poi_cache_resetting = true;
-        self.status = Some(Arc::from("Resetting local POI cache..."));
-        let db = self.vault_store.db();
-        let service = self.active_root.as_ref().and_then(|root| {
-            root.update(cx, |root, _cx| root.poi_cache_service.clone())
-                .ok()
-                .flatten()
+        self.status = None;
+        let controller = self.maintenance_controller.clone();
+        let vault_store = Arc::clone(&self.vault_store);
+        controller.update(cx, |controller, cx| {
+            controller.start_public_reset(vault_store.as_ref(), cx);
         });
-        let resync_requested = service.is_some();
-        let join = if let Some(service) = service {
-            self.runtime.spawn(async move {
-                service
-                    .reset_poi_artifact_cache()
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        } else {
-            self.runtime.spawn_blocking(move || {
-                db.clear_poi_artifact_cache()
-                    .map_err(|error| error.to_string())
-            })
-        };
-        cx.spawn(async move |this, cx| {
-            let message = match join.await {
-                Ok(Ok(removed)) if resync_requested => {
-                    format!(
-                        "Local POI cache reset; cleared {removed} cache records and requested resync"
-                    )
-                }
-                Ok(Ok(removed)) => {
-                    format!("Local POI cache reset; cleared {removed} cache records")
-                }
-                Ok(Err(error)) => format!("Failed to reset local POI cache: {error}"),
-                Err(error) => format!("Local POI cache reset task failed: {error}"),
-            };
-            let _ = this.update(cx, |editor, cx| {
-                editor.poi_cache_resetting = false;
-                editor.status = Some(Arc::from(message));
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     pub(in crate::root) fn open_local_merkle_forest_cache_reset_dialog(
@@ -239,7 +249,7 @@ impl WalletSettingsEditor {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.merkle_forest_resetting {
+        if !self.maintenance_controller.read(cx).is_idle() {
             return;
         }
         let editor = cx.entity();
@@ -273,68 +283,12 @@ impl WalletSettingsEditor {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.merkle_forest_resetting {
-            return;
-        }
-        self.merkle_forest_resetting = true;
-        self.status = Some(Arc::from("Resetting local Merkle forest cache..."));
-        let db = self.vault_store.db();
-        let active_root = self.active_root.clone();
-        let begin_result = active_root.as_ref().and_then(|root| {
-            root.update(cx, |root, cx| root.begin_merkle_forest_cache_reset(cx))
-                .ok()
+        self.status = None;
+        let controller = self.maintenance_controller.clone();
+        let vault_store = Arc::clone(&self.vault_store);
+        controller.update(cx, |controller, cx| {
+            controller.start_merkle_reset(vault_store.as_ref(), cx);
         });
-        let resync_requested = begin_result.is_some();
-        let cleanup = begin_result;
-        let join = self.runtime.spawn(async move {
-            if let Some(cleanup) = cleanup {
-                cleanup.shutdown_for_merkle_reset().await?;
-            }
-            tokio::task::spawn_blocking(move || {
-                wallet_ops::reset_local_merkle_forest_cache(db.as_ref())
-                    .map_err(|error| error.to_string())
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        });
-        cx.spawn(async move |this, cx| {
-            let (message, reset_succeeded) = match join.await {
-                Ok(Ok(removed)) if resync_requested => {
-                    (
-                        format!(
-                            "Local Merkle forest cache reset; cleared {removed} snapshot files and restarted private sync"
-                        ),
-                        true,
-                    )
-                }
-                Ok(Ok(removed)) => (
-                    format!(
-                        "Local Merkle forest cache reset; cleared {removed} snapshot files"
-                    ),
-                    true,
-                ),
-                Ok(Err(error)) => (
-                    format!("Failed to reset local Merkle forest cache: {error}"),
-                    false,
-                ),
-                Err(error) => (
-                    format!("Local Merkle forest cache reset task failed: {error}"),
-                    false,
-                ),
-            };
-            let _ = this.update(cx, |editor, cx| {
-                editor.merkle_forest_resetting = false;
-                editor.status = Some(Arc::from(message));
-                if let Some(root) = editor.active_root.as_ref() {
-                    let _ = root.update(cx, |root, cx| {
-                        root.finish_merkle_forest_cache_reset(reset_succeeded, cx);
-                    });
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     pub(in crate::root) fn render_build_prover_cache_action(
@@ -366,14 +320,16 @@ impl WalletSettingsEditor {
         editor: &Entity<Self>,
         cx: &App,
     ) -> gpui::Div {
-        let resetting = editor.read(cx).poi_cache_resetting;
+        let controller = editor.read(cx).maintenance_controller.clone();
+        let reset = controller.read(cx).reset();
+        let resetting = reset == WalletMaintenanceReset::Public;
         let reset_editor = editor.clone();
         let label = if resetting { "Resetting..." } else { "Reset" };
         div().flex().items_center().child(
             app_button("wallet-settings-poi-cache-reset", label)
                 .danger()
                 .outline()
-                .disabled(resetting)
+                .disabled(reset != WalletMaintenanceReset::Idle)
                 .on_click(move |_event, window, cx| {
                     reset_editor.update(cx, |editor, cx| {
                         editor.open_local_poi_cache_reset_dialog(window, cx);
@@ -386,14 +342,16 @@ impl WalletSettingsEditor {
         editor: &Entity<Self>,
         cx: &App,
     ) -> gpui::Div {
-        let resetting = editor.read(cx).merkle_forest_resetting;
+        let controller = editor.read(cx).maintenance_controller.clone();
+        let reset = controller.read(cx).reset();
+        let resetting = reset == WalletMaintenanceReset::Merkle;
         let reset_editor = editor.clone();
         let label = if resetting { "Resetting..." } else { "Reset" };
         div().flex().items_center().child(
             app_button("wallet-settings-merkle-forest-reset", label)
                 .danger()
                 .outline()
-                .disabled(resetting)
+                .disabled(reset != WalletMaintenanceReset::Idle)
                 .on_click(move |_event, window, cx| {
                     reset_editor.update(cx, |editor, cx| {
                         editor.open_local_merkle_forest_cache_reset_dialog(window, cx);
@@ -407,6 +365,18 @@ impl WalletSettingsEditor {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.maintenance_controller.read(cx).is_idle() {
+            self.status = Some(Arc::from(
+                "Wait for the active cache reset before changing settings",
+            ));
+            cx.notify();
+            return;
+        }
+        if !self.root_replacement_is_allowed(cx) {
+            self.status = Some(Arc::from(WALLET_DELETION_APPLY_STATUS));
+            cx.notify();
+            return;
+        }
         let reusable_http = if settings_restart_reuses_active_network(&self.saved, &self.draft) {
             self.active_root.as_ref().and_then(|root| {
                 root.update(cx, |root, _cx| root.reusable_network_context())
@@ -420,7 +390,7 @@ impl WalletSettingsEditor {
         }
         window.close_all_dialogs(cx);
         if let Some(root) = self.startup_root.clone() {
-            root.update(cx, |root, cx| {
+            let _ = root.update(cx, |root, cx| {
                 root.retry_startup_with_network_context(reusable_http, window, cx);
             });
         }

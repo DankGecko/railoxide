@@ -483,28 +483,28 @@ impl DesktopUnshieldPreparedPlan {
         }
     }
 
-    pub(super) fn transaction_count(&self) -> usize {
+    pub(super) const fn transaction_count(&self) -> usize {
         match self {
             Self::Single(plan) => plan.transaction_count(),
             Self::Composite(plan) => plan.shape.transaction_count,
         }
     }
 
-    pub(super) fn input_count(&self) -> usize {
+    pub(super) const fn input_count(&self) -> usize {
         match self {
             Self::Single(plan) => plan.input_count(),
             Self::Composite(plan) => plan.shape.input_count,
         }
     }
 
-    pub(super) fn private_output_count(&self) -> usize {
+    pub(super) const fn private_output_count(&self) -> usize {
         match self {
             Self::Single(plan) => plan.private_output_count(),
             Self::Composite(plan) => plan.shape.private_output_count,
         }
     }
 
-    pub(super) fn public_output_count(&self) -> usize {
+    pub(super) const fn public_output_count(&self) -> usize {
         match self {
             Self::Single(plan) => plan.public_output_count(),
             Self::Composite(plan) => plan.shape.public_output_count,
@@ -592,40 +592,86 @@ pub struct ShieldSendOutput {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalletSyncTip {
-    pub last_scanned_block: u64,
+    pub last_scanned_block: Option<u64>,
     pub head_block: Option<u64>,
     pub safe_head_block: Option<u64>,
     pub head_last_advanced_at_unix_secs: Option<u64>,
     pub indexed_catch_up: Option<WalletIndexedCatchUpStatus>,
 }
 
+#[derive(Clone)]
+pub struct WalletSessionObservation {
+    pub snapshot: Arc<ListUtxosOutput>,
+    pub readiness: WalletReadiness,
+}
+
 pub struct WalletSession {
     pub chain_id: u64,
-    pub poi_rpc_url: Url,
+    pub poi_read_source: PoiReadSource,
     pub cache_key: String,
     pub start_block: u64,
-    pub ready_rx: watch::Receiver<bool>,
-    pub snapshots_rx: watch::Receiver<Arc<ListUtxosOutput>>,
+    pub observation_rx: watch::Receiver<WalletSessionObservation>,
     pub sync_tip_rx: watch::Receiver<WalletSyncTip>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
+    pub poi_artifact_cache_progress_rx:
+        Option<watch::Receiver<BTreeMap<u64, PoiArtifactCacheProgress>>>,
     pub(crate) db: Arc<DbStore>,
     pub(crate) sync_manager: Arc<SyncManager>,
     pub(crate) chain_key: ChainKey,
     pub(crate) handle: WalletHandle,
+    pub(crate) public_data_plane: PublicDataPlaneHandle,
+    pub(super) projection_cancel_tx: watch::Sender<bool>,
+    pub(super) projection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+pub struct WalletPoiArtifactCacheRetry {
+    retry: CorePoiArtifactCacheRetry,
+    handle: WalletHandle,
+}
+
+impl WalletPoiArtifactCacheRetry {
+    #[must_use]
+    pub const fn attempt_id(&self) -> PoiArtifactCacheAttemptId {
+        self.retry.attempt_id()
+    }
+
+    pub async fn wait(self) -> Result<bool> {
+        self.retry
+            .wait()
+            .await
+            .wrap_err("retry chain PPOI corpus refresh")?;
+        Ok(self.handle.refresh_poi_statuses().await)
+    }
 }
 
 impl WalletSession {
     pub async fn stop(&self) -> Result<()> {
-        self.sync_manager
-            .remove_wallet(&self.chain_key, &self.cache_key)
+        let result = self
+            .sync_manager
+            .remove_wallet_session(&self.handle)
             .await
-            .wrap_err("remove wallet sync worker")
+            .wrap_err("remove wallet sync worker");
+        if result.is_err() {
+            let _ = self.projection_cancel_tx.send(true);
+        }
+        let projection_join = match self.projection_join.lock() {
+            Ok(mut projection_join) => projection_join.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(projection_join) = projection_join {
+            projection_join
+                .await
+                .wrap_err("join wallet session observation projection")?;
+        }
+        result
     }
 
-    pub async fn unspent_utxos(&self) -> Vec<Utxo> {
-        let utxos = self.handle.utxos.read().await.clone();
-        let pending_overlay = self.handle.pending_overlay().await;
-        poi_verified_unspent_utxos_from_records(&utxos, &pending_overlay)
+    #[must_use]
+    pub fn unspent_utxos(&self) -> Vec<Utxo> {
+        let Some(snapshot) = self.handle.current_snapshot() else {
+            return Vec::new();
+        };
+        poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay)
     }
 
     pub(crate) async fn mark_pending_spent_utxos(
@@ -633,15 +679,52 @@ impl WalletSession {
         utxos: &[Utxo],
         tx_hash: Option<FixedBytes<32>>,
     ) {
-        self.handle.mark_pending_spent_utxos(utxos, tx_hash).await;
+        match self.handle.mark_pending_spent_utxos(utxos, tx_hash).await {
+            Ok(
+                WalletPendingSpentMarkOutcome::Marked
+                | WalletPendingSpentMarkOutcome::AlreadyProtected,
+            ) => {}
+            Err(error) => {
+                tracing::warn!(%error, "wallet actor rejected local pending-spend update");
+            }
+        }
     }
 
     pub async fn clear_local_pending_spent(&self) -> bool {
-        self.handle.clear_local_pending_spent().await
+        match self.handle.clear_all_local_pending_spent().await {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error, "wallet actor rejected local pending-spend clear");
+                false
+            }
+        }
     }
 
     pub async fn refresh_poi_statuses(&self) -> bool {
         self.handle.refresh_poi_statuses().await
+    }
+
+    pub async fn retry_poi_artifact_cache(&self) -> Result<WalletPoiArtifactCacheRetry> {
+        let retry = self
+            .public_data_plane
+            .retry_poi_artifact_cache()
+            .await
+            .wrap_err("retry chain PPOI corpus refresh")?;
+        Ok(WalletPoiArtifactCacheRetry {
+            retry,
+            handle: self.handle.clone(),
+        })
+    }
+}
+
+impl Drop for WalletSession {
+    fn drop(&mut self) {
+        let _ = self.projection_cancel_tx.send(true);
+        if let Ok(projection_join) = self.projection_join.get_mut()
+            && let Some(projection_join) = projection_join.take()
+        {
+            projection_join.abort();
+        }
     }
 }
 
@@ -650,21 +733,28 @@ pub(crate) fn poi_verified_unspent_utxos_from_records(
     pending_overlay: &WalletPendingOverlay,
 ) -> Vec<Utxo> {
     let active_poi_list_keys = default_active_poi_list_keys();
-    let pending_spent_keys = pending_spent_keys(pending_overlay);
+    let chain_pending_spent_keys = chain_pending_spent_keys(pending_overlay);
     utxos
         .iter()
         .filter(|entry| !entry.is_spent())
-        .filter(|entry| !pending_spent_keys.contains(&(entry.utxo.tree, entry.utxo.position)))
+        .filter(|entry| {
+            !chain_pending_spent_keys.contains(&(entry.utxo.tree, entry.utxo.position))
+                && !pending_overlay
+                    .local_pending_spent
+                    .iter()
+                    .any(|spent| spent.matches_local_utxo(entry))
+        })
         .filter(|entry| entry.utxo.poi.is_valid_for_lists(&active_poi_list_keys))
         .map(|entry| entry.utxo.clone())
         .collect()
 }
 
-pub(super) fn pending_spent_keys(pending_overlay: &WalletPendingOverlay) -> HashSet<(u32, u64)> {
+pub(super) fn chain_pending_spent_keys(
+    pending_overlay: &WalletPendingOverlay,
+) -> HashSet<(u32, u64)> {
     pending_overlay
         .pending_spent
         .iter()
-        .chain(pending_overlay.local_pending_spent.iter())
         .map(WalletPendingSpent::key)
         .collect()
 }
@@ -673,11 +763,17 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
     request: BlockedShieldRescueEligibilityRequest,
     http: &HttpContext,
 ) -> Result<BlockedShieldRescueEligibility> {
-    let utxos = request.session.handle.utxos.read().await.clone();
-    let pending_overlay = request.session.handle.pending_overlay().await;
-    let Some(utxo) =
-        blocked_shield_rescue_candidate_from_records(&utxos, &pending_overlay, &request.utxo_id)
-    else {
+    let Some(snapshot) = request.session.handle.current_snapshot() else {
+        return Ok(blocked_shield_rescue_disabled(
+            "Wallet state is temporarily unavailable while synchronization resets.",
+            None,
+        ));
+    };
+    let Some(utxo) = blocked_shield_rescue_candidate_from_records(
+        &snapshot.utxos,
+        &snapshot.pending_overlay,
+        &request.utxo_id,
+    ) else {
         return Ok(blocked_shield_rescue_disabled(
             "Selected UTXO is not an unspent blocked Shield that can be refunded.",
             None,
@@ -760,12 +856,18 @@ pub(crate) fn blocked_shield_rescue_candidate_from_records(
     pending_overlay: &WalletPendingOverlay,
     utxo_id: &BlockedShieldRescueUtxoId,
 ) -> Option<Utxo> {
-    let pending_spent_keys = pending_spent_keys(pending_overlay);
+    let chain_pending_spent_keys = chain_pending_spent_keys(pending_overlay);
     let active_poi_list_keys = default_active_poi_list_keys();
     utxos
         .iter()
         .filter(|entry| !entry.is_spent())
-        .filter(|entry| !pending_spent_keys.contains(&(entry.utxo.tree, entry.utxo.position)))
+        .filter(|entry| {
+            !chain_pending_spent_keys.contains(&(entry.utxo.tree, entry.utxo.position))
+                && !pending_overlay
+                    .local_pending_spent
+                    .iter()
+                    .any(|spent| spent.matches_local_utxo(entry))
+        })
         .find(|entry| blocked_shield_rescue_utxo_matches(&entry.utxo, utxo_id))
         .filter(|entry| {
             utxos::activity_utxo_classification(&entry.utxo.poi, &active_poi_list_keys)
@@ -1584,7 +1686,7 @@ pub(super) async fn public_broadcaster_setup(
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let artifact_source = artifact_source(http, session.db.as_ref());
-    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&session.db));
+    let prover = ProverService::new_with_db(&artifact_source, &session.db);
     let chain_handle = session
         .sync_manager
         .chain_handle(&session.chain_key)
@@ -1592,7 +1694,7 @@ pub(super) async fn public_broadcaster_setup(
         .ok_or_else(|| eyre!("chain handle not found for chain {chain_id}"))?;
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
-    let utxos = session.unspent_utxos().await;
+    let utxos = session.unspent_utxos();
 
     Ok(PublicBroadcasterSetup {
         chain,

@@ -64,6 +64,7 @@ waku = { workspace = true }
 waku-relay = { workspace = true }
 
 [dev-dependencies]
+redb = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

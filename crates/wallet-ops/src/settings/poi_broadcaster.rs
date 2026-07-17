@@ -2,8 +2,8 @@ use super::{
     BroadcasterFeePolicy, DEFAULT_PUBLIC_BROADCASTER_RESPONSE_TIMEOUT_SECS, Deserialize,
     MAX_INTERVAL_SECS, OFFICIAL_POI_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_IPNS_NAME,
     OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY, PUBLIC_BROADCASTER_REPUBLISH_INTERVAL,
-    PoiArtifactManifestSource, PoiArtifactSourceConfig, Serialize, Url, parse_fixed_hex_32,
-    validate_optional_range, validate_range, validate_url_scheme,
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, SensitiveUrl, Serialize, Url,
+    parse_fixed_hex_32, validate_optional_range, validate_range, validate_url_scheme,
 };
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,7 +85,9 @@ impl PoiArtifactSettings {
             gateway_urls: self
                 .gateway_urls
                 .iter()
-                .map(|gateway| Url::parse(gateway).expect("validated POI gateway URL"))
+                .map(|gateway| {
+                    SensitiveUrl::from(Url::parse(gateway).expect("validated POI gateway URL"))
+                })
                 .collect(),
             max_manifest_age: self
                 .max_manifest_age_secs
@@ -151,7 +153,9 @@ impl PoiArtifactManifestSourceSetting {
     pub(super) fn to_runtime(&self) -> PoiArtifactManifestSource {
         match self {
             Self::Url(url) => PoiArtifactManifestSource::Url(
-                Url::parse(url).expect("validated POI artifact manifest URL"),
+                Url::parse(url)
+                    .expect("validated POI artifact manifest URL")
+                    .into(),
             ),
             Self::Cid(cid) => PoiArtifactManifestSource::Cid(cid.clone()),
             Self::IpnsName(name) => PoiArtifactManifestSource::IpnsName(name.clone()),

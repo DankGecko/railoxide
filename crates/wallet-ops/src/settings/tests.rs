@@ -904,8 +904,10 @@ fn price_anchor_validation_covers_oracle_and_product_metadata() {
 #[test]
 fn default_poi_read_source_converts_to_official_indexed_artifacts() {
     let settings = WalletSettings::default();
-    let super::PoiReadSource::IndexedArtifacts(source) =
-        settings.poi_read_source().expect("POI source")
+    let super::PoiReadSource::IndexedArtifacts {
+        artifact_source: source,
+        ..
+    } = settings.poi_read_source().expect("POI source")
     else {
         panic!("default POI source should be indexed artifacts");
     };
@@ -929,10 +931,10 @@ fn default_poi_rpc_url_matches_default_poi_service() {
     let settings = WalletSettings::default();
 
     assert_eq!(
-        settings.poi_rpc_url().expect("POI RPC URL").as_str(),
-        reqwest::Url::parse(poi::poi::DEFAULT_WALLET_POI_RPC_URL)
-            .expect("default POI RPC URL")
-            .as_str()
+        settings.poi_rpc_url().expect("POI RPC URL"),
+        super::SensitiveUrl::from(
+            reqwest::Url::parse(poi::poi::DEFAULT_WALLET_POI_RPC_URL).expect("default POI RPC URL")
+        )
     );
 }
 
@@ -942,9 +944,59 @@ fn custom_poi_rpc_url_is_runtime_url() {
     settings.poi.proxy.rpc_url = "https://poi.example/rpc".to_string();
 
     assert_eq!(
-        settings.poi_rpc_url().expect("custom POI RPC URL").as_str(),
-        "https://poi.example/rpc"
+        settings.poi_rpc_url().expect("custom POI RPC URL"),
+        super::SensitiveUrl::from(
+            reqwest::Url::parse("https://poi.example/rpc").expect("custom POI RPC URL")
+        )
     );
+}
+
+#[test]
+fn poi_runtime_policy_formatting_redacts_configured_endpoints() {
+    let mut settings = WalletSettings::default();
+    settings.poi.proxy.rpc_url =
+        "https://rpc-user-sentinel:rpc-password-sentinel@rpc-host-sentinel.invalid/rpc-path-sentinel?rpc-query-sentinel#rpc-fragment-sentinel".to_string();
+    settings.poi.artifact.manifest_source = super::PoiArtifactManifestSourceSetting::Url(
+        "https://manifest-user-sentinel:manifest-password-sentinel@manifest-host-sentinel.invalid/manifest-path-sentinel?manifest-query-sentinel#manifest-fragment-sentinel".to_string(),
+    );
+    settings.poi.artifact.gateway_urls = vec![
+        "https://gateway-user-sentinel:gateway-password-sentinel@gateway-host-sentinel.invalid/gateway-path-sentinel?gateway-query-sentinel#gateway-fragment-sentinel".to_string(),
+    ];
+
+    let policy = settings.poi_read_source().expect("sensitive POI policy");
+    let formatted = format!("{policy:?}");
+    for sentinel in [
+        "rpc-user-sentinel",
+        "rpc-password-sentinel",
+        "rpc-host-sentinel",
+        "rpc-path-sentinel",
+        "rpc-query-sentinel",
+        "rpc-fragment-sentinel",
+        "manifest-user-sentinel",
+        "manifest-password-sentinel",
+        "manifest-host-sentinel",
+        "manifest-path-sentinel",
+        "manifest-query-sentinel",
+        "manifest-fragment-sentinel",
+        "gateway-user-sentinel",
+        "gateway-password-sentinel",
+        "gateway-host-sentinel",
+        "gateway-path-sentinel",
+        "gateway-query-sentinel",
+        "gateway-fragment-sentinel",
+    ] {
+        assert!(
+            !formatted.contains(sentinel),
+            "leaked {sentinel}: {formatted}"
+        );
+    }
+    assert!(settings.poi.proxy.rpc_url.contains("rpc-user-sentinel"));
+    assert!(matches!(
+        settings.poi.artifact.manifest_source,
+        super::PoiArtifactManifestSourceSetting::Url(ref url)
+            if url.contains("manifest-user-sentinel")
+    ));
+    assert!(settings.poi.artifact.gateway_urls[0].contains("gateway-user-sentinel"));
 }
 
 #[test]

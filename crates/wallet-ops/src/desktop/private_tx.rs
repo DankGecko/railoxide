@@ -19,7 +19,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     }
 
     let artifact_source = artifact_source(http, request.session.db.as_ref());
-    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
+    let prover = ProverService::new_with_db(&artifact_source, &request.session.db);
     let chain_handle = request
         .session
         .sync_manager
@@ -29,7 +29,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
 
-    let utxos = request.session.unspent_utxos().await;
+    let utxos = request.session.unspent_utxos();
     let mode = if request.unwrap {
         UnshieldMode::UnwrapBase
     } else {
@@ -340,7 +340,7 @@ pub async fn prepare_blocked_shield_rescue_preview(
     request: BlockedShieldRescuePreviewRequest,
     http: &HttpContext,
 ) -> Result<BlockedShieldRescuePreview> {
-    let utxo = selected_blocked_shield_rescue_utxo(&request.session, &request.utxo_id).await?;
+    let utxo = selected_blocked_shield_rescue_utxo(&request.session, &request.utxo_id)?;
     let eligibility = resolve_blocked_shield_rescue_eligibility(
         BlockedShieldRescueEligibilityRequest {
             chain_id: request.chain_id,
@@ -393,7 +393,7 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
         ));
     }
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
-    let utxo = selected_blocked_shield_rescue_utxo(&request.session, &request.utxo_id).await?;
+    let utxo = selected_blocked_shield_rescue_utxo(&request.session, &request.utxo_id)?;
     let token = utxo.token_address();
     let amount = utxo.note.value;
     let eligibility = resolve_blocked_shield_rescue_eligibility(
@@ -426,7 +426,7 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
     )?;
 
     let artifact_source = artifact_source(http, request.session.db.as_ref());
-    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
+    let prover = ProverService::new_with_db(&artifact_source, &request.session.db);
     let chain_handle = request
         .session
         .sync_manager
@@ -494,14 +494,20 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
     })
 }
 
-pub(super) async fn selected_blocked_shield_rescue_utxo(
+pub(super) fn selected_blocked_shield_rescue_utxo(
     session: &WalletSession,
     utxo_id: &BlockedShieldRescueUtxoId,
 ) -> Result<Utxo> {
-    let utxos = session.handle.utxos.read().await.clone();
-    let pending_overlay = session.handle.pending_overlay().await;
-    blocked_shield_rescue_candidate_from_records(&utxos, &pending_overlay, utxo_id)
-        .ok_or_else(|| eyre!("selected UTXO is not an unspent blocked Shield that can be refunded"))
+    let snapshot = session
+        .handle
+        .current_snapshot()
+        .ok_or_else(|| eyre!("wallet state is unavailable while synchronization resets"))?;
+    blocked_shield_rescue_candidate_from_records(
+        &snapshot.utxos,
+        &snapshot.pending_overlay,
+        utxo_id,
+    )
+    .ok_or_else(|| eyre!("selected UTXO is not an unspent blocked Shield that can be refunded"))
 }
 
 pub(crate) fn matched_blocked_shield_rescue_public_account_uuid(
@@ -586,7 +592,7 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
     let recipient_data = parse_railgun_recipient(recipient)?;
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
     let artifact_source = artifact_source(http, request.session.db.as_ref());
-    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
+    let prover = ProverService::new_with_db(&artifact_source, &request.session.db);
     let chain_handle = request
         .session
         .sync_manager
@@ -596,7 +602,7 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
 
-    let utxos = request.session.unspent_utxos().await;
+    let utxos = request.session.unspent_utxos();
     let send_request = RailgunSendRequest {
         token_address: request.token,
         amount: request.amount,
@@ -653,7 +659,7 @@ pub(super) async fn persist_manual_unshield_pending_pois(
     plan: &DesktopUnshieldPreparedPlan,
     session: &WalletSession,
     chain_id: u64,
-    wallet_id: &str,
+    _wallet_id: &str,
     prover: &ProverService,
     verify_proof: bool,
     http: &HttpContext,
@@ -672,26 +678,24 @@ pub(super) async fn persist_manual_unshield_pending_pois(
     match plan {
         DesktopUnshieldPreparedPlan::Single(plan) => {
             persist_pending_unshield_output_poi_contexts(
-                session.db.as_ref(),
-                chain_id,
-                wallet_id,
+                session,
                 &plan.chunks,
                 &pending_pois,
                 &pending_poi_list_keys,
                 false,
                 false,
-            )?;
+            )
+            .await?;
         }
         DesktopUnshieldPreparedPlan::Composite(plan) => {
             persist_pending_composite_unshield_output_poi_contexts(
-                session.db.as_ref(),
-                chain_id,
-                wallet_id,
+                session,
                 &plan.chunks,
                 &plan.private_output_roles,
                 &pending_pois,
                 &pending_poi_list_keys,
-            )?;
+            )
+            .await?;
         }
     }
     Ok(())
@@ -701,7 +705,7 @@ pub(super) async fn persist_manual_send_pending_pois(
     plan: &SendPlan,
     session: &WalletSession,
     chain_id: u64,
-    wallet_id: &str,
+    _wallet_id: &str,
     prover: &ProverService,
     verify_proof: bool,
     http: &HttpContext,
@@ -718,15 +722,14 @@ pub(super) async fn persist_manual_send_pending_pois(
     )
     .await?;
     persist_pending_send_output_poi_contexts(
-        session.db.as_ref(),
-        chain_id,
-        wallet_id,
+        session,
         &plan.chunks,
         &pending_pois,
         &pending_poi_list_keys,
         false,
         false,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -935,7 +938,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
-    let utxos = request.session.unspent_utxos().await;
+    let utxos = request.session.unspent_utxos();
     let same_token_fee = request.fee_token == request.token;
     let native_top_up = request
         .native_top_up
@@ -1095,7 +1098,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
-    let utxos = request.session.unspent_utxos().await;
+    let utxos = request.session.unspent_utxos();
     let same_token_fee = request.fee_token == request.token;
     let initial_fee_amount =
         initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {

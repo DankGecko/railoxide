@@ -356,7 +356,7 @@ impl LedgerHardwareDerivationClient {
                     &error,
                     apdu,
                     device_confirmation_started,
-                    info,
+                    *info,
                 ) {
                     return Ok(LedgerEip712ClearSigningOutcome::Downgrade(mode));
                 }
@@ -538,6 +538,7 @@ fn ledger_device_model(product_id: u16, product: Option<&str>) -> LedgerDeviceMo
     }
 }
 
+#[must_use]
 pub fn classify_ledger_typed_data_signing_mode(
     info: &LedgerDeviceInfo,
 ) -> HardwareTypedDataSigningMode {
@@ -583,7 +584,7 @@ pub(crate) fn ledger_eip712_clear_failure_downgrade_mode(
     error: &HardwareDerivationError,
     failed_apdu: &LedgerEip712Apdu,
     device_confirmation_started: bool,
-    info: &LedgerDeviceInfo,
+    info: LedgerDeviceInfo,
 ) -> Option<HardwareTypedDataSigningMode> {
     if !matches!(
         classify_ledger_eip712_clear_failure(error, failed_apdu, device_confirmation_started),
@@ -875,7 +876,9 @@ fn ledger_eip712_type_parts(
     }
 }
 
-fn ledger_eip712_primitive_type(primitive: &HardwareEip712PrimitiveType) -> LedgerEip712BaseType {
+const fn ledger_eip712_primitive_type(
+    primitive: &HardwareEip712PrimitiveType,
+) -> LedgerEip712BaseType {
     match primitive {
         HardwareEip712PrimitiveType::Bool => LedgerEip712BaseType::Bool,
         HardwareEip712PrimitiveType::Int(bits) => LedgerEip712BaseType::Int(*bits),
@@ -1433,7 +1436,7 @@ mod tests {
                 &error,
                 &failed_apdu,
                 false,
-                &ledger_clear_info()
+                ledger_clear_info()
             ),
             Some(HardwareTypedDataSigningMode::Eip712HashFallback)
         );
@@ -1442,7 +1445,7 @@ mod tests {
                 &error,
                 &failed_apdu,
                 false,
-                &ledger_no_hash_fallback_info()
+                ledger_no_hash_fallback_info()
             ),
             None
         );
@@ -1462,7 +1465,7 @@ mod tests {
                 &error,
                 &failed_apdu,
                 false,
-                &ledger_clear_info()
+                ledger_clear_info()
             ),
             None
         );
@@ -1492,7 +1495,7 @@ mod tests {
                 &rejected_error,
                 &definition_apdu,
                 false,
-                &ledger_clear_info()
+                ledger_clear_info()
             ),
             None
         );

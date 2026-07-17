@@ -1,5 +1,11 @@
 use super::super::*;
 use super::helpers::*;
+use alloy::primitives::FixedBytes;
+use local_db::{
+    OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, PendingOutputPoiContextRecord,
+    PendingOutputPoiRole, WalletMeta, WalletSyncActorStateRecord,
+};
+use std::collections::BTreeMap;
 use std::fs;
 
 #[test]
@@ -26,6 +32,13 @@ fn wallet_metadata_flows_auto_create_initial_public_account() {
             &generated_metadata,
         )
         .expect("store generated wallet with metadata");
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_index_complete_record_key(
+            generated_wallet_id,
+        ))
+        .expect("load generated ownership completeness")
+        .is_some()
+    );
     let generated_session = store
         .load_view_session(TEST_PASSWORD, generated_wallet_id)
         .expect("generated view session");
@@ -144,10 +157,12 @@ fn wallet_metadata_listing_defaults_and_synthesizes_records() {
     assert_eq!(metadata.len(), 2);
     assert_eq!(legacy.status, WalletStatus::Active);
     assert_eq!(legacy.display_order, 0);
+    assert!(legacy.pending_create_new_chain_ids.is_empty());
     assert_eq!(synthesized.label, "Wallet 2");
     assert_eq!(synthesized.derivation_index, 1);
     assert_eq!(synthesized.status, WalletStatus::Active);
     assert_eq!(synthesized.display_order, 1);
+    assert!(synthesized.pending_create_new_chain_ids.is_empty());
 
     let persisted_legacy = store
         .load_wallet_metadata(TEST_PASSWORD, legacy_wallet_id)
@@ -157,6 +172,57 @@ fn wallet_metadata_listing_defaults_and_synthesizes_records() {
         .expect("load synthesized metadata");
     assert_eq!(persisted_legacy, legacy.clone());
     assert_eq!(persisted_synthesized, synthesized.clone());
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn software_wallet_creation_persists_pending_chains_only_for_generated_wallets() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let pending_chain_ids = BTreeSet::from([1, 56, 137]);
+    let generated_id = "generated-pending-wallet";
+    let generated = store
+        .new_wallet_metadata_with_pending_create_new_chain_ids(
+            TEST_PASSWORD,
+            generated_id,
+            0,
+            WalletSource::Generated,
+            "Generated pending",
+            pending_chain_ids.clone(),
+        )
+        .expect("create generated metadata");
+    let seed = generate_seed_material().expect("generate seed");
+    store
+        .store_generated_wallet_with_metadata(
+            TEST_PASSWORD,
+            generated_id,
+            0,
+            "english",
+            &seed,
+            &generated,
+        )
+        .expect("atomically store generated wallet and metadata");
+    assert_eq!(
+        store
+            .load_wallet_metadata(TEST_PASSWORD, generated_id)
+            .expect("reload generated metadata")
+            .pending_create_new_chain_ids,
+        pending_chain_ids
+    );
+
+    let imported = store
+        .new_wallet_metadata_with_pending_create_new_chain_ids(
+            TEST_PASSWORD,
+            "imported-no-pending-wallet",
+            0,
+            WalletSource::Imported,
+            "Imported no pending",
+            BTreeSet::from([1, 137]),
+        )
+        .expect("create imported metadata");
+    assert!(imported.pending_create_new_chain_ids.is_empty());
 
     drop(store);
     drop(db);
@@ -418,7 +484,7 @@ fn session_wallet_management_renames_hides_shows_reorders_and_guards_last_active
 fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active() {
     let (root_dir, db, store) = desktop_store_with_vault();
     let first_wallet_id = "delete-wallet-a";
-    let second_wallet_id = "delete-wallet-b";
+    let second_wallet_id = "64656c6574652d77616c6c65742d6221";
     let third_wallet_id = "delete-wallet-c";
     let first_session = import_wallet_with_metadata(&store, first_wallet_id, "Alpha");
     let second_session = import_wallet_with_metadata(&store, second_wallet_id, "Beta");
@@ -441,14 +507,105 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
             100,
         )
         .expect("second chain metadata");
-    let first_cache_key =
-        wallet_cache_row_record_key(&first_chain.wallet_chain_uuid, &[0x11; KEY_LEN]);
-    let second_cache_key =
-        wallet_cache_row_record_key(&second_chain.wallet_chain_uuid, &[0x22; KEY_LEN]);
-    db.put_desktop_wallet_vault_record(&first_cache_key, b"first cache")
-        .expect("store first cache row");
-    db.put_desktop_wallet_vault_record(&second_cache_key, b"second cache")
-        .expect("store second cache row");
+    let second_cache_key = second_chain
+        .wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .expect("second wallet cache key");
+    db.put_wallet_utxo(
+        &second_cache_key,
+        "atomic-row",
+        b"encrypted atomic cache row",
+    )
+    .expect("store atomic cache row");
+    db.put_wallet_meta(
+        &second_cache_key,
+        &WalletMeta {
+            last_scanned_block: 123,
+            updated_at: 1,
+            last_scanned_block_hash: None,
+        },
+    )
+    .expect("store atomic cache metadata");
+    db.put_wallet_sync_actor_state(&WalletSyncActorStateRecord {
+        chain_id: second_chain.chain_id,
+        wallet_id: second_cache_key.to_string(),
+        highest_accepted_reset_intent: 7,
+        pending_reset: None,
+        updated_at: 2,
+    })
+    .expect("store actor state");
+    let pending_commitment = FixedBytes::from([0x31; 32]);
+    db.put_pending_output_poi_context(&PendingOutputPoiContextRecord {
+        chain_id: second_chain.chain_id,
+        wallet_id: second_cache_key.to_string(),
+        txid_version: "V2_PoseidonMerkle".to_string(),
+        output_commitment: pending_commitment,
+        output_npk: FixedBytes::from([0x32; 32]),
+        utxo_tree_in: 1,
+        railgun_txid: U256::from(3),
+        txid_merkleroot_index: None,
+        pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::new(),
+        required_poi_list_keys: Vec::new(),
+        output_role: PendingOutputPoiRole::Recipient,
+        created_at: 3,
+        source_operation_id: None,
+        observation: None,
+        submitted_poi_list_keys: Vec::new(),
+        terminal_error: None,
+    })
+    .expect("store pending output context");
+    db.put_pending_output_poi_context(&PendingOutputPoiContextRecord {
+        chain_id: second_chain.chain_id,
+        wallet_id: second_wallet_id.to_string(),
+        txid_version: "V2_PoseidonMerkle".to_string(),
+        output_commitment: FixedBytes::from([0x35; 32]),
+        output_npk: FixedBytes::from([0x36; 32]),
+        utxo_tree_in: 1,
+        railgun_txid: U256::from(5),
+        txid_merkleroot_index: None,
+        pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::new(),
+        required_poi_list_keys: Vec::new(),
+        output_role: PendingOutputPoiRole::Recipient,
+        created_at: 3,
+        source_operation_id: None,
+        observation: None,
+        submitted_poi_list_keys: Vec::new(),
+        terminal_error: None,
+    })
+    .expect("store alpha wallet-identity pending output context");
+    let recovery_commitment = FixedBytes::from([0x41; 32]);
+    db.put_output_poi_recovery(&OutputPoiRecoveryRecord {
+        chain_id: second_chain.chain_id,
+        wallet_id: second_cache_key.to_string(),
+        output_commitment: recovery_commitment,
+        source_tx_hash: FixedBytes::from([0x42; 32]),
+        tx_input: None,
+        status: OutputPoiRecoveryStatus::Recoverable,
+        created_at: 4,
+        updated_at: 4,
+        last_detection_at: Some(4),
+        last_submission_at: None,
+        next_retry_at: None,
+        attempt_count: 0,
+        last_error: None,
+    })
+    .expect("store output recovery");
+    db.put_output_poi_recovery(&OutputPoiRecoveryRecord {
+        chain_id: second_chain.chain_id,
+        wallet_id: second_wallet_id.to_string(),
+        output_commitment: FixedBytes::from([0x45; 32]),
+        source_tx_hash: FixedBytes::from([0x46; 32]),
+        tx_input: None,
+        status: OutputPoiRecoveryStatus::Recoverable,
+        created_at: 4,
+        updated_at: 4,
+        last_detection_at: Some(4),
+        last_submission_at: None,
+        next_retry_at: None,
+        attempt_count: 0,
+        last_error: None,
+    })
+    .expect("store alpha wallet-identity output recovery");
     let private_account = store
         .import_public_account(
             TEST_PASSWORD,
@@ -482,6 +639,39 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
         .collect::<Vec<_>>();
     assert!(private_account_ids.contains(&private_account.public_account_uuid));
 
+    db.put_desktop_wallet_vault_record(
+        &wallet_chain_metadata_record_key(&second_chain.wallet_chain_uuid),
+        b"corrupt wallet-chain metadata",
+    )
+    .expect("corrupt target chain metadata");
+    let second_chain_index_key =
+        wallet_chain_index_record_key(second_wallet_id, &second_chain.wallet_chain_uuid);
+    db.delete_desktop_wallet_vault_record(&second_chain_index_key)
+        .expect("remove target chain ownership index");
+    db.delete_desktop_wallet_vault_record(&wallet_chain_index_complete_record_key(
+        second_wallet_id,
+    ))
+    .expect("remove target ownership completeness");
+    assert!(matches!(
+        store.delete_wallet_for_session(&first_session, second_wallet_id),
+        Err(VaultError::WalletChainMetadataUnavailable)
+    ));
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_metadata_record_key(second_wallet_id))
+            .expect("load retained wallet metadata")
+            .is_some()
+    );
+    assert!(
+        db.get_wallet_meta(&second_cache_key)
+            .expect("load retained atomic metadata")
+            .is_some()
+    );
+    db.put_desktop_wallet_vault_record(
+        &second_chain_index_key,
+        &rmp_serde::to_vec_named(&second_chain.chain_id).expect("encode chain id"),
+    )
+    .expect("restore target chain ownership index");
+
     let deleted = store
         .delete_wallet_for_session(&first_session, second_wallet_id)
         .expect("delete active wallet");
@@ -498,7 +688,7 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
         wallet_view_record_key(second_wallet_id),
         wallet_spend_record_key(second_wallet_id),
         wallet_chain_metadata_record_key(&second_chain.wallet_chain_uuid),
-        second_cache_key,
+        second_chain_index_key,
     ] {
         assert!(
             db.get_desktop_wallet_vault_record(&key)
@@ -507,12 +697,46 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
             "expected {key} to be deleted"
         );
     }
+    assert!(
+        db.list_wallet_utxos(&second_cache_key)
+            .expect("list deleted atomic cache rows")
+            .is_empty()
+    );
+    assert!(
+        db.get_wallet_meta(&second_cache_key)
+            .expect("load deleted atomic metadata")
+            .is_none()
+    );
+    assert!(
+        db.get_wallet_sync_actor_state(second_chain.chain_id, second_cache_key.as_str())
+            .expect("load deleted actor state")
+            .is_none()
+    );
+    assert!(
+        db.list_pending_output_poi_contexts(second_chain.chain_id, second_cache_key.as_str())
+            .expect("list deleted pending output contexts")
+            .is_empty()
+    );
+    assert!(
+        db.list_output_poi_recoveries(second_chain.chain_id, second_cache_key.as_str())
+            .expect("list deleted output recoveries")
+            .is_empty()
+    );
+    assert!(
+        db.list_pending_output_poi_contexts(second_chain.chain_id, second_wallet_id)
+            .expect("list deleted alpha wallet-identity pending contexts")
+            .is_empty()
+    );
+    assert!(
+        db.list_output_poi_recoveries(second_chain.chain_id, second_wallet_id)
+            .expect("list deleted alpha wallet-identity output recoveries")
+            .is_empty()
+    );
     for key in [
         wallet_metadata_record_key(first_wallet_id),
         wallet_view_record_key(first_wallet_id),
         wallet_spend_record_key(first_wallet_id),
         wallet_chain_metadata_record_key(&first_chain.wallet_chain_uuid),
-        first_cache_key,
     ] {
         assert!(
             db.get_desktop_wallet_vault_record(&key)
@@ -578,6 +802,158 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
+
+#[test]
+fn ownership_complete_wallet_deletion_ignores_unrelated_ambiguous_metadata() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let first_session = import_wallet_with_metadata(&store, "complete-first", "First");
+    let second_wallet_id = "complete-second";
+    let second_session = import_wallet_with_metadata(&store, second_wallet_id, "Second");
+    let ambiguous_key = wallet_chain_metadata_record_key("unrelated-legacy-hardware");
+    db.put_desktop_wallet_vault_record(&ambiguous_key, b"unreadable legacy metadata")
+        .expect("store unrelated ambiguous metadata");
+    assert!(
+        store
+            .find_wallet_chain_metadata_for_session(
+                &second_session,
+                0,
+                1,
+                "0x1111111111111111111111111111111111111111",
+            )
+            .expect("scan certified wallet metadata")
+            .is_none()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_index_complete_record_key(
+            second_wallet_id
+        ))
+        .expect("load retained completeness marker")
+        .is_some()
+    );
+
+    let deleted = store
+        .delete_wallet_for_session(&first_session, second_wallet_id)
+        .expect("delete ownership-complete wallet");
+    assert_eq!(deleted.wallet_uuid, second_wallet_id);
+    assert!(
+        db.get_desktop_wallet_vault_record(&ambiguous_key)
+            .expect("load unrelated metadata")
+            .is_some()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_index_complete_record_key(
+            second_wallet_id
+        ))
+        .expect("load deleted completeness marker")
+        .is_none()
+    );
+
+    drop(second_session);
+    drop(first_session);
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn ambiguous_legacy_scan_does_not_certify_ownership_completeness() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let wallet_id = "ambiguous-legacy-wallet";
+    let session = import_wallet_with_metadata(&store, wallet_id, "Legacy");
+    let completeness_key = wallet_chain_index_complete_record_key(wallet_id);
+    db.delete_desktop_wallet_vault_record(&completeness_key)
+        .expect("remove creation-time completeness");
+    db.put_desktop_wallet_vault_record(
+        &wallet_chain_metadata_record_key("unindexed-corrupt-chain"),
+        b"corrupt chain metadata",
+    )
+    .expect("store ambiguous chain metadata");
+
+    assert!(
+        store
+            .find_wallet_chain_metadata_for_session(
+                &session,
+                0,
+                1,
+                "0x1111111111111111111111111111111111111111",
+            )
+            .expect("scan legacy metadata")
+            .is_none()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&completeness_key)
+            .expect("load completeness marker")
+            .is_none()
+    );
+
+    drop(session);
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn authenticated_malformed_legacy_metadata_blocks_certification_and_deletion() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let wallet_id = "33333333333333333333333333333333";
+    let session = import_wallet_with_metadata(&store, wallet_id, "Malformed");
+    import_wallet_with_metadata(&store, "malformed-survivor", "Survivor");
+    let wallet_chain_uuid = "44444444444444444444444444444444";
+    let record = session
+        .clone_vault_view_unlock()
+        .encrypt_record(
+            RecordKind::WalletChainMetadata,
+            wallet_chain_uuid,
+            b"invalid wallet chain metadata",
+        )
+        .expect("encrypt malformed metadata plaintext");
+    let chain_key = wallet_chain_metadata_record_key(wallet_chain_uuid);
+    db.put_desktop_wallet_vault_record(
+        &chain_key,
+        &rmp_serde::to_vec_named(&record).expect("encode authenticated envelope"),
+    )
+    .expect("store authenticated malformed metadata");
+    let completeness_key = wallet_chain_index_complete_record_key(wallet_id);
+    db.delete_desktop_wallet_vault_record(&completeness_key)
+        .expect("remove creation-time completeness");
+
+    assert!(
+        store
+            .find_wallet_chain_metadata_for_session(
+                &session,
+                0,
+                1,
+                "0x1111111111111111111111111111111111111111",
+            )
+            .expect("scan authenticated malformed metadata")
+            .is_none()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&completeness_key)
+            .expect("load completeness marker")
+            .is_none()
+    );
+    assert!(matches!(
+        store.delete_wallet_for_session(&session, wallet_id),
+        Err(VaultError::WalletChainMetadataUnavailable)
+    ));
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_metadata_record_key(wallet_id))
+            .expect("load retained wallet metadata")
+            .is_some()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&chain_key)
+            .expect("load retained malformed metadata")
+            .is_some()
+    );
+
+    drop(session);
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
 #[test]
 fn duplicate_seed_imports_keep_distinct_wallet_and_chain_ids() {
     let (root_dir, db, store) = desktop_store_with_vault();
@@ -694,6 +1070,7 @@ fn opaque_wallet_metadata_keeps_chain_details_encrypted() {
         display_order: 0,
         hardware_descriptor: None,
         hardware_account: None,
+        pending_create_new_chain_ids: BTreeSet::new(),
     };
     let chain_metadata = WalletChainMetadataBundle {
         wallet_chain_uuid: wallet_chain_uuid.clone(),
@@ -736,6 +1113,64 @@ fn opaque_wallet_metadata_keeps_chain_details_encrypted() {
     assert!(!contains_subsequence(&wallet_payload, b"primary wallet"));
     assert!(!contains_subsequence(&chain_payload, b"1234567890abcdef"));
 
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn concurrent_wallet_chain_find_or_create_persists_one_metadata_and_ownership_record() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let wallet_id = "concurrent-chain-wallet";
+    let session = Arc::new(import_wallet_with_metadata(&store, wallet_id, "Concurrent"));
+    let contract = "0x1111111111111111111111111111111111111111";
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut threads = Vec::new();
+
+    for start_block in [100, 200] {
+        let db = Arc::clone(&db);
+        let session = Arc::clone(&session);
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            let store = DesktopVaultStore::from_db(db);
+            barrier.wait();
+            store
+                .find_or_create_wallet_chain_metadata_for_session(
+                    session.as_ref(),
+                    0,
+                    1,
+                    contract,
+                    start_block,
+                    start_block - 1,
+                )
+                .expect("find or create chain metadata")
+        }));
+    }
+
+    barrier.wait();
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("join metadata creator"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
+    assert_eq!(
+        results[0].0.wallet_chain_uuid,
+        results[1].0.wallet_chain_uuid
+    );
+    assert_eq!(
+        db.list_desktop_wallet_vault_records(WALLET_CHAIN_METADATA_PREFIX)
+            .expect("list chain metadata")
+            .len(),
+        1
+    );
+    assert_eq!(
+        db.list_desktop_wallet_vault_records(&wallet_chain_index_prefix(wallet_id))
+            .expect("list chain ownership records")
+            .len(),
+        1
+    );
+
+    drop(session);
     drop(store);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

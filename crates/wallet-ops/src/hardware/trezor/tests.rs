@@ -24,6 +24,8 @@ use super::typed_data::{
 use crate::hardware_typed_data::HardwareEip712Model;
 use crate::vault::TrezorPassphraseMode;
 
+type RecordedMessages = Arc<Mutex<Vec<(MessageType, Vec<u8>)>>>;
+
 struct QueuedTransport {
     responses: VecDeque<ProtoMessage>,
     writes: Arc<Mutex<Vec<MessageType>>>,
@@ -31,7 +33,7 @@ struct QueuedTransport {
 
 struct RecordingTransport {
     responses: VecDeque<ProtoMessage>,
-    writes: Arc<Mutex<Vec<(MessageType, Vec<u8>)>>>,
+    writes: RecordedMessages,
 }
 
 impl Transport for QueuedTransport {
@@ -92,7 +94,7 @@ fn queued_message<M: TrezorMessage>(message: &M) -> ProtoMessage {
 
 fn recording_client(
     responses: VecDeque<ProtoMessage>,
-    writes: Arc<Mutex<Vec<(MessageType, Vec<u8>)>>>,
+    writes: RecordedMessages,
 ) -> TrezorHardwareDerivationClient {
     let client = trezor_client::client::trezor_with_transport(
         trezor_client::Model::Trezor,

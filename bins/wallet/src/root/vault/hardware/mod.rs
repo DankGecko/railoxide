@@ -1,5 +1,21 @@
 #[cfg(feature = "hardware")]
-use super::*;
+use super::{
+    Address, Arc, Context, DEFAULT_HARDWARE_DERIVATION_PATH, DesktopVaultStore, DesktopViewSession,
+    Duration, Focusable, HardwareDerivationDescriptor, HardwareDerivationError,
+    HardwareDerivationMethod, HardwareDeviceKind, HardwareProfileBindingKind,
+    HardwareProfileMetadata, HardwareProfileSession, HardwareRailgunAccountMetadata,
+    HardwareSetupErrorFocus, HardwareViewAccessKey, HardwareWalletProfile,
+    HardwareWalletSyncIntent, LedgerHardwareDerivationClient, ParentElement, ScrollableElement,
+    Styled, SyntheticRailgunEntropy, TrezorHardwareDerivationClient, TrezorPassphraseMode,
+    TrezorPinMatrixProvider, TrezorPinMatrixRequestKind, VaultError, VaultState, ViewUnlock,
+    WalletMetadataBundle, WalletRoot, WalletSetupMode, Window, WindowExt, Zeroize, Zeroizing,
+    app_strong_text, div, generate_opaque_id, hardware_device_kind_from_source,
+    hardware_setup_vault_error_focus, hardware_setup_vault_error_message,
+    hardware_setup_vault_error_preserves_password, hardware_view_access_key_from_hardware_output,
+    mpsc, parse_bip32_path, px, secondary_dialog_content_width, sleep,
+    synthetic_entropy_from_hardware_output, trezor_cipher_key_label, vault_error_kind,
+    vault_error_message, wallet_options_from_metadata,
+};
 #[cfg(not(feature = "hardware"))]
 use super::{Context, HardwareWalletSyncIntent, WalletRoot};
 

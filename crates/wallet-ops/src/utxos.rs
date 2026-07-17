@@ -217,10 +217,7 @@ pub(crate) fn apply_pending_overlay_to_outputs(
         .filter(|utxo| utxo.is_spent())
         .map(|utxo| (utxo.utxo.tree, utxo.utxo.position))
         .collect();
-    let mut local_pending_spent = BTreeMap::new();
-    for spent in overlay.local_pending_spent {
-        local_pending_spent.insert(spent.key(), spent);
-    }
+    let local_pending_spent = overlay.local_pending_spent;
     let mut pending_spent = BTreeMap::new();
     for spent in overlay.pending_spent {
         pending_spent.insert(spent.key(), spent);
@@ -232,7 +229,15 @@ pub(crate) fn apply_pending_overlay_to_outputs(
         }
         if let Some(spent) = pending_spent.get(&(output.tree, output.position)) {
             mark_output_pending_spent(output, spent);
-        } else if let Some(spent) = local_pending_spent.get(&(output.tree, output.position)) {
+        } else if let Some(spent) = local_pending_spent.iter().find(|spent| {
+            spent.key() == (output.tree, output.position)
+                && confirmed_utxos.iter().any(|utxo| {
+                    !utxo.is_spent()
+                        && utxo.utxo.tree == output.tree
+                        && utxo.utxo.position == output.position
+                        && spent.matches_local_utxo(utxo)
+                })
+        }) {
             mark_output_local_pending_spent(output, spent);
         }
     }
