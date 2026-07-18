@@ -31,7 +31,7 @@ use wallet_ops::{
     BlockedShieldRescueEligibilityRequest, BlockedShieldRescueInfo,
     BlockedShieldRescueSelfBroadcastRequest, BlockedShieldRescueUtxoId,
     DesktopPrivateSpendAuthorization, ListUtxosOutput, SelfBroadcastGasFeeSelection,
-    SelfBroadcastSessionEvent, UtxoOutput,
+    SelfBroadcastSessionEvent, UtxoOutput, UtxoPpoiState, WalletPpoiWorkflowStatus,
 };
 
 use super::actions::{UtxoEnd, UtxoHome, UtxoPageDown, UtxoPageUp};
@@ -60,7 +60,7 @@ enum UtxoNavigation {
 }
 
 const POI_COLUMN_INDEX: usize = 4;
-const POI_COLUMN_WIDTH: f32 = 130.0;
+const POI_COLUMN_WIDTH: f32 = 180.0;
 const BLOCKED_SHIELD_RESCUE_RESOLVING_REASON: &str = "Resolving source transaction origin...";
 const BLOCKED_SHIELD_REFUND_IN_FLIGHT_REASON: &str =
     "Blocked Shield refund submission is already in progress.";
@@ -131,8 +131,12 @@ impl WalletRoot {
                 &self.blocked_shield_refunds_in_flight,
             );
         }
+        let poi_refreshing = self
+            .chain_states
+            .get(&self.selected_chain)
+            .is_some_and(ChainUtxoState::poi_refreshing);
         self.utxo_table.update(cx, |state, cx| {
-            state.delegate_mut().set_rows(rows);
+            state.delegate_mut().set_rows(rows, poi_refreshing);
             cx.notify();
         });
     }
@@ -179,7 +183,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    pub(super) fn retry_poi_recovery(session: Option<Arc<wallet_ops::WalletSession>>, cx: &App) {
+    pub(super) fn retry_poi_submissions(session: Option<Arc<wallet_ops::WalletSession>>, cx: &App) {
         let Some(session) = session else {
             return;
         };
@@ -618,7 +622,7 @@ impl WalletRoot {
         content
     }
 
-    fn selected_chain_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {
+    pub(super) fn selected_chain_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {
         self.chain_states
             .get(&self.selected_chain)
             .and_then(ChainUtxoState::poi_refresh_session)
@@ -706,15 +710,41 @@ impl WalletRoot {
             return centered_message("Choose a wallet to view activity");
         }
         match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Error { message, .. }) => {
-                self.render_chain_error_body(root, message.as_ref())
-            }
+            Some(ChainUtxoState::Error {
+                message,
+                ppoi_workflow_status,
+                ..
+            }) => div()
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(render_ppoi_workflow_status_card(
+                    *ppoi_workflow_status,
+                    false,
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .child(self.render_chain_error_body(root, message.as_ref())),
+                ),
             Some(ChainUtxoState::Ready {
                 snapshot, session, ..
-            }) if snapshot.utxo_count == 0 => centered_message(format!(
-                "No UTXOs found. Synced from block {}.",
-                session.start_block
-            )),
+            }) if snapshot.utxo_count == 0 => div()
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(self.render_utxo_controls(root))
+                .child(centered_message(format!(
+                    "No UTXOs found. Synced from block {}.",
+                    session.start_block
+                ))),
             Some(state) if state.renders_table() => div()
                 .size_full()
                 .min_w(px(0.0))
@@ -752,8 +782,13 @@ impl WalletRoot {
         let snapshot = state.and_then(ChainUtxoState::snapshot);
         let local_pending_spent_count =
             snapshot.map_or(0, |snapshot| snapshot.local_pending_spent_count);
-        let recoverable_poi_count =
-            snapshot.map_or(0, |snapshot| recoverable_poi_candidate_count(snapshot));
+        let ppoi_workflow_status = state.map_or_else(
+            WalletPpoiWorkflowStatus::default,
+            ChainUtxoState::ppoi_workflow_status,
+        );
+        let owned_ppoi_retry_candidates = snapshot.map_or(0, |snapshot| {
+            recoverable_poi_candidate_count(snapshot.as_ref())
+        });
         let clear_search_input = self.tx_search_input.clone();
         let clear_search_table = self.utxo_table.clone();
         let search_input = app_input(&self.tx_search_input)
@@ -790,24 +825,20 @@ impl WalletRoot {
             });
         let poi_refreshing = state.is_some_and(ChainUtxoState::poi_refreshing);
         let poi_refresh_session = state.and_then(ChainUtxoState::poi_refresh_session);
-        let poi_recovery_session = poi_refresh_session.clone();
-        let poi_recovery_label = if recoverable_poi_count == 1 {
-            "Retry PPOI recovery".to_string()
-        } else {
-            format!("Retry PPOI recovery ({recoverable_poi_count})")
-        };
-        let poi_recovery_tooltip = format!(
-            "Retry recovery for {recoverable_poi_count} PPOI-pending private output{}",
-            if recoverable_poi_count == 1 { "" } else { "s" }
-        );
-        let poi_recovery_button = app_button("wallet-retry-poi-recovery", poi_recovery_label)
+        let poi_retry_root = root.clone();
+        let poi_retry_button = app_button(
+            "wallet-retry-poi-recovery",
+            poi_retry_button_label(poi_refreshing),
+        )
             .outline()
             .small()
             .loading(poi_refreshing)
             .disabled(poi_refreshing || poi_refresh_session.is_none())
-            .tooltip(poi_recovery_tooltip)
+            .tooltip("PPOI submission is normally automatic. Retry also processes recipient and broadcaster-fee outputs created by this wallet.")
             .on_click(move |_event, _window, cx| {
-                Self::retry_poi_recovery(poi_recovery_session.clone(), cx);
+                poi_retry_root.update(cx, |root, cx| {
+                    Self::retry_poi_submissions(root.selected_chain_session(), cx);
+                });
             });
 
         div()
@@ -815,6 +846,10 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .gap_2()
+            .children(render_ppoi_workflow_status_card(
+                ppoi_workflow_status,
+                poi_refreshing,
+            ))
             .when(local_pending_spent_count > 0, |this| {
                 this.child(
                     self.render_local_pending_spent_summary(
@@ -833,9 +868,14 @@ impl WalletRoot {
                     .child(div().w(px(280.0)).child(search_input))
                     .child(spent_toggle)
                     .child(div().flex_1())
-                    .when(recoverable_poi_count > 0, |this| {
-                        this.child(poi_recovery_button)
-                    }),
+                    .when(
+                        global_poi_retry_available(
+                            poi_refresh_session.is_some(),
+                            ppoi_workflow_status.needs_attention,
+                            owned_ppoi_retry_candidates,
+                        ),
+                        |this| this.child(poi_retry_button),
+                    ),
             )
     }
 
@@ -1005,6 +1045,7 @@ pub(super) struct UtxoDisplayRow {
     pub(super) amount: String,
     pub(super) activity_classification: String,
     pub(super) poi_status: String,
+    pub(super) ppoi_state: UtxoPpoiState,
     pub(super) poi_spendable: bool,
     pub(super) source_tx_hash: String,
     pub(super) source_block_timestamp: u64,
@@ -1022,6 +1063,7 @@ pub(super) struct UtxoDelegate {
     rows: Arc<[UtxoDisplayRow]>,
     columns: [Column; 7],
     tx_search_input: Entity<InputState>,
+    poi_refreshing: bool,
 }
 
 impl UtxoDelegate {
@@ -1053,11 +1095,13 @@ impl UtxoDelegate {
                     .movable(false),
             ],
             tx_search_input,
+            poi_refreshing: false,
         }
     }
 
-    pub(super) fn set_rows(&mut self, rows: Vec<UtxoDisplayRow>) {
+    pub(super) fn set_rows(&mut self, rows: Vec<UtxoDisplayRow>, poi_refreshing: bool) {
         self.rows = Arc::from(rows);
+        self.poi_refreshing = poi_refreshing;
     }
 
     pub(super) fn set_column_widths(&mut self, widths: &[Pixels]) {
@@ -1196,6 +1240,14 @@ impl TableDelegate for UtxoDelegate {
                 .when(should_show_blocked_shield_refund_action(row), |this| {
                     this.child(blocked_shield_refund_action(row, row_ix, self.root.clone()))
                 })
+                .when(should_show_ppoi_retry_action(row), |this| {
+                    this.child(ppoi_retry_action(
+                        row,
+                        row_ix,
+                        self.root.clone(),
+                        self.poi_refreshing,
+                    ))
+                })
                 .into_any_element(),
             5 => source_tx_cell(
                 row,
@@ -1242,9 +1294,40 @@ fn poi_status_indicator(row: &UtxoDisplayRow, row_ix: usize) -> gpui::AnyElement
     } else {
         Tag::warning()
     };
-    tag.small()
-        .outline()
-        .child(SharedString::from(row.poi_status.clone()))
+    let detail = ppoi_row_state_detail(row.ppoi_state, row.is_spent);
+    div()
+        .id(SharedString::from(format!("wallet-poi-status-{row_ix}")))
+        .tooltip(move |window, cx| Tooltip::new(detail).build(window, cx))
+        .child(
+            tag.small()
+                .outline()
+                .child(SharedString::from(row.poi_status.clone())),
+        )
+        .into_any_element()
+}
+
+fn ppoi_retry_action(
+    row: &UtxoDisplayRow,
+    row_ix: usize,
+    root: WeakEntity<WalletRoot>,
+    refreshing: bool,
+) -> gpui::AnyElement {
+    let tooltip = ppoi_retry_tooltip(row.ppoi_state);
+    div()
+        .child(
+            app_button_base(SharedString::from(format!("wallet-retry-poi-{row_ix}")))
+                .xsmall()
+                .loading(refreshing)
+                .disabled(refreshing)
+                .tooltip(tooltip)
+                .child("Retry")
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = root.update(cx, |root, cx| {
+                        WalletRoot::retry_poi_submissions(root.selected_chain_session(), cx);
+                    });
+                }),
+        )
         .into_any_element()
 }
 
@@ -1481,25 +1564,156 @@ pub(super) fn recoverable_poi_candidate_count(snapshot: &ListUtxosOutput) -> usi
 }
 
 fn is_recoverable_poi_candidate(row: &UtxoOutput) -> bool {
-    if row.is_spent
-        || row.pending_new
-        || row.pending_spent
-        || row.local_pending_spent
-        || row.poi_spendable
-        || row.commitment_kind != "Transact"
-    {
-        return false;
-    }
-
-    row.poi_statuses.is_empty()
-        || row
-            .poi_statuses
-            .values()
-            .any(|status| is_recoverable_poi_status(status))
+    row.is_ppoi_retry_eligible()
 }
 
-fn is_recoverable_poi_status(status: &str) -> bool {
-    matches!(status, "Missing" | "Unknown" | "ProofSubmitted")
+pub(super) fn should_show_ppoi_retry_action(row: &UtxoDisplayRow) -> bool {
+    !row.is_spent
+        && !row.pending_new
+        && !row.pending_spent
+        && !row.local_pending_spent
+        && row.activity_classification == "Private Output"
+        && row.ppoi_state.retry_eligible()
+}
+
+pub(super) const fn global_poi_retry_available(
+    session_available: bool,
+    workflow_needs_attention: u64,
+    owned_retry_candidates: usize,
+) -> bool {
+    session_available && (workflow_needs_attention > 0 || owned_retry_candidates > 0)
+}
+
+pub(super) const fn poi_retry_button_label(refreshing: bool) -> &'static str {
+    if refreshing {
+        "Submitting PPOIs…"
+    } else {
+        "Retry PPOI submissions"
+    }
+}
+
+pub(super) const fn ppoi_state_detail(state: UtxoPpoiState) -> &'static str {
+    match state {
+        UtxoPpoiState::Valid => "This output has valid PPOI and is spendable.",
+        UtxoPpoiState::Missing => {
+            "The PPOI service has no proof for this output. The sending wallet normally submits it, and this output stays unspendable until validation succeeds. If retry here does not resolve it, open and sync the sending wallet, then retry PPOI submissions there."
+        }
+        UtxoPpoiState::ProofSubmitted => "The PPOI proof was submitted and is awaiting validation.",
+        UtxoPpoiState::Unknown => "This output's PPOI status needs checking.",
+        UtxoPpoiState::ShieldBlocked => {
+            "This Shield output is blocked and must use the refund action instead."
+        }
+        UtxoPpoiState::Mixed => {
+            "Active PPOI lists report mixed states; this output stays unspendable while its status is checked."
+        }
+    }
+}
+
+pub(super) const fn ppoi_row_state_detail(state: UtxoPpoiState, is_spent: bool) -> &'static str {
+    if is_spent && matches!(state, UtxoPpoiState::Valid) {
+        "This spent output has valid historical PPOI status."
+    } else {
+        ppoi_state_detail(state)
+    }
+}
+
+pub(super) const fn ppoi_workflow_status_title(
+    status: WalletPpoiWorkflowStatus,
+    refreshing: bool,
+) -> Option<&'static str> {
+    if refreshing {
+        Some("Submitting PPOIs…")
+    } else if status.needs_attention > 0 {
+        Some("PPOI submission needs attention")
+    } else if status.awaiting_validation > 0 {
+        Some("Awaiting PPOI validation")
+    } else if status.awaiting_submission > 0 {
+        Some("PPOI submission pending")
+    } else {
+        None
+    }
+}
+
+pub(super) fn ppoi_workflow_status_detail(status: WalletPpoiWorkflowStatus) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if status.awaiting_submission > 0 {
+        parts.push(ppoi_workflow_count_label(
+            status.awaiting_submission,
+            "awaiting submission",
+        ));
+    }
+    if status.awaiting_validation > 0 {
+        parts.push(ppoi_workflow_count_label(
+            status.awaiting_validation,
+            "awaiting validation",
+        ));
+    }
+    if status.needs_attention > 0 {
+        parts.push(ppoi_workflow_count_label(
+            status.needs_attention,
+            "needs attention",
+        ));
+    }
+    if parts.is_empty() {
+        "Checking sender-created PPOI contexts.".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn ppoi_workflow_count_label(count: u64, suffix: &str) -> String {
+    let noun = if count == 1 { "PPOI" } else { "PPOIs" };
+    format!("{count} {noun} {suffix}")
+}
+
+fn render_ppoi_workflow_status_card(
+    status: WalletPpoiWorkflowStatus,
+    refreshing: bool,
+) -> Option<gpui::Div> {
+    let title = ppoi_workflow_status_title(status, refreshing)?;
+    let color = if status.needs_attention > 0 && !refreshing {
+        theme::DANGER
+    } else {
+        theme::WARNING
+    };
+    Some(
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb_with_alpha(color, 0.34))
+            .bg(rgb_with_alpha(color, 0.08))
+            .p(px(10.0))
+            .children(refreshing.then(|| {
+                Spinner::new()
+                    .icon(IconName::LoaderCircle)
+                    .color(rgb(color).into())
+                    .with_size(px(14.0))
+            }))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(app_strong_text(title).text_color(rgb(color)))
+                    .child(
+                        app_muted_text(ppoi_workflow_status_detail(status))
+                            .line_height(px(18.0))
+                            .whitespace_normal(),
+                    ),
+            ),
+    )
+}
+
+pub(super) const fn ppoi_retry_tooltip(state: UtxoPpoiState) -> &'static str {
+    ppoi_state_detail(state)
 }
 
 pub(super) fn display_rows_from_output(
@@ -1673,6 +1887,7 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
             amount: row.value.clone(),
             activity_classification: row.activity_classification.clone(),
             poi_status: format_poi_status(row),
+            ppoi_state: row.ppoi_state,
             poi_spendable: row.poi_spendable,
             source_tx_hash: row.source_tx_hash.clone(),
             source_block_timestamp: row.source_block_timestamp,
@@ -1708,6 +1923,7 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         amount,
         activity_classification: row.activity_classification.clone(),
         poi_status: format_poi_status(row),
+        ppoi_state: row.ppoi_state,
         poi_spendable: row.poi_spendable,
         source_tx_hash: row.source_tx_hash.clone(),
         source_block_timestamp: row.source_block_timestamp,
@@ -1731,17 +1947,15 @@ fn format_poi_status(row: &UtxoOutput) -> String {
     if row.pending_new {
         return "Pending receive".to_string();
     }
-    if row.poi_statuses.is_empty() {
-        return "Unknown".to_string();
+    match row.ppoi_state {
+        UtxoPpoiState::Valid => "Valid",
+        UtxoPpoiState::Missing => "Missing",
+        UtxoPpoiState::ProofSubmitted => "ProofSubmitted",
+        UtxoPpoiState::Unknown => "Unknown",
+        UtxoPpoiState::ShieldBlocked => "ShieldBlocked",
+        UtxoPpoiState::Mixed => "Mixed",
     }
-    let mut statuses: Vec<_> = row.poi_statuses.values().cloned().collect();
-    statuses.sort();
-    statuses.dedup();
-    if statuses.len() == 1 {
-        statuses.remove(0)
-    } else {
-        statuses.join(", ")
-    }
+    .to_string()
 }
 
 fn format_tree_position(tree: u32, position: u64) -> String {

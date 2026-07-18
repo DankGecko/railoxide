@@ -58,7 +58,8 @@ use rand::seq::IndexedRandom;
 use reqwest::Url;
 use serde::Serialize;
 pub use sync_service::types::{
-    WalletObservation, WalletReadiness, WalletReadinessError, WalletReadinessWaitError,
+    WalletObservation, WalletPpoiWorkflowStatus, WalletReadiness, WalletReadinessError,
+    WalletReadinessWaitError,
 };
 use sync_service::{
     ChainConfig, ChainConfigDefaults, ChainKey, LocalPoiMerkleProofSource,
@@ -161,7 +162,7 @@ use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
 use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
     ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,
-    max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
+    UtxoPpoiState, max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
     max_unshield_amount_from_outputs,
 };
 pub use walletconnect::{

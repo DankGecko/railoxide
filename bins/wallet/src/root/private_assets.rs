@@ -14,7 +14,7 @@ use railgun_ui::{format_token_amount, format_usd_micro_value, short_address};
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
 use ui::theme::{self};
 use wallet_ops::{
-    ListUtxosOutput, TokenAnchorRateCache, TokenTotal,
+    ListUtxosOutput, TokenAnchorRateCache, TokenTotal, UtxoPpoiState,
     max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
     max_unshield_amount_from_outputs as planner_max_unshield_amount_from_outputs,
     settings::EffectiveTokenRegistry,
@@ -72,6 +72,7 @@ struct PrivatePendingSummary {
     pending_incoming_outputs: usize,
     pending_outgoing_outputs: usize,
     recoverable_poi_outputs: usize,
+    recoverable_ppoi_states: Vec<UtxoPpoiState>,
     poi_refreshing: bool,
     poi_refresh_session: Option<Arc<wallet_ops::WalletSession>>,
 }
@@ -398,6 +399,17 @@ fn private_pending_summary(
         .filter(|row| row.pending_spent || row.local_pending_spent)
         .count();
     let recoverable_poi_outputs = recoverable_poi_candidate_count(snapshot);
+    let mut recoverable_ppoi_states = Vec::new();
+    for state in snapshot
+        .utxos
+        .iter()
+        .filter(|row| row.is_ppoi_retry_eligible())
+        .map(|row| row.ppoi_state)
+    {
+        if !recoverable_ppoi_states.contains(&state) {
+            recoverable_ppoi_states.push(state);
+        }
+    }
 
     if pending_poi_assets.is_empty()
         && pending_incoming_assets.is_empty()
@@ -416,6 +428,7 @@ fn private_pending_summary(
         pending_incoming_outputs,
         pending_outgoing_outputs,
         recoverable_poi_outputs,
+        recoverable_ppoi_states,
         poi_refreshing,
         poi_refresh_session,
     })
@@ -429,7 +442,7 @@ const fn private_pending_summary_detail(summary: &PrivatePendingSummary) -> &'st
             "Blocked Shields can be reviewed and refunded."
         }
     } else if summary.recoverable_poi_outputs > 0 {
-        "Some private outputs need PPOI recovery before they become spendable."
+        "Some private outputs need PPOI submission or status checks before they become spendable."
     } else if !summary.pending_poi_assets.is_empty() {
         "Some private outputs are waiting for PPOI validation before they become spendable."
     } else if summary.pending_incoming_outputs > 0 && summary.pending_outgoing_outputs > 0 {
@@ -832,7 +845,8 @@ impl WalletRoot {
         summary: &PrivatePendingSummary,
         content_width: Pixels,
     ) -> gpui::Div {
-        let retry_session = summary.poi_refresh_session.clone();
+        let retry_available = summary.poi_refresh_session.is_some();
+        let retry_root = root.clone();
         let retrying = summary.poi_refreshing;
         let recoverable = summary.recoverable_poi_outputs;
         let show_recovery = recoverable > 0;
@@ -882,16 +896,21 @@ impl WalletRoot {
                     "",
                     theme::WARNING,
                     RailgunActionIcon::Clock,
-                    (recoverable == 0).then_some("No recoverable PPOI outputs found yet."),
+                    (recoverable == 0)
+                        .then_some("No confirmed PPOI outputs are currently eligible for retry."),
                 ))
             })
             .when(show_recovery, |this| {
-                this.child(private_pending_recovery_section(recoverable))
+                this.child(private_pending_retry_section(
+                    recoverable,
+                    &summary.recoverable_ppoi_states,
+                ))
             })
             .child(
                 div()
                     .w_full()
                     .flex()
+                    .flex_wrap()
                     .justify_end()
                     .gap_2()
                     .child(
@@ -906,14 +925,16 @@ impl WalletRoot {
                         actions.child(
                             app_button(
                                 "wallet-private-pending-dialog-retry-poi",
-                                retry_poi_label(recoverable),
+                                retry_poi_label(recoverable, retrying),
                             )
                             .primary()
                             .small()
                             .loading(retrying)
-                            .disabled(retrying || retry_session.is_none())
+                            .disabled(retrying || !retry_available)
                             .on_click(move |_event, _window, cx| {
-                                Self::retry_poi_recovery(retry_session.clone(), cx);
+                                retry_root.update(cx, |root, cx| {
+                                    Self::retry_poi_submissions(root.selected_chain_session(), cx);
+                                });
                             }),
                         )
                     }),
@@ -1189,11 +1210,13 @@ fn private_asset_pending_label(label: impl Into<SharedString>) -> gpui::Div {
         )
 }
 
-fn retry_poi_label(count: usize) -> String {
-    if count == 1 {
-        "Retry PPOI recovery".to_string()
+pub(super) fn retry_poi_label(count: usize, retrying: bool) -> String {
+    if retrying {
+        "Submitting PPOIs…".to_string()
+    } else if count == 1 {
+        "Retry PPOI".to_string()
     } else {
-        format!("Retry PPOI recovery ({count})")
+        format!("Retry PPOI submissions ({count})")
     }
 }
 
@@ -1442,23 +1465,29 @@ fn private_pending_asset_amount_row(
         )
 }
 
-fn private_pending_recovery_section(recoverable: usize) -> gpui::Div {
+fn private_pending_retry_section(recoverable: usize, states: &[UtxoPpoiState]) -> gpui::Div {
     let content = div()
         .flex()
         .flex_col()
         .gap_2()
         .child(private_pending_section_header(
-            "Recoverable PPOI outputs",
+            "Retry PPOI",
             pending_output_count_label(recoverable),
             theme::DANGER,
             RailgunActionIcon::Clock,
         ))
         .child(
-            app_muted_text("Recoverable PPOI outputs can be retried without querying wallet-specific balances from a server.")
+            app_muted_text("PPOI submission is normally automatic. Retry checks these outputs and also processes recipient and broadcaster-fee outputs created by this wallet.")
                 .text_size(px(12.0))
                 .line_height(px(17.0))
                 .whitespace_normal(),
-        );
+        )
+        .children(states.iter().map(|state| {
+            app_muted_text(super::utxo::ppoi_state_detail(*state))
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .whitespace_normal()
+        }));
     private_pending_section_card(theme::DANGER, content)
 }
 

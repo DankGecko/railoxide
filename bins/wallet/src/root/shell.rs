@@ -14,9 +14,10 @@ use gpui::{
     bounce, div, ease_in_out, img, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Root, Sizable, TitleBar,
+    Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     badge::Badge,
     button::ButtonVariants,
+    notification::Notification,
     progress::Progress as UiProgress,
     resizable::{resizable_panel, v_resizable},
     scroll::ScrollableElement,
@@ -41,8 +42,8 @@ use crate::assets::{
 use super::actions::register_wallet_shortcut_root;
 use super::chain_load::{
     BalanceSyncIssue, PresenceStatus, SyncStatusContext, SyncStatusLabels, WalletStatusCounts,
-    balance_sync_issue, balances_presence_status, ppoi_presence_status, ready_status_bar,
-    sync_status_bar, sync_status_labels,
+    balance_sync_issue, balances_presence_status, ppoi_presence_status,
+    ppoi_validation_toast_scope_is_current, ready_status_bar, sync_status_bar, sync_status_labels,
 };
 use super::private_assets::{
     format_private_asset_rows_from_snapshot, should_show_pending_poi_amount,
@@ -273,6 +274,17 @@ impl WalletRoot {
 
 impl Render for WalletRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let pending_ppoi_validation_toast = self.pending_ppoi_validation_toast.take();
+        if pending_ppoi_validation_toast.is_some_and(|(wallet_id, wallet_generation)| {
+            ppoi_validation_toast_scope_is_current(
+                self.selected_wallet_id.as_deref(),
+                self.active_wallet_generation,
+                wallet_id.as_ref(),
+                wallet_generation,
+            )
+        }) {
+            window.push_notification(Notification::success("PPOI validation complete."), cx);
+        }
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.sync_walletconnect_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);
@@ -1302,7 +1314,7 @@ impl Render for PpoiStatusHoverCard {
                     .text_color(rgb(theme::TEXT_MUTED))
                     .when_some(
                         ppoi_hover_detail(status, progress.as_ref(), refreshing),
-                        |this, val| this.child(val),
+                        gpui::ParentElement::child,
                     ),
             )
             .when_some(
@@ -1328,8 +1340,8 @@ impl Render for PpoiStatusHoverCard {
             )
             .when(refreshing, |this| {
                 this.child(render_ppoi_hover_note(
-                    "Refreshing PPOI status",
-                    "Checking private-output PPOI status and retrying recoverable outputs.",
+                    "Submitting PPOIs…",
+                    "Submitting sender-created contexts and checking owned outputs. Retry PPOI submissions from Activity if an output remains blocked.",
                     theme::WARNING,
                 ))
             })
@@ -1806,7 +1818,7 @@ fn format_duration_compact(secs: u64) -> String {
     format!("{}d", secs / SECONDS_PER_DAY)
 }
 
-fn ppoi_hover_heading(
+pub(super) fn ppoi_hover_heading(
     status: PresenceStatus,
     progress: Option<&PoiArtifactCacheProgress>,
     refreshing: bool,
@@ -1828,7 +1840,7 @@ fn ppoi_hover_heading(
         }
     }
     if refreshing {
-        return "Refreshing PPOI status";
+        return "Submitting PPOIs…";
     }
     match status {
         PresenceStatus::Healthy => "PPOI ready",
@@ -1838,7 +1850,7 @@ fn ppoi_hover_heading(
     }
 }
 
-const fn ppoi_hover_detail(
+pub(super) const fn ppoi_hover_detail(
     status: PresenceStatus,
     progress: Option<&PoiArtifactCacheProgress>,
     refreshing: bool,
@@ -1856,7 +1868,9 @@ const fn ppoi_hover_detail(
         }
     }
     if refreshing {
-        return Some("Checking private-output PPOI status and retrying recoverable outputs.");
+        return Some(
+            "Submitting sender-created contexts and checking owned private-output PPOI status.",
+        );
     }
     match status {
         PresenceStatus::Healthy => Some("Up to date and following the source."),
@@ -2029,7 +2043,7 @@ fn ppoi_attention_detail(counts: WalletStatusCounts) -> String {
         format!(
             "Review {} and {}",
             count_label(counts.blocked_shield_outputs, "blocked Shield output"),
-            count_label(counts.recoverable_poi_outputs, "recoverable PPOI output"),
+            count_label(counts.recoverable_poi_outputs, "PPOI output needing retry"),
         )
     } else if counts.blocked_shield_outputs > 0 {
         format!(
@@ -2039,7 +2053,7 @@ fn ppoi_attention_detail(counts: WalletStatusCounts) -> String {
     } else {
         format!(
             "Review {}",
-            count_label(counts.recoverable_poi_outputs, "recoverable PPOI output")
+            count_label(counts.recoverable_poi_outputs, "PPOI output needing retry")
         )
     }
 }

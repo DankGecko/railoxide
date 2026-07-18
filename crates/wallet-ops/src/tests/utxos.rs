@@ -67,7 +67,11 @@ fn pending_overlay_rows_are_not_spendable() {
 
     assert_eq!(outputs.len(), 2);
     assert!(outputs.iter().any(|output| output.pending_spent));
-    assert!(outputs.iter().any(|output| output.pending_new));
+    assert!(
+        outputs
+            .iter()
+            .any(|output| output.pending_new && output.ppoi_state == UtxoPpoiState::Unknown)
+    );
     assert_eq!(max_send_amount_from_outputs(&outputs, token), U256::ZERO);
     assert_eq!(
         max_unshield_amount_from_outputs(&outputs, token),
@@ -264,8 +268,105 @@ fn token_totals_include_poi_verified_balance() {
         outputs[1].poi_statuses[&hex::encode(active_list_key)],
         "Unknown"
     );
+    assert_eq!(outputs[1].ppoi_state, UtxoPpoiState::Unknown);
     assert_eq!(totals[0].total, "12");
     assert_eq!(totals[0].poi_verified_total, "5");
+}
+
+#[test]
+fn utxo_ppoi_state_is_derived_from_active_list_statuses() {
+    let token = address(0x11);
+    for (status, expected, retry_eligible) in [
+        (PoiStatus::Valid, UtxoPpoiState::Valid, false),
+        (PoiStatus::Missing, UtxoPpoiState::Missing, true),
+        (
+            PoiStatus::ProofSubmitted,
+            UtxoPpoiState::ProofSubmitted,
+            true,
+        ),
+        (PoiStatus::Unknown, UtxoPpoiState::Unknown, true),
+        (
+            PoiStatus::ShieldBlocked,
+            UtxoPpoiState::ShieldBlocked,
+            false,
+        ),
+    ] {
+        let mut wallet_utxo = utxo(token, 5, 0, 1);
+        for list_key in default_active_poi_list_keys() {
+            wallet_utxo.utxo.poi.statuses.insert(list_key, status);
+        }
+
+        let (outputs, _) = utxo_outputs_from_utxos(vec![wallet_utxo]);
+
+        assert_eq!(outputs[0].ppoi_state, expected);
+        assert_eq!(outputs[0].is_ppoi_retry_eligible(), retry_eligible);
+    }
+}
+
+#[test]
+fn mixed_active_list_statuses_are_typed_and_shield_blocked_takes_priority() {
+    let mut wallet_utxo = utxo(address(0x11), 5, 0, 1);
+    let active_keys = [
+        FixedBytes::from([0x11; 32]),
+        FixedBytes::from([0x22; 32]),
+        FixedBytes::from([0x33; 32]),
+    ];
+    wallet_utxo.utxo.poi.statuses.clear();
+    wallet_utxo
+        .utxo
+        .poi
+        .statuses
+        .insert(active_keys[0], PoiStatus::Valid);
+    wallet_utxo
+        .utxo
+        .poi
+        .statuses
+        .insert(active_keys[1], PoiStatus::Missing);
+
+    assert_eq!(
+        crate::utxos::utxo_ppoi_state(&wallet_utxo.utxo.poi, &active_keys),
+        UtxoPpoiState::Mixed
+    );
+
+    wallet_utxo
+        .utxo
+        .poi
+        .statuses
+        .insert(active_keys[2], PoiStatus::ShieldBlocked);
+    assert_eq!(
+        crate::utxos::utxo_ppoi_state(&wallet_utxo.utxo.poi, &active_keys),
+        UtxoPpoiState::ShieldBlocked
+    );
+}
+
+#[test]
+fn ppoi_retry_eligibility_excludes_spent_and_pending_outputs() {
+    let token = address(0x11);
+    let mut missing = utxo(token, 5, 0, 1);
+    for list_key in default_active_poi_list_keys() {
+        missing
+            .utxo
+            .poi
+            .statuses
+            .insert(list_key, PoiStatus::Missing);
+    }
+    let (mut outputs, _) = utxo_outputs_from_utxos(vec![missing]);
+    assert!(outputs[0].is_ppoi_retry_eligible());
+
+    outputs[0].is_spent = true;
+    assert!(!outputs[0].is_ppoi_retry_eligible());
+    outputs[0].is_spent = false;
+    outputs[0].pending_new = true;
+    assert!(!outputs[0].is_ppoi_retry_eligible());
+    outputs[0].pending_new = false;
+    outputs[0].pending_spent = true;
+    assert!(!outputs[0].is_ppoi_retry_eligible());
+    outputs[0].pending_spent = false;
+    outputs[0].local_pending_spent = true;
+    assert!(!outputs[0].is_ppoi_retry_eligible());
+    outputs[0].local_pending_spent = false;
+    outputs[0].commitment_kind = "Shield".to_string();
+    assert!(!outputs[0].is_ppoi_retry_eligible());
 }
 
 #[test]
@@ -377,6 +478,7 @@ fn list_utxos_output_serializes_existing_field_names() {
                 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
                 "Unknown".to_string(),
             )]),
+            ppoi_state: UtxoPpoiState::Unknown,
             poi_spendable: false,
             source_tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
@@ -421,6 +523,7 @@ fn list_utxos_output_serializes_existing_field_names() {
                 "poi_statuses": {
                     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd": "Unknown",
                 },
+                "ppoi_state": "Unknown",
                 "poi_spendable": false,
                 "source_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
                 "source_block_number": 11,

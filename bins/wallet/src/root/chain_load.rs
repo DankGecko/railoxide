@@ -16,8 +16,8 @@ use tokio::sync::{OnceCell, oneshot, watch};
 use ui::theme::{self, APP_TEXT_SIZE};
 use wallet_ops::{
     DesktopWalletSyncStartPolicy, ListUtxosOutput, PoiArtifactCacheProgress, SyncProgressStage,
-    SyncProgressUnit, SyncProgressUpdate, ViewWalletChainSessionRequest, WalletReadiness,
-    WalletSessionStore, WalletSyncTip, vault::WalletSource,
+    SyncProgressUnit, SyncProgressUpdate, ViewWalletChainSessionRequest, WalletPpoiWorkflowStatus,
+    WalletReadiness, WalletSessionStore, WalletSyncTip, vault::WalletSource,
 };
 
 use super::utxo::should_focus_utxo_table;
@@ -35,6 +35,7 @@ pub(super) enum ChainUtxoState {
         observer_token: InstalledObserverToken,
         sync_tip: WalletSyncTip,
         poi_refreshing: bool,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus,
     },
     Ready {
         snapshot: Arc<ListUtxosOutput>,
@@ -42,10 +43,12 @@ pub(super) enum ChainUtxoState {
         observer_token: InstalledObserverToken,
         sync_tip: WalletSyncTip,
         poi_refreshing: bool,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus,
     },
     Error {
         message: Arc<str>,
         start_block: Option<u64>,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus,
     },
 }
 
@@ -611,6 +614,29 @@ impl ChainUtxoState {
         }
     }
 
+    pub(super) const fn ppoi_workflow_status(&self) -> WalletPpoiWorkflowStatus {
+        match self {
+            Self::Syncing {
+                ppoi_workflow_status,
+                ..
+            }
+            | Self::Ready {
+                ppoi_workflow_status,
+                ..
+            }
+            | Self::Error {
+                ppoi_workflow_status,
+                ..
+            } => *ppoi_workflow_status,
+            Self::Idle | Self::Loading { .. } => WalletPpoiWorkflowStatus {
+                awaiting_submission: 0,
+                awaiting_validation: 0,
+                needs_attention: 0,
+                validation_revision: 0,
+            },
+        }
+    }
+
     pub(super) fn poi_refresh_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {
         match self {
             Self::Syncing { session, .. } | Self::Ready { session, .. } => Some(session.clone()),
@@ -826,7 +852,7 @@ pub(super) fn ready_wallet_status_labels(counts: WalletStatusCounts) -> SyncStat
     let title = if counts.blocked_shield_outputs > 0 {
         "Private assets need attention"
     } else if counts.recoverable_poi_outputs > 0 {
-        "PPOI recovery available"
+        "PPOI retry available"
     } else if counts.has_private_attention() {
         "Private balance update pending"
     } else {
@@ -849,7 +875,7 @@ fn ready_wallet_status_detail(counts: WalletStatusCounts) -> String {
         return count_label(counts.blocked_shield_outputs, "blocked Shield output") + verb;
     }
     if counts.recoverable_poi_outputs > 0 {
-        return count_label(counts.recoverable_poi_outputs, "output") + " can retry PPOI recovery";
+        return count_label(counts.recoverable_poi_outputs, "output") + " can retry PPOI";
     }
     let mut parts = Vec::new();
     if counts.pending_incoming_outputs > 0 {
@@ -934,6 +960,28 @@ pub(super) fn installed_observer_is_exact_current(
         wallet_generation,
     ) && observer_token.chain_id == chain_id
         && installed_token == Some(observer_token)
+}
+
+pub(super) const fn ppoi_validation_completion_is_current(
+    previous_revision: u64,
+    current_revision: u64,
+    observer_is_exact_current: bool,
+) -> bool {
+    observer_is_exact_current && current_revision > previous_revision
+}
+
+pub(super) fn ppoi_validation_toast_scope_is_current(
+    selected_wallet_id: Option<&str>,
+    active_wallet_generation: u64,
+    queued_wallet_id: &str,
+    queued_wallet_generation: u64,
+) -> bool {
+    wallet_generation_matches(
+        selected_wallet_id,
+        active_wallet_generation,
+        queued_wallet_id,
+        queued_wallet_generation,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1272,6 +1320,7 @@ impl WalletRoot {
         self.blocked_shield_refunds_in_flight.clear();
         self.blocked_shield_rescue_lookup_generation =
             self.blocked_shield_rescue_lookup_generation.wrapping_add(1);
+        self.pending_ppoi_validation_toast = None;
         self.active_wallet_tab = WalletTab::default();
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
@@ -1440,6 +1489,7 @@ impl WalletRoot {
         lifecycle_generation: u64,
         task_id: u64,
         observer_token: &InstalledObserverToken,
+        ppoi_workflow_status: Option<WalletPpoiWorkflowStatus>,
         message: Arc<str>,
         cx: &mut Context<'_, Self>,
     ) -> Option<Arc<wallet_ops::WalletSession>> {
@@ -1476,10 +1526,17 @@ impl WalletRoot {
             message,
         )?;
         let state = self.chain_states.remove(&chain_id)?;
-        let session = match state {
-            ChainUtxoState::Syncing { session, .. } | ChainUtxoState::Ready { session, .. } => {
-                session
+        let (session, previous_ppoi_workflow_status) = match state {
+            ChainUtxoState::Syncing {
+                session,
+                ppoi_workflow_status,
+                ..
             }
+            | ChainUtxoState::Ready {
+                session,
+                ppoi_workflow_status,
+                ..
+            } => (session, ppoi_workflow_status),
             state @ (ChainUtxoState::Idle
             | ChainUtxoState::Loading { .. }
             | ChainUtxoState::Error { .. }) => {
@@ -1493,6 +1550,7 @@ impl WalletRoot {
             ChainUtxoState::Error {
                 message: terminal.message,
                 start_block: Some(terminal.start_block),
+                ppoi_workflow_status: ppoi_workflow_status.unwrap_or(previous_ppoi_workflow_status),
             },
         );
         if self.selected_chain == chain_id {
@@ -1790,6 +1848,7 @@ impl WalletRoot {
                             ChainUtxoState::Error {
                                 message: Arc::from(message),
                                 start_block: previous_start_block,
+                                ppoi_workflow_status: WalletPpoiWorkflowStatus::default(),
                             },
                         );
                         if root.selected_chain == chain_id {
@@ -1821,6 +1880,7 @@ impl WalletRoot {
                             ChainUtxoState::Error {
                                 message: Arc::from(format!("wallet UTXO task failed: {error}")),
                                 start_block: previous_start_block,
+                                ppoi_workflow_status: WalletPpoiWorkflowStatus::default(),
                             },
                         );
                         if root.selected_chain == chain_id {
@@ -1866,6 +1926,9 @@ impl WalletRoot {
                 session.poi_artifact_cache_progress_rx.clone();
             let initial_snapshot = initial_observation.snapshot.clone();
             let initial_readiness = wallet_readiness_disposition(&initial_observation.readiness);
+            let initial_ppoi_workflow_status = initial_observation.ppoi_workflow_status;
+            let mut last_ppoi_validation_revision =
+                initial_ppoi_workflow_status.validation_revision;
             let initial_sync_tip = *session.sync_tip_rx.borrow();
             let initial_poi_refreshing = *session.poi_refreshing_rx.borrow();
             let initial_poi_artifact_cache_progress = poi_artifact_cache_progress_rx
@@ -1904,6 +1967,7 @@ impl WalletRoot {
                         observer_token: observer_token.clone(),
                         sync_tip: initial_sync_tip,
                         poi_refreshing: initial_poi_refreshing,
+                        ppoi_workflow_status: initial_ppoi_workflow_status,
                     },
                     WalletReadinessDisposition::Syncing => ChainUtxoState::Syncing {
                         snapshot: initial_snapshot.clone(),
@@ -1912,10 +1976,12 @@ impl WalletRoot {
                         observer_token: observer_token.clone(),
                         sync_tip: initial_sync_tip,
                         poi_refreshing: initial_poi_refreshing,
+                        ppoi_workflow_status: initial_ppoi_workflow_status,
                     },
                     WalletReadinessDisposition::Error(message) => ChainUtxoState::Error {
                         message,
                         start_block: Some(session.start_block),
+                        ppoi_workflow_status: initial_ppoi_workflow_status,
                     },
                 };
                 root.chain_states.insert(chain_id, state);
@@ -1976,6 +2042,7 @@ impl WalletRoot {
                                         lifecycle_generation,
                                         chain_load_task_id,
                                         &observer_token,
+                                        None,
                                         Arc::from("wallet session observation stream closed"),
                                         cx,
                                     )
@@ -1994,20 +2061,34 @@ impl WalletRoot {
                             break;
                         }
                         let observation = observation_rx.borrow_and_update().clone();
+                        let ppoi_workflow_status = observation.ppoi_workflow_status;
+                        let validation_completed = ppoi_validation_completion_is_current(
+                            last_ppoi_validation_revision,
+                            ppoi_workflow_status.validation_revision,
+                            true,
+                        );
                         let disposition = wallet_readiness_disposition(&observation.readiness);
                         if let WalletReadinessDisposition::Error(message) = &disposition {
                             let session_to_stop = this
                                 .update(cx, |root, cx| {
-                                    root.transition_current_installed_observer_to_error(
+                                    let session = root.transition_current_installed_observer_to_error(
                                         result_wallet_id.as_ref(),
                                         active_wallet_generation,
                                         chain_id,
                                         lifecycle_generation,
                                         chain_load_task_id,
                                         &observer_token,
+                                        Some(ppoi_workflow_status),
                                         Arc::clone(message),
                                         cx,
-                                    )
+                                    );
+                                    if session.is_some() && validation_completed {
+                                        root.pending_ppoi_validation_toast = Some((
+                                            Arc::clone(&result_wallet_id),
+                                            active_wallet_generation,
+                                        ));
+                                    }
+                                    session
                                 })
                                 .ok()
                                 .flatten();
@@ -2059,6 +2140,7 @@ impl WalletRoot {
                                         observer_token,
                                         sync_tip,
                                         poi_refreshing,
+                                        ppoi_workflow_status,
                                     }
                                 }
                                 ChainUtxoState::Syncing {
@@ -2075,6 +2157,7 @@ impl WalletRoot {
                                     observer_token,
                                     sync_tip,
                                     poi_refreshing,
+                                    ppoi_workflow_status,
                                 },
                                 ChainUtxoState::Ready {
                                     session,
@@ -2088,6 +2171,7 @@ impl WalletRoot {
                                     observer_token,
                                     sync_tip,
                                     poi_refreshing,
+                                    ppoi_workflow_status,
                                 },
                                 ChainUtxoState::Ready {
                                     session,
@@ -2102,6 +2186,7 @@ impl WalletRoot {
                                     observer_token,
                                     sync_tip,
                                     poi_refreshing,
+                                    ppoi_workflow_status,
                                 },
                                 state @ (ChainUtxoState::Idle
                                 | ChainUtxoState::Loading { .. }
@@ -2111,6 +2196,12 @@ impl WalletRoot {
                                 }
                             };
                             root.chain_states.insert(chain_id, state);
+                            if validation_completed {
+                                root.pending_ppoi_validation_toast = Some((
+                                    Arc::clone(&result_wallet_id),
+                                    active_wallet_generation,
+                                ));
+                            }
                             root.refresh_open_form_assets_for_snapshot(&snapshot, cx);
                             if became_ready {
                                 root.reschedule_ready_public_broadcaster_cost_estimates(chain_id, cx);
@@ -2124,6 +2215,8 @@ impl WalletRoot {
                         if !matches!(should_continue, Ok(true)) {
                             break;
                         }
+                        last_ppoi_validation_revision =
+                            ppoi_workflow_status.validation_revision;
                     }
                     changed = async {
                         match sync_tip_rx.as_mut() {

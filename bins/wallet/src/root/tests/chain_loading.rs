@@ -4,14 +4,16 @@ use crate::root::chain_load::{
     WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, WalletSyncLifecycleCleanupWaitGroup,
     chain_load_start_is_allowed, chain_progress_update_is_current,
     destructive_cache_reset_admission_is_allowed, installed_observer_is_exact_current,
-    installed_observer_terminal_transition, retain_auxiliary_stream, wallet_readiness_disposition,
+    installed_observer_terminal_transition, ppoi_validation_completion_is_current,
+    ppoi_validation_toast_scope_is_current, retain_auxiliary_stream, wallet_readiness_disposition,
     wallet_sync_maintenance_allows_start,
 };
 use crate::root::shell::{PoiArtifactCacheRetryAttempts, ppoi_retry_completion_is_current};
 use wallet_ops::{
     PoiArtifactCacheAttemptId, PoiArtifactCachePhase, PoiArtifactCacheProgress,
-    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletNetworkMode, WalletReadiness,
-    WalletReadinessError, WalletSessionStore, WalletSyncTip,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletNetworkMode,
+    WalletPpoiWorkflowStatus, WalletReadiness, WalletReadinessError, WalletSessionStore,
+    WalletSyncTip,
 };
 
 #[test]
@@ -26,6 +28,33 @@ fn terminal_wallet_readiness_is_not_projected_as_syncing() {
         wallet_readiness_disposition(&WalletReadiness::Shutdown),
         WalletReadinessDisposition::Error(Arc::from("wallet sync session stopped")),
     );
+}
+
+#[test]
+fn ppoi_validation_toast_requires_later_exact_observer_revision() {
+    assert!(ppoi_validation_completion_is_current(3, 4, true));
+    assert!(!ppoi_validation_completion_is_current(3, 3, true));
+    assert!(!ppoi_validation_completion_is_current(4, 3, true));
+    assert!(!ppoi_validation_completion_is_current(3, 4, false));
+}
+
+#[test]
+fn ppoi_validation_toast_scope_rejects_wallet_replacement() {
+    assert!(ppoi_validation_toast_scope_is_current(
+        Some("wallet-a"),
+        7,
+        "wallet-a",
+        7,
+    ));
+    assert!(!ppoi_validation_toast_scope_is_current(
+        Some("wallet-b"),
+        8,
+        "wallet-a",
+        7,
+    ));
+    assert!(!ppoi_validation_toast_scope_is_current(
+        None, 7, "wallet-a", 7,
+    ));
 }
 
 #[test]
@@ -293,6 +322,7 @@ async fn wallet_sync_lifecycle_reset_inventory_survives_loading_and_error_withou
     let error = ChainUtxoState::Error {
         message: Arc::from("sync failed after chain registration"),
         start_block: Some(1),
+        ppoi_workflow_status: WalletPpoiWorkflowStatus::default(),
     };
     assert!(error.poi_refresh_session().is_none());
     let error_report = reset_store.reset_public_sync_caches().await;
@@ -760,12 +790,19 @@ fn repair_cache_help_text_only_mentions_hint_when_available() {
 
 #[test]
 fn chain_error_state_preserves_start_block_hint() {
+    let ppoi_workflow_status = WalletPpoiWorkflowStatus {
+        awaiting_validation: 2,
+        validation_revision: 3,
+        ..WalletPpoiWorkflowStatus::default()
+    };
     let state = ChainUtxoState::Error {
         message: Arc::from("sync failed"),
         start_block: Some(24936250),
+        ppoi_workflow_status,
     };
 
     assert_eq!(state.start_block(), Some(24936250));
+    assert_eq!(state.ppoi_workflow_status(), ppoi_workflow_status);
     assert!(!state.renders_table());
 }
 
@@ -1259,9 +1296,9 @@ fn ready_wallet_status_labels_prioritize_actionable_private_attention() {
             ..WalletStatusCounts::default()
         }),
         SyncStatusLabels {
-            title: "PPOI recovery available".to_string(),
+            title: "PPOI retry available".to_string(),
             percent: 100,
-            detail: "3 outputs can retry PPOI recovery".to_string(),
+            detail: "3 outputs can retry PPOI".to_string(),
         }
     );
     assert_eq!(
@@ -1296,4 +1333,16 @@ fn ready_wallet_status_text_is_hidden_for_all_ready_states() {
         blocked_shield_outputs: 1,
         ..WalletStatusCounts::default()
     }));
+}
+
+#[test]
+fn active_ppoi_hover_uses_exact_submission_copy() {
+    assert_eq!(
+        ppoi_hover_heading(PresenceStatus::Active, None, true),
+        "Submitting PPOIs…"
+    );
+    assert_eq!(
+        ppoi_hover_detail(PresenceStatus::Active, None, true),
+        Some("Submitting sender-created contexts and checking owned private-output PPOI status.")
+    );
 }

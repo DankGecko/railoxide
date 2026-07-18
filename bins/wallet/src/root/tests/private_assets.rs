@@ -365,6 +365,13 @@ fn private_asset_rows_hide_zero_pending_poi() {
 }
 
 #[test]
+fn private_pending_retry_labels_use_submission_copy() {
+    assert_eq!(retry_poi_label(1, false), "Retry PPOI");
+    assert_eq!(retry_poi_label(2, false), "Retry PPOI submissions (2)");
+    assert_eq!(retry_poi_label(0, true), "Submitting PPOIs…");
+}
+
+#[test]
 fn private_asset_rows_show_separate_pending_amounts() {
     let token = Address::from([0x11; 20]);
     let mut pending_in = unshield_utxo_output(token, 7, 0, 2);

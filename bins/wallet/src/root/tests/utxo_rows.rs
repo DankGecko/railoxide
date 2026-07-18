@@ -105,6 +105,7 @@ fn recoverable_poi_candidate_count_only_counts_actionable_transact_outputs() {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         "Missing".to_string(),
     )]);
+    missing.ppoi_state = UtxoPpoiState::Missing;
     let mut shield = missing.clone();
     shield.commitment_kind = "Shield".to_string();
     let mut pending = missing.clone();
@@ -129,6 +130,154 @@ fn recoverable_poi_candidate_count_only_counts_actionable_transact_outputs() {
 }
 
 #[test]
+fn ppoi_row_retry_eligibility_includes_actionable_states_and_excludes_spent() {
+    for state in [
+        UtxoPpoiState::Missing,
+        UtxoPpoiState::Unknown,
+        UtxoPpoiState::ProofSubmitted,
+    ] {
+        let mut output = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+        output.ppoi_state = state;
+        output.poi_spendable = false;
+        let row = display_rows_from_output(
+            &ListUtxosOutput {
+                chain_id: 1,
+                cache_key: "cache".to_string(),
+                utxo_count: 1,
+                unspent_count: 1,
+                spent_count: 0,
+                local_pending_spent_count: 0,
+                utxos: vec![output],
+                totals: Vec::new(),
+            },
+            "",
+            true,
+        )
+        .remove(0);
+        assert!(should_show_ppoi_retry_action(&row), "state {state:?}");
+
+        let mut spent = row.clone();
+        spent.is_spent = true;
+        assert!(!should_show_ppoi_retry_action(&spent));
+
+        let pending_overlays: [fn(&mut UtxoDisplayRow); 3] = [
+            |row: &mut UtxoDisplayRow| row.pending_new = true,
+            |row: &mut UtxoDisplayRow| row.pending_spent = true,
+            |row: &mut UtxoDisplayRow| row.local_pending_spent = true,
+        ];
+        for apply_pending in pending_overlays {
+            let mut pending = row.clone();
+            apply_pending(&mut pending);
+            assert!(!should_show_ppoi_retry_action(&pending));
+        }
+    }
+
+    for state in [UtxoPpoiState::Valid, UtxoPpoiState::ShieldBlocked] {
+        let mut row = display_rows_from_output(
+            &ListUtxosOutput {
+                chain_id: 1,
+                cache_key: "cache".to_string(),
+                utxo_count: 1,
+                unspent_count: 1,
+                spent_count: 0,
+                local_pending_spent_count: 0,
+                utxos: vec![utxo_output(
+                    "0x1111111111111111111111111111111111111111",
+                    "42",
+                    false,
+                )],
+                totals: Vec::new(),
+            },
+            "",
+            true,
+        )
+        .remove(0);
+        row.ppoi_state = state;
+        assert!(!should_show_ppoi_retry_action(&row));
+    }
+}
+
+#[test]
+fn missing_ppoi_detail_gives_sender_retry_instructions() {
+    let detail = ppoi_state_detail(UtxoPpoiState::Missing);
+
+    assert!(detail.contains("PPOI service has no proof"));
+    assert!(detail.contains("sending wallet normally submits"));
+    assert!(detail.contains("stays unspendable"));
+    assert!(detail.contains("open and sync the sending wallet"));
+    assert!(detail.contains("retry PPOI submissions there"));
+    assert!(ppoi_state_detail(UtxoPpoiState::ProofSubmitted).contains("awaiting validation"));
+    assert!(ppoi_state_detail(UtxoPpoiState::Unknown).contains("status needs checking"));
+}
+
+#[test]
+fn global_sender_retry_requires_actionable_work() {
+    let snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 0,
+        unspent_count: 0,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: Vec::new(),
+        totals: Vec::new(),
+    };
+
+    assert_eq!(recoverable_poi_candidate_count(&snapshot), 0);
+    assert!(!global_poi_retry_available(true, 0, 0));
+    assert!(!global_poi_retry_available(false, 1, 0));
+    assert!(global_poi_retry_available(true, 1, 0));
+    assert!(global_poi_retry_available(true, 0, 1));
+    assert_eq!(poi_retry_button_label(false), "Retry PPOI submissions");
+    assert_eq!(poi_retry_button_label(true), "Submitting PPOIs…");
+}
+
+#[test]
+fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
+    let healthy = wallet_ops::WalletPpoiWorkflowStatus::default();
+    assert_eq!(ppoi_workflow_status_title(healthy, false), None);
+    assert_eq!(
+        ppoi_workflow_status_title(healthy, true),
+        Some("Submitting PPOIs…")
+    );
+
+    let pending = wallet_ops::WalletPpoiWorkflowStatus {
+        awaiting_submission: 1,
+        awaiting_validation: 2,
+        needs_attention: 0,
+        validation_revision: 0,
+    };
+    assert_eq!(
+        ppoi_workflow_status_title(pending, false),
+        Some("Awaiting PPOI validation")
+    );
+    assert_eq!(
+        ppoi_workflow_status_detail(pending),
+        "1 PPOI awaiting submission · 2 PPOIs awaiting validation"
+    );
+
+    let attention = wallet_ops::WalletPpoiWorkflowStatus {
+        needs_attention: 1,
+        ..pending
+    };
+    assert_eq!(
+        ppoi_workflow_status_title(attention, false),
+        Some("PPOI submission needs attention")
+    );
+    assert!(ppoi_workflow_status_detail(attention).contains("1 PPOI needs attention"));
+}
+
+#[test]
+fn spent_valid_ppoi_detail_is_historical_not_spendable() {
+    assert_eq!(
+        ppoi_row_state_detail(UtxoPpoiState::Valid, true),
+        "This spent output has valid historical PPOI status."
+    );
+    assert!(!ppoi_row_state_detail(UtxoPpoiState::Valid, true).contains("spendable"));
+    assert!(ppoi_row_state_detail(UtxoPpoiState::Valid, false).contains("spendable"));
+}
+
+#[test]
 fn display_rows_include_activity_classification() {
     let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
     blocked_shield.commitment_kind = "Shield".to_string();
@@ -137,6 +286,7 @@ fn display_rows_include_activity_classification() {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         "ShieldBlocked".to_string(),
     )]);
+    blocked_shield.ppoi_state = UtxoPpoiState::ShieldBlocked;
     blocked_shield.poi_spendable = false;
     let output = ListUtxosOutput {
         chain_id: 1,
@@ -193,6 +343,7 @@ fn display_rows_include_blocked_shield_rescue_metadata() {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         "ShieldBlocked".to_string(),
     )]);
+    blocked_shield.ppoi_state = UtxoPpoiState::ShieldBlocked;
     blocked_shield.poi_spendable = false;
     blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
         eligible: true,
@@ -270,6 +421,7 @@ fn resolving_blocked_shield_refund_is_loading_not_unavailable() {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         "ShieldBlocked".to_string(),
     )]);
+    blocked_shield.ppoi_state = UtxoPpoiState::ShieldBlocked;
     blocked_shield.poi_spendable = false;
     blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
         eligible: false,
@@ -312,6 +464,7 @@ fn cached_blocked_shield_rescue_does_not_reenable_spent_row() {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         "ShieldBlocked".to_string(),
     )]);
+    blocked_shield.ppoi_state = UtxoPpoiState::ShieldBlocked;
     blocked_shield.poi_spendable = false;
     blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
         eligible: false,
@@ -364,6 +517,7 @@ fn in_flight_blocked_shield_refund_disables_cached_action() {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         "ShieldBlocked".to_string(),
     )]);
+    blocked_shield.ppoi_state = UtxoPpoiState::ShieldBlocked;
     blocked_shield.poi_spendable = false;
     blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
         eligible: true,

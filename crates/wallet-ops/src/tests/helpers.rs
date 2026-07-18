@@ -44,7 +44,7 @@ pub(super) use crate::{
     ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
     PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
     RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
-    SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput,
+    SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput, UtxoPpoiState,
     WalletPendingOverlay, WalletPendingSpent, WalletPendingSpentMarkOutcome,
     apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
     approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,

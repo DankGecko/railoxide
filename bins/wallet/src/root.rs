@@ -109,6 +109,8 @@ use public_broadcaster::{
 };
 use settings::WalletSettingsEditor;
 use shell::{PoiArtifactCacheRetryAttempts, WalletTab};
+#[cfg(test)]
+use shell::{ppoi_hover_detail, ppoi_hover_heading};
 use sidebar::Activity;
 use spend_authorization::{SpendAuthorizationCache, SpendAuthorizationLifetime};
 use startup::WalletStartupRoot;
@@ -172,8 +174,8 @@ use private_action::{
 use private_assets::{
     format_private_asset_rows, format_total, max_send_amount_from_snapshot,
     max_unshield_amount_from_snapshot, private_asset_display_amounts,
-    refresh_form_asset_from_snapshot, send_asset_key_from_formatted, send_key_matches_asset,
-    unshield_asset_key_from_formatted, unshield_key_matches_asset,
+    refresh_form_asset_from_snapshot, retry_poi_label, send_asset_key_from_formatted,
+    send_key_matches_asset, unshield_asset_key_from_formatted, unshield_key_matches_asset,
 };
 #[cfg(test)]
 use private_broadcaster::{
@@ -246,10 +248,12 @@ use spend_authorization::{
 use startup::{load_validated_startup_settings, resolve_initial_chain_id};
 #[cfg(test)]
 use utxo::{
-    activity_classification_icon_style, apply_blocked_shield_rescue_rows,
+    UtxoDisplayRow, activity_classification_icon_style, apply_blocked_shield_rescue_rows,
     blocked_shield_refund_action_available, blocked_shield_refund_origin_resolving,
-    display_rows_from_output, format_compact_age, recoverable_poi_candidate_count,
-    should_show_blocked_shield_refund_action,
+    display_rows_from_output, format_compact_age, global_poi_retry_available,
+    poi_retry_button_label, ppoi_row_state_detail, ppoi_state_detail, ppoi_workflow_status_detail,
+    ppoi_workflow_status_title, recoverable_poi_candidate_count,
+    should_show_blocked_shield_refund_action, should_show_ppoi_retry_action,
 };
 #[cfg(test)]
 use vault::{
@@ -390,6 +394,7 @@ pub(crate) struct WalletRoot {
     ui_state: WalletUiState,
     chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
+    pending_ppoi_validation_toast: Option<(Arc<str>, u64)>,
     poi_artifact_cache_progress: BTreeMap<u64, PoiArtifactCacheProgress>,
     poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts,
     wallet_sync_lifecycle: WalletSyncLifecycle,
@@ -902,6 +907,7 @@ impl WalletRoot {
             ui_state,
             chain_select: chain_select.clone(),
             chain_states,
+            pending_ppoi_validation_toast: None,
             poi_artifact_cache_progress: BTreeMap::new(),
             poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts::default(),
             wallet_sync_lifecycle: WalletSyncLifecycle::new(),

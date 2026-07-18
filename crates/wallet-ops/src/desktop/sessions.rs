@@ -233,10 +233,23 @@ fn wallet_session_observation(
             empty_wallet_snapshot(chain_id, cache_key)
         }
     });
-    Ok(WalletSessionObservation {
+    Ok(wallet_session_observation_from_parts(
         snapshot,
-        readiness: observation.readiness().clone(),
-    })
+        observation.readiness().clone(),
+        *observation.ppoi_workflow_status(),
+    ))
+}
+
+const fn wallet_session_observation_from_parts(
+    snapshot: Arc<ListUtxosOutput>,
+    readiness: WalletReadiness,
+    ppoi_workflow_status: WalletPpoiWorkflowStatus,
+) -> WalletSessionObservation {
+    WalletSessionObservation {
+        snapshot,
+        readiness,
+        ppoi_workflow_status,
+    }
 }
 
 fn empty_wallet_snapshot(chain_id: u64, cache_key: &str) -> ListUtxosOutput {
@@ -436,6 +449,24 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_session_observation_keeps_ppoi_workflow_separate_from_snapshot() {
+        let status = WalletPpoiWorkflowStatus {
+            awaiting_submission: 1,
+            awaiting_validation: 2,
+            needs_attention: 3,
+            validation_revision: 4,
+        };
+        let projected = wallet_session_observation_from_parts(
+            Arc::new(empty_wallet_snapshot(1, "wallet")),
+            WalletReadiness::Syncing,
+            status,
+        );
+
+        assert_eq!(projected.ppoi_workflow_status, status);
+        assert_eq!(projected.snapshot.utxo_count, 0);
+    }
 
     #[test]
     fn active_wallet_scope_rejects_stale_and_same_generation_replacement() {

@@ -15,7 +15,7 @@ pub(super) use wallet_ops::{
     PublicBalanceAsset, PublicBalanceEntry, PublicBroadcasterCandidate,
     PublicBroadcasterCostEstimate, PublicBroadcasterFeeMargin, PublicBroadcasterResultKind,
     PublicBroadcasterSelection, PublicBroadcasterSubmissionResult, SyncProgressStage,
-    SyncProgressUpdate, TransactionGenerationStage, UtxoOutput,
+    SyncProgressUpdate, TransactionGenerationStage, UtxoOutput, UtxoPpoiState,
     settings::{
         BuiltInTokenOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WALLET_SETTINGS_KEY,
@@ -75,6 +75,11 @@ pub(super) fn utxo_output_with_hashes(
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
             if is_spent { "Unknown" } else { "Valid" }.to_string(),
         )]),
+        ppoi_state: if is_spent {
+            UtxoPpoiState::Unknown
+        } else {
+            UtxoPpoiState::Valid
+        },
         poi_spendable: !is_spent,
         source_tx_hash: source_tx_hash.to_string(),
         source_block_number: 11,
@@ -111,6 +116,7 @@ pub(super) fn unshield_utxo_output(
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
             "Valid".to_string(),
         )]),
+        ppoi_state: UtxoPpoiState::Valid,
         poi_spendable: true,
         source_tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
             .to_string(),

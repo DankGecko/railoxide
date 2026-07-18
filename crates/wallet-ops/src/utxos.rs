@@ -17,6 +17,26 @@ pub enum ActivityUtxoClassification {
     PrivateOutput,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum UtxoPpoiState {
+    Valid,
+    Missing,
+    ProofSubmitted,
+    Unknown,
+    ShieldBlocked,
+    Mixed,
+}
+
+impl UtxoPpoiState {
+    #[must_use]
+    pub const fn retry_eligible(self) -> bool {
+        matches!(
+            self,
+            Self::Missing | Self::ProofSubmitted | Self::Unknown | Self::Mixed
+        )
+    }
+}
+
 impl ActivityUtxoClassification {
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -41,6 +61,7 @@ pub struct UtxoOutput {
     pub npk: String,
     pub blinded_commitment: String,
     pub poi_statuses: BTreeMap<String, String>,
+    pub ppoi_state: UtxoPpoiState,
     pub poi_spendable: bool,
     pub source_tx_hash: String,
     pub source_block_number: u64,
@@ -54,6 +75,16 @@ pub struct UtxoOutput {
 }
 
 impl UtxoOutput {
+    #[must_use]
+    pub fn is_ppoi_retry_eligible(&self) -> bool {
+        !self.is_spent
+            && !self.pending_new
+            && !self.pending_spent
+            && !self.local_pending_spent
+            && self.commitment_kind == "Transact"
+            && self.ppoi_state.retry_eligible()
+    }
+
     fn planner_utxo_for_token(&self, token: Address) -> Option<Utxo> {
         if self.is_spent
             || self.pending_new
@@ -159,6 +190,7 @@ pub(crate) fn utxo_outputs_from_utxos(
             let activity_classification =
                 activity_utxo_classification(&utxo.poi, &active_poi_list_keys);
             let poi_statuses = poi_statuses_for_output(&utxo, &active_poi_list_keys);
+            let ppoi_state = utxo_ppoi_state(&utxo.poi, &active_poi_list_keys);
 
             UtxoOutput {
                 tree: utxo.tree,
@@ -178,6 +210,7 @@ pub(crate) fn utxo_outputs_from_utxos(
                 npk: hex::encode_prefixed(utxo.poi.npk),
                 blinded_commitment: hex::encode_prefixed(utxo.poi.blinded_commitment),
                 poi_statuses,
+                ppoi_state,
                 poi_spendable,
                 source_tx_hash: hex::encode_prefixed(source.tx_hash),
                 source_block_number: source.block_number,
@@ -316,6 +349,7 @@ fn pending_utxo_output(wallet_utxo: WalletUtxo) -> UtxoOutput {
         npk: hex::encode_prefixed(utxo.poi.npk),
         blinded_commitment: hex::encode_prefixed(utxo.poi.blinded_commitment),
         poi_statuses: BTreeMap::new(),
+        ppoi_state: UtxoPpoiState::Unknown,
         poi_spendable: false,
         source_tx_hash: hex::encode_prefixed(source.tx_hash),
         source_block_number: source.block_number,
@@ -392,6 +426,33 @@ const fn poi_status_label(status: PoiStatus) -> &'static str {
         PoiStatus::ProofSubmitted => "ProofSubmitted",
         PoiStatus::Missing => "Missing",
         PoiStatus::Unknown => "Unknown",
+    }
+}
+
+pub(crate) fn utxo_ppoi_state(
+    poi: &UtxoPoiMetadata,
+    active_poi_list_keys: &[FixedBytes<32>],
+) -> UtxoPpoiState {
+    let mut state = None;
+    let mut mixed = false;
+    for list_key in active_poi_list_keys {
+        let current = match poi.statuses.get(list_key) {
+            Some(PoiStatus::Valid) => UtxoPpoiState::Valid,
+            Some(PoiStatus::ShieldBlocked) => return UtxoPpoiState::ShieldBlocked,
+            Some(PoiStatus::ProofSubmitted) => UtxoPpoiState::ProofSubmitted,
+            Some(PoiStatus::Missing) => UtxoPpoiState::Missing,
+            Some(PoiStatus::Unknown) | None => UtxoPpoiState::Unknown,
+        };
+        match state {
+            None => state = Some(current),
+            Some(previous) if previous == current => {}
+            Some(_) => mixed = true,
+        }
+    }
+    if mixed {
+        UtxoPpoiState::Mixed
+    } else {
+        state.unwrap_or(UtxoPpoiState::Unknown)
     }
 }
 

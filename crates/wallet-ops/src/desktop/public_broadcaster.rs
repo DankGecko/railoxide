@@ -603,6 +603,7 @@ pub struct WalletSyncTip {
 pub struct WalletSessionObservation {
     pub snapshot: Arc<ListUtxosOutput>,
     pub readiness: WalletReadiness,
+    pub ppoi_workflow_status: WalletPpoiWorkflowStatus,
 }
 
 pub struct WalletSession {
