@@ -70,11 +70,12 @@ use sync_service::{
 pub use sync_service::{
     ChainPublicSyncCacheReset, ChainPublicSyncCacheResetResult, GlobalPoiPolicy as PoiReadSource,
     PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
-    PersistedPublicSyncCacheResetReport, PoiArtifactCacheAttemptId, PoiArtifactCacheListProgress,
-    PoiArtifactCachePhase, PoiArtifactCacheProgress, PoiArtifactManifestSource,
-    PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource, PublicSyncCachesResetReport,
-    SyncProgressStage, SyncProgressUnit, SyncProgressUpdate, WalletIndexedCatchUpSource,
-    WalletIndexedCatchUpStatus, reset_persisted_public_sync_caches,
+    PersistedPublicSyncCacheResetReport, PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind,
+    PoiArtifactCacheGraphProgress, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
+    PoiArtifactCacheProgress, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
+    PublicScanSource, PublicSyncCachesResetReport, SyncProgressStage, SyncProgressUnit,
+    SyncProgressUpdate, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
+    reset_persisted_public_sync_caches,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;

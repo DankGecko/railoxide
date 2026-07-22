@@ -38,6 +38,7 @@ pub(super) struct ManageWalletsState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(not(any(test, feature = "hardware")), allow(dead_code))]
 enum HardwareDeleteUnlockLifecycle {
     #[default]
     Inactive,
@@ -62,11 +63,13 @@ impl ManageWalletsState {
         };
     }
 
+    #[cfg_attr(not(any(test, feature = "hardware")), allow(dead_code))]
     pub(super) fn begin_hardware_delete_unlock(&mut self, wallet_id: Arc<str>) {
         self.hardware_delete_wallet_id = Some(wallet_id);
         self.hardware_delete_unlock_lifecycle = HardwareDeleteUnlockLifecycle::AwaitingTarget;
     }
 
+    #[cfg_attr(not(any(test, feature = "hardware")), allow(dead_code))]
     pub(super) fn mark_hardware_delete_target_opened(&mut self, wallet_id: &str) {
         if self.hardware_delete_unlock_lifecycle == HardwareDeleteUnlockLifecycle::AwaitingTarget
             && self.hardware_delete_wallet_id.as_deref() == Some(wallet_id)
@@ -75,6 +78,7 @@ impl ManageWalletsState {
         }
     }
 
+    #[cfg_attr(not(any(test, feature = "hardware")), allow(dead_code))]
     pub(super) fn finish_hardware_delete_unlock_dialog(&mut self) {
         if self.hardware_delete_unlock_lifecycle == HardwareDeleteUnlockLifecycle::AwaitingTarget {
             self.hardware_delete_wallet_id = None;

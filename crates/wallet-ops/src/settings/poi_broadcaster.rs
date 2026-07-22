@@ -1,10 +1,15 @@
 use super::{
     BroadcasterFeePolicy, DEFAULT_PUBLIC_BROADCASTER_RESPONSE_TIMEOUT_SECS, Deserialize,
-    MAX_INTERVAL_SECS, OFFICIAL_POI_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_IPNS_NAME,
-    OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY, PUBLIC_BROADCASTER_REPUBLISH_INTERVAL,
-    PoiArtifactManifestSource, PoiArtifactSourceConfig, SensitiveUrl, Serialize, Url,
-    parse_fixed_hex_32, validate_optional_range, validate_range, validate_url_scheme,
+    LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME, MAX_INTERVAL_SECS, OFFICIAL_POI_ARTIFACT_GATEWAYS,
+    OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
+    PUBLIC_BROADCASTER_REPUBLISH_INTERVAL, PoiArtifactManifestSource, PoiArtifactSourceConfig,
+    SensitiveUrl, Serialize, Url, parse_fixed_hex_32, validate_optional_range, validate_range,
+    validate_url_scheme,
 };
+use cid::Cid;
+use libp2p::PeerId;
+
+const LIBP2P_KEY_CODEC: u64 = 0x72;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -77,6 +82,21 @@ impl PoiArtifactSettings {
         }
     }
 
+    pub(super) fn migrate_legacy_official_identity(&mut self) -> bool {
+        if self.publisher_pubkey != OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY
+            || self.manifest_source
+                != PoiArtifactManifestSourceSetting::IpnsName(
+                    LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string(),
+                )
+        {
+            return false;
+        }
+
+        self.manifest_source =
+            PoiArtifactManifestSourceSetting::IpnsName(OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string());
+        true
+    }
+
     pub(super) fn source_config(&self) -> PoiArtifactSourceConfig {
         PoiArtifactSourceConfig {
             trusted_publisher_pubkey: parse_fixed_hex_32(&self.publisher_pubkey)
@@ -101,8 +121,21 @@ impl PoiArtifactSettings {
         } else if parse_fixed_hex_32(&self.publisher_pubkey).is_err() {
             errors.push("poi.artifact.publisher_pubkey must be a 32-byte hex value".to_string());
         }
-        self.manifest_source
-            .validate("poi.artifact.manifest_source", errors);
+        match &self.manifest_source {
+            PoiArtifactManifestSourceSetting::IpnsName(name) => {
+                let valid = Cid::try_from(name.trim()).is_ok_and(|cid| {
+                    cid.codec() == LIBP2P_KEY_CODEC
+                        && PeerId::from_bytes(&cid.hash().to_bytes()).is_ok()
+                });
+                if !valid {
+                    errors
+                        .push("poi.artifact.manifest_source must be a valid IPNS name".to_string());
+                }
+            }
+            PoiArtifactManifestSourceSetting::Url(_) | PoiArtifactManifestSourceSetting::Cid(_) => {
+                errors.push("poi.artifact.manifest_source must use an IPNS name".to_string());
+            }
+        }
         if self.gateway_urls.is_empty() {
             errors.push("poi.artifact.gateway_urls must contain at least one gateway".to_string());
         }
@@ -139,17 +172,6 @@ impl Default for PoiArtifactManifestSourceSetting {
 }
 
 impl PoiArtifactManifestSourceSetting {
-    pub(super) fn validate(&self, field: &str, errors: &mut Vec<String>) {
-        match self {
-            Self::Url(url) => validate_url_scheme(field, url, &["http", "https"], errors),
-            Self::Cid(cid) | Self::IpnsName(cid) => {
-                if cid.trim().is_empty() {
-                    errors.push(format!("{field} must not be empty"));
-                }
-            }
-        }
-    }
-
     pub(super) fn to_runtime(&self) -> PoiArtifactManifestSource {
         match self {
             Self::Url(url) => PoiArtifactManifestSource::Url(

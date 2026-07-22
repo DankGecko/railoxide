@@ -1,5 +1,8 @@
 use super::*;
-use crate::root::maintenance::{WalletMaintenanceReset, WalletMaintenanceStateMachine};
+use crate::root::maintenance::{
+    PublicSyncResetCompletion, WalletMaintenanceReset, WalletMaintenanceStateMachine,
+    public_sync_reset_restart_is_safe,
+};
 use crate::root::settings::{
     add_indexed_artifact_gateway_url, apply_indexed_artifact_source_mode,
     indexed_artifact_source_mode_value, indexed_artifact_source_status_message,
@@ -27,10 +30,55 @@ fn maintenance_reset_state_machine_rejects_competing_acquisition() {
             .try_acquire(WalletMaintenanceReset::Merkle, "merkle reset")
             .is_none()
     );
+    assert!(
+        state
+            .try_acquire(WalletMaintenanceReset::Poi, "PPOI reset")
+            .is_none()
+    );
     assert!(state.complete(public_generation, "public reset complete"));
     assert_eq!(state.reset(), WalletMaintenanceReset::Idle);
+    let poi_generation = state
+        .try_acquire(WalletMaintenanceReset::Poi, "PPOI reset")
+        .expect("idle state acquires PPOI reset");
+    assert_eq!(state.reset(), WalletMaintenanceReset::Poi);
+    assert!(
+        state
+            .try_acquire(WalletMaintenanceReset::Public, "public reset")
+            .is_none()
+    );
+    assert!(state.complete(poi_generation, "PPOI reset complete"));
     assert!(state.set_idle_status("cleanup pending"));
     assert_eq!(state.status().as_deref(), Some("cleanup pending"));
+}
+
+#[test]
+fn public_and_ppoi_resets_block_sync_for_newly_installed_root() {
+    assert!(maintenance_blocks_public_sync(
+        WalletMaintenanceReset::Public
+    ));
+    assert!(maintenance_blocks_public_sync(WalletMaintenanceReset::Poi));
+    assert!(!maintenance_blocks_public_sync(
+        WalletMaintenanceReset::Merkle
+    ));
+    assert!(!maintenance_blocks_public_sync(
+        WalletMaintenanceReset::Idle
+    ));
+}
+
+#[test]
+fn public_sync_reset_restarts_only_after_cleanup_reaches_reset_attempt() {
+    assert!(public_sync_reset_restart_is_safe(
+        true,
+        PublicSyncResetCompletion::ResetAttempted,
+    ));
+    assert!(!public_sync_reset_restart_is_safe(
+        true,
+        PublicSyncResetCompletion::CleanupFailed,
+    ));
+    assert!(!public_sync_reset_restart_is_safe(
+        false,
+        PublicSyncResetCompletion::ResetAttempted,
+    ));
 }
 
 #[test]

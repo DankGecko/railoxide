@@ -113,6 +113,7 @@ impl Render for WalletSettingsEditor {
         );
         let poi_reset_editor = editor.clone();
         let poi_cache_reset_editor = editor.clone();
+        let poi_data_reset_editor = editor.clone();
         let merkle_forest_cache_reset_editor = editor.clone();
         let prover_cache_editor = editor.clone();
         let indexed_source_mode = Self::dropdown_field(
@@ -630,7 +631,10 @@ impl Render for WalletSettingsEditor {
                         SettingItem::new("Publisher public key", poi_publisher)
                             .layout(Axis::Vertical),
                     )
-                    .item(SettingItem::new("IPNS name", poi_ipns).layout(Axis::Vertical))
+                    .item(
+                        SettingItem::new("IPNS name", poi_ipns)
+                            .layout(Axis::Vertical),
+                    )
                     .item(SettingItem::new(
                         "Reset POI artifact defaults",
                         SettingField::<SharedString>::render(move |_options, _window, _cx| {
@@ -733,6 +737,17 @@ impl Render for WalletSettingsEditor {
                                 )
                             }),
                         )
+                        .description("Clears downloaded public sync data while preserving verified PPOI data used for wallet checks.")
+                        .layout(Axis::Vertical),
+                    )
+                    .item(
+                        SettingItem::new(
+                            "Reset PPOI data",
+                            SettingField::<SharedString>::render(move |_options, _window, cx| {
+                                Self::render_poi_data_reset_action(&poi_data_reset_editor, cx)
+                            }),
+                        )
+                        .description("Deletes verified PPOI data and downloaded PPOI chunks for all chains, then rebuilds from the current source.")
                         .layout(Axis::Vertical),
                     )
                     .item(

@@ -8,12 +8,16 @@ use crate::root::chain_load::{
     ppoi_validation_toast_scope_is_current, retain_auxiliary_stream, wallet_readiness_disposition,
     wallet_sync_maintenance_allows_start,
 };
-use crate::root::shell::{PoiArtifactCacheRetryAttempts, ppoi_retry_completion_is_current};
+use crate::root::maintenance::{PublicSyncResetCompletion, public_sync_reset_restart_is_safe};
+use crate::root::shell::{
+    PoiArtifactCacheRetryAttempts, ppoi_chunk_progress_label, ppoi_replay_progress_label,
+    ppoi_retry_completion_is_current,
+};
 use wallet_ops::{
-    PoiArtifactCacheAttemptId, PoiArtifactCachePhase, PoiArtifactCacheProgress,
-    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, WalletNetworkMode,
-    WalletPpoiWorkflowStatus, WalletReadiness, WalletReadinessError, WalletSessionStore,
-    WalletSyncTip,
+    PoiArtifactCacheAttemptId, PoiArtifactCacheGraphProgress, PoiArtifactCachePhase,
+    PoiArtifactCacheProgress, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
+    WalletNetworkMode, WalletPpoiWorkflowStatus, WalletReadiness, WalletReadinessError,
+    WalletSessionStore, WalletSyncTip,
 };
 
 #[test]
@@ -93,6 +97,7 @@ fn poi_artifact_progress(
 ) -> PoiArtifactCacheProgress {
     PoiArtifactCacheProgress {
         attempt_id,
+        generation: 1,
         chain_id: 1,
         phase,
         completed_lists: usize::from(ready_for_wallet_checks),
@@ -101,8 +106,9 @@ fn poi_artifact_progress(
         current_event_index: None,
         target_event_index: None,
         list_progress: Vec::new(),
+        graph: PoiArtifactCacheGraphProgress::default(),
         ready_for_wallet_checks,
-        last_error: None,
+        last_error: (phase == PoiArtifactCachePhase::Failed).then(|| "failed".to_string()),
     }
 }
 
@@ -692,15 +698,22 @@ async fn wallet_sync_lifecycle_cleanup_detects_late_initialized_store() {
     let poi_policy = wallet_ops::settings::WalletSettings::default()
         .poi_read_source()
         .expect("default POI policy");
-    let store = Arc::new(
-        WalletSessionStore::open(root_dir.clone(), poi_policy).expect("open session store"),
-    );
+    let vault_store = DesktopVaultStore::open(root_dir.clone()).expect("open wallet DB");
+    let db = vault_store.db();
+    let store = Arc::new(WalletSessionStore::from_db(Arc::clone(&db), poi_policy));
 
-    assert!(old_session_store.set(store).is_ok());
+    assert!(old_session_store.set(Arc::clone(&store)).is_ok());
     let report = cleanup.shutdown().await.expect("shutdown lifecycle");
 
     assert_eq!(report.stopped_startup_tasks, 0);
     assert!(report.shut_down_session_store);
+    let reset = wallet_ops::reset_persisted_poi_data(db.as_ref())
+        .await
+        .expect("offline PPOI reset after owner shutdown");
+    assert_eq!(reset.data_records_removed, 0);
+    drop(store);
+    drop(db);
+    drop(vault_store);
     let _ = fs::remove_dir_all(root_dir);
 }
 
@@ -717,6 +730,8 @@ async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
     started_rx.await.expect("blocking cleanup task started");
     let cleanup = lifecycle.invalidate();
     let cleanup_task = cleanup.spawn(&tokio::runtime::Handle::current());
+    let admission_barrier = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task.clone()]);
+    assert!(!admission_barrier.is_finished());
 
     let error = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task.clone()])
         .shutdown_with_timeout(Duration::from_millis(1))
@@ -724,11 +739,16 @@ async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
         .expect_err("cleanup should time out");
 
     assert_eq!(error, "timed out stopping wallet sync; try again");
-    let report = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task])
-        .shutdown_with_timeout(Duration::from_secs(1))
-        .await
-        .expect("cleanup should still complete");
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task])
+            .shutdown_for_root_replacement(),
+    )
+    .await
+    .expect("root replacement cleanup should not time out")
+    .expect("cleanup should still complete");
     assert_eq!(report.stopped_startup_tasks, 1);
+    assert!(admission_barrier.is_finished());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -762,15 +782,22 @@ async fn wallet_sync_lifecycle_wait_group_reuses_timed_out_cleanup() {
 }
 
 #[tokio::test]
-async fn wallet_deletion_cleanup_surfaces_completion_channel_closure() {
-    let error = WalletSyncLifecycleCleanupWaitGroup::new(vec![
+async fn closed_cleanup_is_terminal_but_still_surfaces_explicit_error() {
+    let cleanup = WalletSyncLifecycleCleanupWaitGroup::new(vec![
         WalletSyncLifecycleCleanupTask::closed_for_test(),
-    ])
-    .shutdown_for_wallet_deletion()
-    .await
-    .expect_err("closed cleanup channel should fail deletion");
+    ]);
+    assert!(cleanup.is_finished());
+
+    let error = cleanup
+        .shutdown_for_wallet_deletion()
+        .await
+        .expect_err("closed cleanup channel should fail deletion");
 
     assert_eq!(error, "wallet sync cleanup task ended before completion");
+    assert!(!public_sync_reset_restart_is_safe(
+        true,
+        PublicSyncResetCompletion::CleanupFailed,
+    ));
 }
 
 #[test]
@@ -1015,10 +1042,10 @@ fn wallet_status_presence_classifies_sync_and_ppoi_health() {
 
     let attempt_id = poi_artifact_attempt_id(1);
     let active_cache =
-        poi_artifact_progress(attempt_id, PoiArtifactCachePhase::ApplyingDeltas, false);
+        poi_artifact_progress(attempt_id, PoiArtifactCachePhase::ReplayingRanges, false);
     let ready_cache = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Ready, true);
-    let usable_error = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Error, true);
-    let blocking_error = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Error, false);
+    let usable_error = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Failed, true);
+    let blocking_error = poi_artifact_progress(attempt_id, PoiArtifactCachePhase::Failed, false);
     assert_eq!(
         ppoi_presence_status(
             false,
@@ -1087,6 +1114,131 @@ fn ppoi_retry_completion_rejects_stale_wallet_or_session() {
 }
 
 #[test]
+fn cold_ppoi_download_reports_chunk_and_byte_progress_without_readiness() {
+    let mut progress = poi_artifact_progress(
+        poi_artifact_attempt_id(2),
+        PoiArtifactCachePhase::DownloadingChunks,
+        false,
+    );
+    progress.graph = PoiArtifactCacheGraphProgress {
+        verified_chunks: 3,
+        total_chunks: 10,
+        verified_encoded_bytes: 12 * 1024 * 1024,
+        total_authenticated_encoded_bytes: Some(31 * 1024 * 1024),
+        ..PoiArtifactCacheGraphProgress::default()
+    };
+
+    assert_eq!(
+        ppoi_hover_heading(PresenceStatus::Active, Some(&progress), false),
+        "Downloading POI chunks"
+    );
+    assert_eq!(
+        ppoi_chunk_progress_label(&progress).as_deref(),
+        Some("3/10 chunks · 12 MiB/31 MiB")
+    );
+    assert!(!progress.ready_for_wallet_checks);
+}
+
+#[test]
+fn warm_ppoi_refresh_keeps_local_corpus_readiness_visible() {
+    let progress = poi_artifact_progress(
+        poi_artifact_attempt_id(3),
+        PoiArtifactCachePhase::Planning,
+        true,
+    );
+
+    assert_eq!(
+        ppoi_hover_heading(PresenceStatus::Active, Some(&progress), false),
+        "Refreshing PPOI data"
+    );
+    assert_eq!(
+        ppoi_hover_detail(PresenceStatus::Active, Some(&progress), false),
+        Some(
+            "Refreshing in the background while wallet checks use verified PPOI data saved on this device."
+        )
+    );
+}
+
+#[test]
+fn retained_bridge_replay_reports_authenticated_event_range() {
+    let mut progress = poi_artifact_progress(
+        poi_artifact_attempt_id(4),
+        PoiArtifactCachePhase::ReplayingRanges,
+        true,
+    );
+    progress.graph = PoiArtifactCacheGraphProgress {
+        replay_start_event_index: Some(32_768),
+        replay_end_event_index: Some(33_023),
+        replayed_event_count: 128,
+        total_replay_event_count: 256,
+        ..PoiArtifactCacheGraphProgress::default()
+    };
+
+    assert_eq!(
+        ppoi_replay_progress_label(&progress).as_deref(),
+        Some("Events 32768-33023 · 128/256 replayed")
+    );
+    assert_eq!(
+        ppoi_hover_heading(PresenceStatus::Active, Some(&progress), false),
+        "Refreshing PPOI data"
+    );
+}
+
+#[test]
+fn failed_ppoi_refresh_keeps_serving_corpus_available() {
+    let mut progress = poi_artifact_progress(
+        poi_artifact_attempt_id(5),
+        PoiArtifactCachePhase::Failed,
+        true,
+    );
+    progress.last_error = Some("catalog unavailable".to_string());
+
+    assert_eq!(
+        ppoi_presence_status(
+            false,
+            true,
+            true,
+            Some(&progress),
+            WalletStatusCounts::default()
+        ),
+        PresenceStatus::Active
+    );
+    assert_eq!(
+        ppoi_hover_heading(PresenceStatus::Active, Some(&progress), false),
+        "Artifact cache refresh failed"
+    );
+    assert_eq!(
+        ppoi_hover_detail(PresenceStatus::Active, Some(&progress), false),
+        Some(
+            "Refresh failed; wallet checks continue using verified PPOI data saved on this device."
+        )
+    );
+}
+
+#[test]
+fn official_ppoi_artifact_runtime_has_no_legacy_or_proxy_fallback() {
+    let settings = wallet_ops::settings::WalletSettings::default();
+    let wallet_ops::PoiReadSource::IndexedArtifacts {
+        artifact_source,
+        wallet_read_fallback,
+        ..
+    } = settings
+        .poi_read_source()
+        .expect("official PPOI artifact runtime")
+    else {
+        panic!("official PPOI artifact runtime should use indexed artifacts");
+    };
+
+    assert!(matches!(
+        artifact_source.manifest_source,
+        wallet_ops::PoiArtifactManifestSource::IpnsName(ref name)
+            if name == wallet_ops::settings::OFFICIAL_POI_ARTIFACT_IPNS_NAME
+                && name != wallet_ops::settings::LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME
+    ));
+    assert_eq!(wallet_read_fallback, wallet_ops::PoiProxyFallback::Disabled);
+}
+
+#[test]
 fn ppoi_retry_pending_admission_owns_chain() {
     let mut attempts = PoiArtifactCacheRetryAttempts::default();
     let request_token = attempts.begin(1).expect("start retry request");
@@ -1138,24 +1290,6 @@ fn ppoi_retry_stale_completion_does_not_clear_replacement() {
     assert!(!attempts.finish(1, stale_attempt_id));
     assert!(attempts.contains(1));
     assert!(attempts.finish(1, replacement_attempt_id));
-}
-
-#[test]
-fn ppoi_retry_unrelated_progress_attempt_does_not_match_user_retry() {
-    let mut attempts = PoiArtifactCacheRetryAttempts::default();
-    let request_token = attempts.begin(1).expect("start retry request");
-    let attempt_id = poi_artifact_attempt_id(40);
-    assert!(attempts.bind(1, request_token, attempt_id));
-    let unrelated_progress = poi_artifact_progress(
-        poi_artifact_attempt_id(41),
-        PoiArtifactCachePhase::ApplyingDeltas,
-        false,
-    );
-    let matching_progress =
-        poi_artifact_progress(attempt_id, PoiArtifactCachePhase::ApplyingDeltas, false);
-
-    assert!(!attempts.matches_progress(1, &unrelated_progress));
-    assert!(attempts.matches_progress(1, &matching_progress));
 }
 
 #[test]

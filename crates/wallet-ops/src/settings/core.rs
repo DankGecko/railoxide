@@ -11,8 +11,10 @@ pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 1;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x4fa849f01e8983c4393eee6e7482f60d4f9702e2d7917101a0edeb001369d5c5";
-pub const OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
+pub const LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
     "k51qzi5uqu5di629evs7ynhsqiy4uit6qt70tx62roace2ij6jc83uo9jseqit";
+pub const OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
+    "k51qzi5uqu5dkrtrukbpsi4pbdfphcrceqgujgft1fxaa4lfgrdp46f4mk7qdq";
 pub const OFFICIAL_POI_ARTIFACT_GATEWAYS: &[&str] = &[
     "https://dweb.link",
     "https://ipfs.filebase.io",

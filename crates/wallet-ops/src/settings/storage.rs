@@ -8,7 +8,12 @@ pub fn load_wallet_settings(store: &DbStore) -> Result<WalletSettings, WalletSet
     let Some(payload) = store.get_app_settings_record(WALLET_SETTINGS_KEY)? else {
         return Ok(WalletSettings::default());
     };
-    decode_wallet_settings(&payload)
+    let mut settings = decode_wallet_settings(&payload)?;
+    if settings.poi.artifact.migrate_legacy_official_identity() {
+        let payload = encode_wallet_settings(&settings)?;
+        store.put_app_settings_record(WALLET_SETTINGS_KEY, &payload)?;
+    }
+    Ok(settings)
 }
 
 pub fn save_wallet_settings(

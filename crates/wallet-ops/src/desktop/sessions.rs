@@ -12,6 +12,67 @@ pub struct WalletSessionStore {
     active_wallet_scope: AsyncMutex<ActiveWalletScope>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistedPoiDataResetReport {
+    pub data_records_removed: u64,
+    pub chunk_records_removed: u64,
+}
+
+impl PersistedPoiDataResetReport {
+    #[must_use]
+    pub const fn total_removed_entries(self) -> u64 {
+        self.data_records_removed
+            .saturating_add(self.chunk_records_removed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("failed to reset {failed_resource} after removing {removed_entries} entries: {reason}")]
+pub struct PersistedPoiDataResetError {
+    pub kind: PersistedPublicSyncCacheKind,
+    pub reason: String,
+    pub partial_report: PersistedPoiDataResetReport,
+    failed_resource: &'static str,
+    removed_entries: u64,
+}
+
+impl From<PersistedPublicSyncCacheResetError> for PersistedPoiDataResetError {
+    fn from(error: PersistedPublicSyncCacheResetError) -> Self {
+        let partial_report = PersistedPoiDataResetReport {
+            data_records_removed: error.poi_corpus_entries_removed,
+            chunk_records_removed: error
+                .partial_report
+                .poi_artifact_checkpoint_chunk_entries_removed,
+        };
+        let failed_resource = match error.kind {
+            PersistedPublicSyncCacheKind::PoiCorpus => "verified PPOI data",
+            PersistedPublicSyncCacheKind::PoiArtifactCheckpointChunks => "downloaded PPOI chunks",
+            PersistedPublicSyncCacheKind::Txid
+            | PersistedPublicSyncCacheKind::WalletScanArtifactChunks => "PPOI data",
+        };
+        Self {
+            kind: error.kind,
+            reason: error.reason,
+            removed_entries: partial_report.total_removed_entries(),
+            partial_report,
+            failed_resource,
+        }
+    }
+}
+
+/// Resets PPOI data after every wallet sync owner for `db` has shut down.
+pub async fn reset_persisted_poi_data(
+    db: &DbStore,
+) -> Result<PersistedPoiDataResetReport, PersistedPoiDataResetError> {
+    let reset = sync_service::reset_offline_poi_corpus(db)
+        .await
+        .map_err(PersistedPoiDataResetError::from)?;
+    Ok(PersistedPoiDataResetReport {
+        data_records_removed: reset.corpus_entries_removed,
+        chunk_records_removed: reset.raw_chunk_entries_removed,
+    })
+}
+
 #[derive(Default)]
 struct ActiveWalletScope {
     generation: u64,
@@ -449,6 +510,29 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn offline_poi_data_reset_accepts_database_without_active_owners() {
+        let root_dir = std::env::temp_dir().join(format!(
+            "wallet-ops-offline-poi-reset-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open local DB");
+
+        let report = reset_persisted_poi_data(&db)
+            .await
+            .expect("reset empty PPOI data");
+
+        assert_eq!(report, PersistedPoiDataResetReport::default());
+        drop(db);
+        std::fs::remove_dir_all(root_dir).expect("remove local DB");
+    }
 
     #[test]
     fn wallet_session_observation_keeps_ppoi_workflow_separate_from_snapshot() {

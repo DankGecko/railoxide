@@ -218,8 +218,8 @@ impl WalletSettingsEditor {
                 dialog,
                 ConfirmationDialogProps::danger(
                     "Reset public sync caches",
-                    "Clears reconstructible persisted artifact chunks, POI corpus, and TXID public cache data. Active wallet sessions also discard public scan coverage and resync.",
-                    Some("Wallet data, keys, and balances are not deleted."),
+                    "Clears downloaded artifact chunks and TXID public cache data. Active wallet sessions also discard public scan coverage and resync.",
+                    Some("Verified PPOI data, wallet data, keys, and balances are preserved."),
                     "Reset public cache",
                 ),
                 dialog_width,
@@ -241,6 +241,50 @@ impl WalletSettingsEditor {
         let vault_store = Arc::clone(&self.vault_store);
         controller.update(cx, |controller, cx| {
             controller.start_public_reset(vault_store.as_ref(), cx);
+        });
+    }
+
+    pub(in crate::root) fn open_poi_data_reset_dialog(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.maintenance_controller.read(cx).is_idle() {
+            return;
+        }
+        let editor = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let confirm_editor = editor.clone();
+            confirmation_dialog(
+                dialog,
+                ConfirmationDialogProps::danger(
+                    "Reset PPOI data",
+                    "Deletes verified PPOI data and downloaded PPOI chunks for all chains. PPOI checks will be unavailable until current data downloads and verifies again.",
+                    Some("Wallet data, keys, balances, settings, and publisher rollback protection are preserved."),
+                    "Reset PPOI data",
+                ),
+                dialog_width,
+                dialog_max_height,
+                content_max_height,
+            )
+            .on_ok(move |_event, _window, cx| {
+                confirm_editor.update(cx, |editor, cx| {
+                    editor.confirm_poi_data_reset(cx);
+                });
+                true
+            })
+        });
+    }
+
+    pub(in crate::root) fn confirm_poi_data_reset(&mut self, cx: &mut Context<'_, Self>) {
+        self.status = None;
+        let controller = self.maintenance_controller.clone();
+        let vault_store = Arc::clone(&self.vault_store);
+        controller.update(cx, |controller, cx| {
+            controller.start_poi_reset(vault_store.as_ref(), cx);
         });
     }
 
@@ -333,6 +377,28 @@ impl WalletSettingsEditor {
                 .on_click(move |_event, window, cx| {
                     reset_editor.update(cx, |editor, cx| {
                         editor.open_local_poi_cache_reset_dialog(window, cx);
+                    });
+                }),
+        )
+    }
+
+    pub(in crate::root) fn render_poi_data_reset_action(
+        editor: &Entity<Self>,
+        cx: &App,
+    ) -> gpui::Div {
+        let controller = editor.read(cx).maintenance_controller.clone();
+        let reset = controller.read(cx).reset();
+        let resetting = reset == WalletMaintenanceReset::Poi;
+        let reset_editor = editor.clone();
+        let label = if resetting { "Resetting..." } else { "Reset" };
+        div().flex().items_center().child(
+            app_button("wallet-settings-poi-data-reset", label)
+                .danger()
+                .outline()
+                .disabled(reset != WalletMaintenanceReset::Idle)
+                .on_click(move |_event, window, cx| {
+                    reset_editor.update(cx, |editor, cx| {
+                        editor.open_poi_data_reset_dialog(window, cx);
                     });
                 }),
         )

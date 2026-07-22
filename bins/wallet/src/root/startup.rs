@@ -34,6 +34,7 @@ use wallet_ops::{
     vault::DesktopVaultStore,
 };
 
+use super::chain_load::WalletSyncLifecycleCleanupWaitGroup;
 use super::settings::{
     StartupSettingsSummary, WalletSettingsEditor, settings_dialog_dimensions,
     startup_settings_action_state,
@@ -135,6 +136,7 @@ impl WalletStartupRoot {
                 1,
                 event_tx,
                 StartupNetworkContext::Build,
+                None,
                 progress_tx,
                 progress_rx,
                 vault_store,
@@ -150,6 +152,7 @@ impl WalletStartupRoot {
         generation: u64,
         event_tx: EventTx,
         network_context: StartupNetworkContext,
+        cleanup: Option<WalletSyncLifecycleCleanupWaitGroup>,
         progress_tx: watch::Sender<WalletNetworkProgress>,
         mut progress_rx: watch::Receiver<WalletNetworkProgress>,
         vault_store: Arc<DesktopVaultStore>,
@@ -179,6 +182,12 @@ impl WalletStartupRoot {
         let chain_ids = self.chain_ids.clone();
         let monitor_state = self.monitor_state.clone();
         let startup = self.runtime.spawn(async move {
+            if let Some(cleanup) = cleanup {
+                cleanup
+                    .shutdown_for_root_replacement()
+                    .await
+                    .map_err(|error| eyre::eyre!(error))?;
+            }
             build_wallet_startup(
                 options,
                 chain_ids,
@@ -199,6 +208,12 @@ impl WalletStartupRoot {
                 Ok(Ok(ready)) => root.finish_startup(ready, window, cx),
                 Ok(Err(error)) => root.fail_startup(format_report_chain(&error), cx),
                 Err(error) => root.fail_startup(format!("Wallet startup task failed: {error}"), cx),
+            });
+            let _ = this.update(cx, |root, cx| {
+                root.maintenance_controller.update(cx, |controller, cx| {
+                    controller.clear_finished_root_replacement_cleanup();
+                    cx.notify();
+                });
             });
         })
         .detach();
@@ -346,9 +361,14 @@ impl WalletStartupRoot {
                 return;
             }
         };
+        let cleanup = self
+            .wallet_root
+            .as_ref()
+            .map(|root| root.update(cx, |root, _cx| root.begin_root_replacement_sync_shutdown()));
         self.startup_generation = self.startup_generation.saturating_add(1);
         self.maintenance_controller.update(cx, |controller, _cx| {
             controller.clear_active_root();
+            controller.set_root_replacement_cleanup(cleanup.clone());
         });
         self.wallet_root = None;
         self.error = None;
@@ -363,6 +383,7 @@ impl WalletStartupRoot {
             self.startup_generation,
             self.event_tx.clone(),
             network_context,
+            cleanup,
             progress_tx,
             progress_rx,
             vault_store,

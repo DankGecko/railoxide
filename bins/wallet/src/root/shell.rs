@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,8 +32,9 @@ use ui::icons;
 use ui::logs::LogStore;
 use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    PoiArtifactCacheAttemptId, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
-    PoiArtifactCacheProgress, PublicScanSource, WalletNetworkMode, WalletSyncTip,
+    PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind, PoiArtifactCacheListProgress,
+    PoiArtifactCachePhase, PoiArtifactCacheProgress, PublicScanSource, WalletNetworkMode,
+    WalletSyncTip,
 };
 
 use crate::assets::{
@@ -130,16 +132,6 @@ impl PoiArtifactCacheRetryAttempts {
             }
             Entry::Occupied(_) | Entry::Vacant(_) => false,
         }
-    }
-
-    pub(super) fn matches_progress(
-        &self,
-        chain_id: u64,
-        progress: &PoiArtifactCacheProgress,
-    ) -> bool {
-        self.active
-            .get(&chain_id)
-            .is_some_and(|attempt| attempt.attempt_id == Some(progress.attempt_id))
     }
 
     pub(super) fn contains(&self, chain_id: u64) -> bool {
@@ -896,6 +888,7 @@ impl WalletRoot {
                 root,
                 ppoi_status,
                 counts,
+                "PPOI",
             ));
         } else {
             chips.push(
@@ -916,6 +909,7 @@ impl WalletRoot {
         root: &Entity<Self>,
         status: PresenceStatus,
         counts: WalletStatusCounts,
+        label: &'static str,
     ) -> gpui::AnyElement {
         render_ppoi_status_hover_target(root, "wallet-status-ppoi-hover")
             .child(
@@ -923,7 +917,7 @@ impl WalletRoot {
                     .count(counts.ppoi_attention_count())
                     .color(rgb(ppoi_attention_badge_color(counts)))
                     .child(
-                        status_presence_text("PPOI", status)
+                        status_presence_text(label, status)
                             .pr(px(12.0))
                             .into_any_element(),
                     ),
@@ -1082,9 +1076,10 @@ pub(super) const fn ppoi_retry_completion_is_current(
     current_wallet_generation == retry_wallet_generation && session_is_current
 }
 
-fn status_presence_text(label: &'static str, status: PresenceStatus) -> gpui::Div {
+fn status_presence_text(label: impl Into<SharedString>, status: PresenceStatus) -> gpui::Div {
     div()
         .h(px(24.0))
+        .min_w_0()
         .px_1()
         .flex()
         .items_center()
@@ -1093,9 +1088,11 @@ fn status_presence_text(label: &'static str, status: PresenceStatus) -> gpui::Di
         .child(status_presence_dot(status))
         .child(
             div()
+                .min_w_0()
+                .truncate()
                 .text_size(px(12.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(label),
+                .child(label.into()),
         )
 }
 
@@ -1250,12 +1247,6 @@ impl Render for PpoiStatusHoverCard {
             let retrying = root
                 .poi_artifact_cache_retry_attempts
                 .contains(root.selected_chain);
-            debug_assert!(
-                !progress.as_ref().is_some_and(|progress| {
-                    root.poi_artifact_cache_retry_attempts
-                        .matches_progress(root.selected_chain, progress)
-                }) || retrying
-            );
             (status, progress, refreshing, counts, retrying)
         };
         let color = presence_status_color(status);
@@ -1422,6 +1413,28 @@ fn render_ppoi_artifact_progress_section(
                 .text_size(px(12.0))
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(list_text),
+        )
+        .when_some(
+            ppoi_chunk_progress_label(progress),
+            |this, chunk_progress| {
+                this.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(chunk_progress),
+                )
+            },
+        )
+        .when_some(
+            ppoi_replay_progress_label(progress),
+            |this, replay_progress| {
+                this.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(replay_progress),
+                )
+            },
         )
         .when(
             progress.current_event_index.is_some() || progress.target_event_index.is_some(),
@@ -1825,17 +1838,34 @@ pub(super) fn ppoi_hover_heading(
 ) -> &'static str {
     if let Some(progress) = progress {
         if progress.is_error() {
-            return if status == PresenceStatus::Error {
-                "PPOI checks blocked"
-            } else {
-                "Artifact cache refresh failed"
+            return match progress.failure_kind() {
+                Some(PoiArtifactCacheFailureKind::ServingCorpusUnavailable) => {
+                    "PPOI data unavailable"
+                }
+                None if status == PresenceStatus::Error => "PPOI checks blocked",
+                Some(PoiArtifactCacheFailureKind::RefreshDegraded) | None => {
+                    "Artifact cache refresh failed"
+                }
             };
         }
         if progress.is_active() {
-            return if progress.phase == PoiArtifactCachePhase::LiveTailing {
-                "Following POI event tail"
-            } else {
-                "Rebuilding local POI artifact cache"
+            if progress.ready_for_wallet_checks {
+                return "Refreshing PPOI data";
+            }
+            return match progress.phase {
+                PoiArtifactCachePhase::LoadingPersisted => "Loading saved PPOI data",
+                PoiArtifactCachePhase::Resetting => "Resetting PPOI data",
+                PoiArtifactCachePhase::ResolvingManifest => "Resolving POI manifest",
+                PoiArtifactCachePhase::VerifyingCatalog => "Verifying POI catalog",
+                PoiArtifactCachePhase::Planning => "Planning POI refresh",
+                PoiArtifactCachePhase::DownloadingChunks => "Downloading POI chunks",
+                PoiArtifactCachePhase::ReplayingRanges => "Replaying POI event ranges",
+                PoiArtifactCachePhase::Validating => "Validating PPOI data",
+                PoiArtifactCachePhase::Persisting => "Saving PPOI data",
+                PoiArtifactCachePhase::LiveTailing => "Following POI event tail",
+                PoiArtifactCachePhase::Idle
+                | PoiArtifactCachePhase::Ready
+                | PoiArtifactCachePhase::Failed => "PPOI catching up",
             };
         }
     }
@@ -1850,21 +1880,30 @@ pub(super) fn ppoi_hover_heading(
     }
 }
 
-pub(super) const fn ppoi_hover_detail(
+pub(super) fn ppoi_hover_detail(
     status: PresenceStatus,
     progress: Option<&PoiArtifactCacheProgress>,
     refreshing: bool,
 ) -> Option<&'static str> {
     if let Some(progress) = progress {
         if progress.is_error() {
-            return if progress.ready_for_wallet_checks {
-                Some("Using last ready cache state.")
-            } else {
-                Some("No ready local POI cache is available.")
+            return match progress.failure_kind() {
+                Some(PoiArtifactCacheFailureKind::RefreshDegraded) => Some(
+                    "Refresh failed; wallet checks continue using verified PPOI data saved on this device.",
+                ),
+                Some(PoiArtifactCacheFailureKind::ServingCorpusUnavailable) => {
+                    Some("No verified PPOI data is available for wallet checks.")
+                }
+                None if progress.ready_for_wallet_checks => Some(
+                    "Refresh failed; wallet checks continue using verified PPOI data saved on this device.",
+                ),
+                None => Some("No verified PPOI data is available for wallet checks."),
             };
         }
         if progress.is_active() {
-            return None;
+            return progress.ready_for_wallet_checks.then_some(
+                "Refreshing in the background while wallet checks use verified PPOI data saved on this device.",
+            );
         }
     }
     if refreshing {
@@ -1885,17 +1924,73 @@ pub(super) const fn ppoi_hover_detail(
 const fn ppoi_artifact_phase_label(phase: PoiArtifactCachePhase) -> &'static str {
     match phase {
         PoiArtifactCachePhase::Idle => "Idle",
-        PoiArtifactCachePhase::LoadingPersisted => "Loading persisted cache",
-        PoiArtifactCachePhase::Resetting => "Resetting cache",
-        PoiArtifactCachePhase::FetchingManifest => "Fetching manifest",
-        PoiArtifactCachePhase::DownloadingBase => "Downloading base",
-        PoiArtifactCachePhase::ApplyingDeltas => "Applying deltas",
-        PoiArtifactCachePhase::SyncingBlockedShields => "Syncing blocked Shields",
+        PoiArtifactCachePhase::LoadingPersisted => "Loading saved PPOI data",
+        PoiArtifactCachePhase::Resetting => "Resetting PPOI data",
+        PoiArtifactCachePhase::ResolvingManifest => "Resolving manifest",
+        PoiArtifactCachePhase::VerifyingCatalog => "Verifying catalog",
+        PoiArtifactCachePhase::Planning => "Planning refresh",
+        PoiArtifactCachePhase::DownloadingChunks => "Downloading chunks",
+        PoiArtifactCachePhase::ReplayingRanges => "Replaying ranges",
+        PoiArtifactCachePhase::Validating => "Validating PPOI data",
+        PoiArtifactCachePhase::Persisting => "Saving PPOI data",
         PoiArtifactCachePhase::LiveTailing => "Live tailing",
-        PoiArtifactCachePhase::ValidatingRoots => "Validating roots",
         PoiArtifactCachePhase::Ready => "Ready",
-        PoiArtifactCachePhase::Error => "Error",
+        PoiArtifactCachePhase::Failed => "Failed",
     }
+}
+
+pub(super) fn ppoi_chunk_progress_label(progress: &PoiArtifactCacheProgress) -> Option<String> {
+    if progress.graph.total_chunks == 0 {
+        return None;
+    }
+    let mut label = format!(
+        "{}/{} chunks",
+        progress
+            .graph
+            .verified_chunks
+            .min(progress.graph.total_chunks),
+        progress.graph.total_chunks
+    );
+    if let Some(total_bytes) = progress.graph.total_authenticated_encoded_bytes {
+        let _ = write!(
+            label,
+            " · {}/{}",
+            format_byte_count(progress.graph.verified_encoded_bytes.min(total_bytes)),
+            format_byte_count(total_bytes)
+        );
+    } else if progress.graph.verified_encoded_bytes > 0 {
+        let _ = write!(
+            label,
+            " · {} verified",
+            format_byte_count(progress.graph.verified_encoded_bytes)
+        );
+    }
+    Some(label)
+}
+
+pub(super) fn ppoi_replay_progress_label(progress: &PoiArtifactCacheProgress) -> Option<String> {
+    let start = progress.graph.replay_start_event_index?;
+    let end = progress.graph.replay_end_event_index?;
+    let replayed = progress
+        .graph
+        .replayed_event_count
+        .min(progress.graph.total_replay_event_count);
+    Some(format!(
+        "Events {start}-{end} · {replayed}/{} replayed",
+        progress.graph.total_replay_event_count
+    ))
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        return format!("{} MiB", bytes / MIB);
+    }
+    if bytes >= KIB {
+        return format!("{} KiB", bytes / KIB);
+    }
+    format!("{bytes} B")
 }
 
 fn ppoi_event_progress_label(progress: &PoiArtifactCacheProgress) -> String {

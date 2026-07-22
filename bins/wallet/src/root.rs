@@ -399,6 +399,7 @@ pub(crate) struct WalletRoot {
     poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts,
     wallet_sync_lifecycle: WalletSyncLifecycle,
     wallet_sync_cleanup_tasks: Vec<WalletSyncLifecycleCleanupTask>,
+    wallet_sync_lifecycle_shutdown_started: bool,
     public_sync_cache_resetting: bool,
     merkle_forest_cache_resetting: bool,
     unlock_password_input: Entity<InputState>,
@@ -459,8 +460,10 @@ pub(crate) struct WalletRoot {
 impl Drop for WalletRoot {
     fn drop(&mut self) {
         let _ = self.waku_worker_shutdown.send(true);
-        let cleanup = self.wallet_sync_lifecycle.invalidate();
-        let _ = cleanup.spawn(&self.runtime);
+        if !self.wallet_sync_lifecycle_shutdown_started {
+            let cleanup = self.wallet_sync_lifecycle.invalidate();
+            let _ = cleanup.spawn(&self.runtime);
+        }
     }
 }
 
@@ -621,7 +624,7 @@ impl WalletRoot {
         let merkle_forest_cache_resetting =
             maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Merkle;
         let public_sync_cache_resetting =
-            maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Public;
+            maintenance_blocks_public_sync(maintenance_controller.read(cx).reset());
         let vault_store = Some(vault_store);
         let (settings_editor, settings_error) = match vault_store.as_ref() {
             Some(store) => {
@@ -912,6 +915,7 @@ impl WalletRoot {
             poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts::default(),
             wallet_sync_lifecycle: WalletSyncLifecycle::new(),
             wallet_sync_cleanup_tasks: Vec::new(),
+            wallet_sync_lifecycle_shutdown_started: false,
             public_sync_cache_resetting,
             merkle_forest_cache_resetting,
             unlock_password_input,
@@ -1389,6 +1393,15 @@ impl WalletRoot {
         root.spawn_network_health_monitor(cx);
         root
     }
+}
+
+pub(in crate::root) const fn maintenance_blocks_public_sync(
+    reset: maintenance::WalletMaintenanceReset,
+) -> bool {
+    matches!(
+        reset,
+        maintenance::WalletMaintenanceReset::Public | maintenance::WalletMaintenanceReset::Poi
+    )
 }
 
 pub(super) fn new_text_input<T>(

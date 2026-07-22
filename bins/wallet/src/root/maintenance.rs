@@ -4,14 +4,28 @@ use gpui::{Context, WeakEntity};
 use tokio::runtime::Handle;
 use wallet_ops::vault::DesktopVaultStore;
 
-use super::WalletRoot;
+use super::{WalletRoot, chain_load::WalletSyncLifecycleCleanupWaitGroup};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::root) enum WalletMaintenanceReset {
     #[default]
     Idle,
     Public,
+    Poi,
     Merkle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum PublicSyncResetCompletion {
+    CleanupFailed,
+    ResetAttempted,
+}
+
+pub(in crate::root) const fn public_sync_reset_restart_is_safe(
+    resync_requested: bool,
+    completion: PublicSyncResetCompletion,
+) -> bool {
+    resync_requested && matches!(completion, PublicSyncResetCompletion::ResetAttempted)
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +91,7 @@ pub(in crate::root) struct WalletMaintenanceController {
     runtime: Handle,
     state: WalletMaintenanceStateMachine,
     active_root: Option<WeakEntity<WalletRoot>>,
+    root_replacement_cleanup: Option<WalletSyncLifecycleCleanupWaitGroup>,
 }
 
 impl WalletMaintenanceController {
@@ -85,6 +100,7 @@ impl WalletMaintenanceController {
             runtime,
             state: WalletMaintenanceStateMachine::default(),
             active_root: None,
+            root_replacement_cleanup: None,
         }
     }
 
@@ -93,7 +109,7 @@ impl WalletMaintenanceController {
     }
 
     pub(in crate::root) fn is_idle(&self) -> bool {
-        self.reset() == WalletMaintenanceReset::Idle
+        self.reset() == WalletMaintenanceReset::Idle && !self.root_replacement_cleanup_in_progress()
     }
 
     pub(in crate::root) fn status(&self) -> Option<Arc<str>> {
@@ -108,6 +124,27 @@ impl WalletMaintenanceController {
         self.active_root = None;
     }
 
+    pub(in crate::root) fn set_root_replacement_cleanup(
+        &mut self,
+        cleanup: Option<WalletSyncLifecycleCleanupWaitGroup>,
+    ) {
+        self.root_replacement_cleanup = cleanup;
+    }
+
+    pub(in crate::root) fn clear_finished_root_replacement_cleanup(&mut self) {
+        if self
+            .root_replacement_cleanup
+            .as_ref()
+            .is_some_and(WalletSyncLifecycleCleanupWaitGroup::is_finished)
+        {
+            self.root_replacement_cleanup = None;
+        }
+    }
+
+    const fn root_replacement_cleanup_in_progress(&self) -> bool {
+        self.root_replacement_cleanup.is_some()
+    }
+
     pub(in crate::root) fn clear_status(&mut self, cx: &mut Context<'_, Self>) {
         if self.state.clear_status() {
             cx.notify();
@@ -119,6 +156,12 @@ impl WalletMaintenanceController {
         vault_store: &DesktopVaultStore,
         cx: &mut Context<'_, Self>,
     ) -> bool {
+        if self.root_replacement_cleanup_in_progress() {
+            self.state
+                .set_idle_status("Wait for wallet sync cleanup before resetting caches");
+            cx.notify();
+            return false;
+        }
         if self.active_root.as_ref().is_some_and(|root| {
             !root
                 .update(cx, |root, _cx| root.destructive_cache_reset_is_allowed())
@@ -143,16 +186,20 @@ impl WalletMaintenanceController {
         let resync_requested = reset_context.is_some();
         let join = self.runtime.spawn(async move {
             let store = match reset_context {
-                Some(reset_context) => reset_context.shutdown_for_public_reset().await?,
+                Some(reset_context) => match reset_context.shutdown_for_public_reset().await {
+                    Ok(store) => store,
+                    Err(error) => {
+                        return (Err(error), PublicSyncResetCompletion::CleanupFailed);
+                    }
+                },
                 None => None,
             };
-            if let Some(store) = store {
+            let result = if let Some(store) = store {
                 let report = store.reset_public_sync_caches().await;
                 if let Err(error) = report.persisted.as_ref() {
-                    return Err(format!("persisted public cache reset failed: {error}"));
-                }
-                let failed = report.failed_chain_count();
-                if failed > 0 {
+                    Err(format!("persisted public cache reset failed: {error}"))
+                } else if report.failed_chain_count() > 0 {
+                    let failed = report.failed_chain_count();
                     let first_failure = report
                         .chains
                         .iter()
@@ -165,33 +212,130 @@ impl WalletMaintenanceController {
                             })
                         })
                         .expect("failed reset report contains an error");
-                    return Err(format!(
+                    Err(format!(
                         "{failed} of {} chain resets failed; first failure: {first_failure}",
                         report.chains.len()
-                    ));
+                    ))
+                } else {
+                    Ok(report.total_removed_entries)
                 }
-                return Ok::<u64, String>(report.total_removed_entries);
-            }
-            wallet_ops::reset_persisted_public_sync_caches(db.as_ref())
-                .await
-                .map(wallet_ops::PersistedPublicSyncCacheResetReport::total_removed_entries)
-                .map_err(|error| error.to_string())
+            } else {
+                wallet_ops::reset_persisted_public_sync_caches(db.as_ref())
+                    .await
+                    .map(wallet_ops::PersistedPublicSyncCacheResetReport::total_removed_entries)
+                    .map_err(|error| error.to_string())
+            };
+            (result, PublicSyncResetCompletion::ResetAttempted)
         });
         cx.spawn(async move |this, cx| {
-            let message = match join.await {
-                Ok(Ok(removed)) if resync_requested => format!(
-                    "Public sync caches reset; cleared {removed} cache records and requested resync"
+            let (message, restart_safe) = match join.await {
+                Ok((Ok(removed), completion)) if resync_requested => (
+                    format!(
+                        "Public sync caches reset; cleared {removed} cache records and requested resync"
+                    ),
+                    public_sync_reset_restart_is_safe(resync_requested, completion),
                 ),
-                Ok(Ok(removed)) => {
-                    format!("Persisted public sync caches reset; cleared {removed} cache records")
-                }
-                Ok(Err(error)) => format!("Failed to reset public sync caches: {error}"),
-                Err(error) => format!("Public sync cache reset task failed: {error}"),
+                Ok((Ok(removed), completion)) => (
+                    format!("Persisted public sync caches reset; cleared {removed} cache records"),
+                    public_sync_reset_restart_is_safe(resync_requested, completion),
+                ),
+                Ok((Err(error), completion)) => (
+                    format!("Failed to reset public sync caches: {error}"),
+                    public_sync_reset_restart_is_safe(resync_requested, completion),
+                ),
+                Err(error) => (
+                    format!("Public sync cache reset task failed: {error}"),
+                    false,
+                ),
             };
             let _ = this.update(cx, |controller, cx| {
                 if controller.state.complete(generation, message) {
                     if let Some(root) = controller.active_root.as_ref() {
-                        let _ = root.update(cx, WalletRoot::finish_public_sync_cache_reset);
+                        let _ = root.update(cx, |root, cx| {
+                            root.finish_public_sync_cache_reset(restart_safe, cx);
+                        });
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+        true
+    }
+
+    pub(in crate::root) fn start_poi_reset(
+        &mut self,
+        vault_store: &DesktopVaultStore,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if self.root_replacement_cleanup_in_progress() {
+            self.state
+                .set_idle_status("Wait for wallet sync cleanup before resetting PPOI data");
+            cx.notify();
+            return false;
+        }
+        if self.active_root.as_ref().is_some_and(|root| {
+            !root
+                .update(cx, |root, _cx| root.destructive_cache_reset_is_allowed())
+                .unwrap_or(false)
+        }) {
+            self.state
+                .set_idle_status("Wait for wallet sync cleanup before resetting PPOI data");
+            cx.notify();
+            return false;
+        }
+        let Some(generation) = self
+            .state
+            .try_acquire(WalletMaintenanceReset::Poi, "Resetting PPOI data...")
+        else {
+            return false;
+        };
+        let reset_context = self
+            .active_root
+            .as_ref()
+            .and_then(|root| root.update(cx, WalletRoot::begin_poi_data_reset).ok());
+        let db = vault_store.db();
+        let resync_requested = reset_context.is_some();
+        let join = self.runtime.spawn(async move {
+            if let Some(reset_context) = reset_context
+                && let Err(error) = reset_context.shutdown_for_poi_reset().await
+            {
+                return (Err(error), PublicSyncResetCompletion::CleanupFailed);
+            }
+            let result = wallet_ops::reset_persisted_poi_data(db.as_ref())
+                .await
+                .map_err(|error| error.to_string());
+            (result, PublicSyncResetCompletion::ResetAttempted)
+        });
+        cx.spawn(async move |this, cx| {
+            let (message, restart_safe) = match join.await {
+                Ok((Ok(report), completion)) if resync_requested => (
+                    format!(
+                        "PPOI data reset; removed {} data records and {} downloaded chunks; rebuilding",
+                        report.data_records_removed, report.chunk_records_removed
+                    ),
+                    public_sync_reset_restart_is_safe(resync_requested, completion),
+                ),
+                Ok((Ok(report), completion)) => (
+                    format!(
+                        "Persisted PPOI data reset; removed {} data records and {} downloaded chunks",
+                        report.data_records_removed, report.chunk_records_removed
+                    ),
+                    public_sync_reset_restart_is_safe(resync_requested, completion),
+                ),
+                Ok((Err(error), completion)) => (
+                    format!("Failed to reset PPOI data: {error}"),
+                    public_sync_reset_restart_is_safe(resync_requested, completion),
+                ),
+                Err(error) => (format!("PPOI data reset task failed: {error}"), false),
+            };
+            let _ = this.update(cx, |controller, cx| {
+                if controller.state.complete(generation, message) {
+                    if let Some(root) = controller.active_root.as_ref() {
+                        let _ = root.update(cx, |root, cx| {
+                            root.finish_public_sync_cache_reset(restart_safe, cx);
+                        });
                     }
                     cx.notify();
                 }
@@ -207,6 +351,12 @@ impl WalletMaintenanceController {
         vault_store: &DesktopVaultStore,
         cx: &mut Context<'_, Self>,
     ) -> bool {
+        if self.root_replacement_cleanup_in_progress() {
+            self.state
+                .set_idle_status("Wait for wallet sync cleanup before resetting caches");
+            cx.notify();
+            return false;
+        }
         if self.active_root.as_ref().is_some_and(|root| {
             !root
                 .update(cx, |root, _cx| root.destructive_cache_reset_is_allowed())

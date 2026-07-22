@@ -181,6 +181,7 @@ pub(super) struct WalletSyncLifecycleCleanupTask {
     completed_rx: watch::Receiver<Option<WalletSyncLifecycleCleanupReport>>,
 }
 
+#[derive(Clone)]
 pub(super) struct WalletSyncLifecycleCleanupWaitGroup {
     tasks: Vec<WalletSyncLifecycleCleanupTask>,
 }
@@ -487,7 +488,7 @@ impl WalletSyncLifecycleCleanupTask {
     }
 
     pub(super) fn is_finished(&self) -> bool {
-        self.completed_rx.borrow().is_some()
+        self.completed_rx.borrow().is_some() || self.completed_rx.has_changed().is_err()
     }
 
     async fn wait(mut self) -> Result<WalletSyncLifecycleCleanupReport, String> {
@@ -521,6 +522,18 @@ impl WalletSyncLifecycleCleanupWaitGroup {
         self.wait().await
     }
 
+    pub(super) async fn shutdown_for_root_replacement(
+        self,
+    ) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        self.wait().await
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.tasks
+            .iter()
+            .all(WalletSyncLifecycleCleanupTask::is_finished)
+    }
+
     #[cfg(test)]
     pub(super) async fn shutdown_with_timeout(
         self,
@@ -549,6 +562,10 @@ impl WalletPublicSyncCacheResetContext {
     ) -> Result<Option<Arc<WalletSessionStore>>, String> {
         self.cleanup.wait().await?;
         Ok(self.session_store.get().cloned())
+    }
+
+    pub(super) async fn shutdown_for_poi_reset(self) -> Result<(), String> {
+        self.cleanup.wait().await.map(|_| ())
     }
 }
 
@@ -1355,9 +1372,34 @@ impl WalletRoot {
         }
     }
 
-    pub(super) fn finish_public_sync_cache_reset(&mut self, cx: &mut Context<'_, Self>) {
+    pub(super) fn begin_poi_data_reset(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) -> WalletPublicSyncCacheResetContext {
+        self.public_sync_cache_resetting = true;
+        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        let session_store = self.wallet_sync_lifecycle.public_sync_cache_reset_cell();
+        let cleanup = self.wallet_sync_lifecycle.invalidate();
+        self.start_wallet_sync_cleanup(cleanup);
+        for state in self.chain_states.values_mut() {
+            *state = ChainUtxoState::Idle;
+        }
+        self.poi_artifact_cache_retry_attempts.clear();
+        self.sync_utxo_table(cx);
+        cx.notify();
+        WalletPublicSyncCacheResetContext {
+            cleanup: self.wallet_sync_cleanup_wait_group(),
+            session_store,
+        }
+    }
+
+    pub(super) fn finish_public_sync_cache_reset(
+        &mut self,
+        restart_safe: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
         self.public_sync_cache_resetting = false;
-        if self.view_session.is_some() {
+        if restart_safe && self.view_session.is_some() {
             self.ensure_chain_load(self.selected_chain, cx);
         } else {
             cx.notify();
@@ -1378,6 +1420,16 @@ impl WalletRoot {
         self.start_wallet_sync_cleanup(cleanup);
         self.reset_wallet_scoped_state(cx);
         cx.notify();
+        self.wallet_sync_cleanup_wait_group()
+    }
+
+    pub(super) fn begin_root_replacement_sync_shutdown(
+        &mut self,
+    ) -> WalletSyncLifecycleCleanupWaitGroup {
+        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        let cleanup = self.wallet_sync_lifecycle.invalidate();
+        self.start_wallet_sync_cleanup(cleanup);
+        self.wallet_sync_lifecycle_shutdown_started = true;
         self.wallet_sync_cleanup_wait_group()
     }
 

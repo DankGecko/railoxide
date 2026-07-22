@@ -3,16 +3,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use local_db::{DbConfig, DbStore};
+use serde::{Deserialize, Serialize};
 
 use super::{
     DEFAULT_INDEXED_ARTIFACT_CONCURRENCY, DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
     IndexedArtifactManifestSourceSetting, IndexedArtifactSourceModeSetting,
-    OFFICIAL_INDEXED_ARTIFACT_GATEWAYS, OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME,
-    OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY, OFFICIAL_POI_ARTIFACT_GATEWAYS,
-    OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
-    PoiArtifactManifestSourceSetting, PoiReadSourceSetting, WALLET_SETTINGS_KEY,
-    WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WakuDirectPeerSetting,
-    WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
+    LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_INDEXED_ARTIFACT_GATEWAYS,
+    OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME, OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY,
+    OFFICIAL_POI_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_IPNS_NAME,
+    OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY, PoiArtifactManifestSourceSetting, PoiReadSourceSetting,
+    WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION,
+    WakuDirectPeerSetting, WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
     build_effective_chain_configs, build_effective_token_registry, decode_wallet_settings,
     decode_wallet_ui_state, encode_wallet_settings, load_wallet_settings, load_wallet_ui_state,
     save_wallet_settings, save_wallet_ui_state, should_show_chain_deployment_metadata_settings,
@@ -31,6 +32,82 @@ fn temp_db_root() -> PathBuf {
         .map_or(0, |duration| duration.as_nanos());
     let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     dir.join(format!("db-{pid}-{nanos}-{counter}"))
+}
+
+fn legacy_official_settings() -> WalletSettings {
+    let mut settings = WalletSettings::default();
+    settings.poi.artifact.manifest_source = PoiArtifactManifestSourceSetting::IpnsName(
+        LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string(),
+    );
+    settings
+}
+
+fn put_unmigrated_settings(store: &DbStore, settings: &WalletSettings) {
+    let payload = encode_wallet_settings(settings).expect("encode unmigrated settings");
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+        .expect("store unmigrated settings");
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReleasedV1WalletSettingsWire {
+    version: u32,
+    network: super::NetworkSettings,
+    chains: super::ChainSettings,
+    indexed_artifacts: super::IndexedArtifactSettings,
+    poi: ReleasedV1PoiSettingsWire,
+    broadcaster: super::PublicBroadcasterSettings,
+    tokens: super::TokenSettings,
+    gas: super::GasSettings,
+    runtime: super::RuntimeSettings,
+    waku: super::WakuSettings,
+    walletconnect: super::WalletConnectSettings,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReleasedV1PoiSettingsWire {
+    read_source: PoiReadSourceSetting,
+    artifact: ReleasedV1PoiArtifactSettingsWire,
+    proxy: super::PoiProxySettings,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReleasedV1PoiArtifactSettingsWire {
+    publisher_pubkey: String,
+    manifest_source: ReleasedV1PoiArtifactManifestSourceWire,
+    gateway_urls: Vec<String>,
+    max_manifest_age_secs: Option<u64>,
+}
+
+impl Default for ReleasedV1PoiArtifactSettingsWire {
+    fn default() -> Self {
+        Self {
+            publisher_pubkey: OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY.to_string(),
+            manifest_source: ReleasedV1PoiArtifactManifestSourceWire::default(),
+            gateway_urls: OFFICIAL_POI_ARTIFACT_GATEWAYS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            max_manifest_age_secs: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "kebab-case")]
+enum ReleasedV1PoiArtifactManifestSourceWire {
+    Url(String),
+    Cid(String),
+    IpnsName(String),
+}
+
+impl Default for ReleasedV1PoiArtifactManifestSourceWire {
+    fn default() -> Self {
+        Self::IpnsName(LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string())
+    }
 }
 
 #[test]
@@ -92,6 +169,185 @@ fn missing_settings_synthesizes_official_indexed_artifact_defaults() {
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn exact_legacy_official_identity_migrates_in_place() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    put_unmigrated_settings(&store, &legacy_official_settings());
+
+    let migrated = load_wallet_settings(&store).expect("load and migrate settings");
+    assert_eq!(migrated.version, 1);
+    assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(
+        migrated.poi.artifact.publisher_pubkey,
+        OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY
+    );
+    assert_eq!(
+        migrated.poi.artifact.manifest_source,
+        PoiArtifactManifestSourceSetting::IpnsName(OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string())
+    );
+
+    let persisted = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read migrated settings")
+        .expect("migrated settings record");
+    assert_eq!(
+        decode_wallet_settings(&persisted).expect("decode migrated settings"),
+        migrated
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn official_identity_migration_preserves_user_preferences() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = legacy_official_settings();
+    settings.poi.artifact.gateway_urls = vec![
+        "https://second.example".to_string(),
+        "https://first.example".to_string(),
+    ];
+    settings.poi.artifact.max_manifest_age_secs = Some(7_200);
+    settings.poi.proxy.rpc_url = "https://poi-proxy.example/rpc".to_string();
+    put_unmigrated_settings(&store, &settings);
+
+    let migrated = load_wallet_settings(&store).expect("load and migrate settings");
+
+    assert_eq!(
+        migrated.poi.artifact.gateway_urls,
+        settings.poi.artifact.gateway_urls
+    );
+    assert_eq!(
+        migrated.poi.artifact.max_manifest_age_secs,
+        settings.poi.artifact.max_manifest_age_secs
+    );
+    assert_eq!(migrated.poi.proxy, settings.poi.proxy);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn nonmatching_identity_is_untouched_and_constructs_a_v4_source() {
+    for settings in [
+        {
+            let mut settings = legacy_official_settings();
+            settings.poi.artifact.publisher_pubkey = format!("0x{}", "11".repeat(32));
+            settings
+        },
+        {
+            let mut settings = legacy_official_settings();
+            settings.poi.artifact.manifest_source = PoiArtifactManifestSourceSetting::IpnsName(
+                "k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft".to_string(),
+            );
+            settings
+        },
+    ] {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        put_unmigrated_settings(&store, &settings);
+
+        let loaded = load_wallet_settings(&store).expect("load nonmatching settings");
+        assert_eq!(loaded, settings);
+        let super::PoiReadSource::IndexedArtifacts {
+            artifact_source,
+            wallet_read_fallback,
+            ..
+        } = loaded
+            .poi_read_source()
+            .expect("custom PPOI artifact graph source")
+        else {
+            panic!("nonmatching identity should remain an indexed artifact source");
+        };
+        assert_eq!(
+            alloy::hex::encode_prefixed(artifact_source.trusted_publisher_pubkey.as_slice()),
+            settings.poi.artifact.publisher_pubkey
+        );
+        assert_eq!(
+            artifact_source.manifest_source,
+            settings.poi.artifact.manifest_source.to_runtime()
+        );
+        assert_eq!(wallet_read_fallback, super::PoiProxyFallback::Disabled);
+        let persisted = store
+            .get_app_settings_record(WALLET_SETTINGS_KEY)
+            .expect("read nonmatching settings")
+            .expect("nonmatching settings record");
+        assert_eq!(
+            decode_wallet_settings(&persisted).expect("decode nonmatching settings"),
+            settings
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[test]
+fn migrated_official_settings_survive_database_restart() {
+    let root_dir = temp_db_root();
+    {
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        put_unmigrated_settings(&store, &legacy_official_settings());
+        load_wallet_settings(&store).expect("migrate settings");
+    }
+
+    let reopened = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("reopen db");
+    let settings = load_wallet_settings(&reopened).expect("load migrated settings after restart");
+    assert_eq!(
+        settings.poi.artifact.manifest_source,
+        PoiArtifactManifestSourceSetting::IpnsName(OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string())
+    );
+
+    drop(reopened);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn frozen_released_v1_decoder_can_reset_migrated_settings_before_unlock() {
+    let migrated_payload =
+        encode_wallet_settings(&WalletSettings::default()).expect("encode migrated v1 settings");
+
+    let mut released: ReleasedV1WalletSettingsWire = rmp_serde::from_slice(&migrated_payload)
+        .expect("released v1 decoder accepts migrated record");
+    assert_eq!(released.version, 1);
+    released.poi.artifact.publisher_pubkey = OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY.to_string();
+    released.poi.artifact.manifest_source = ReleasedV1PoiArtifactManifestSourceWire::IpnsName(
+        LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string(),
+    );
+    released.poi.artifact.gateway_urls = OFFICIAL_POI_ARTIFACT_GATEWAYS
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    released.poi.artifact.max_manifest_age_secs = None;
+    let restored_payload = rmp_serde::to_vec_named(&released).expect("released v1 reset persists");
+    let restored = decode_wallet_settings(&restored_payload).expect("decode released reset record");
+
+    assert_eq!(restored.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(
+        restored.poi.artifact.manifest_source,
+        PoiArtifactManifestSourceSetting::IpnsName(
+            LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string()
+        )
+    );
 }
 
 #[test]
@@ -906,6 +1162,7 @@ fn default_poi_read_source_converts_to_official_indexed_artifacts() {
     let settings = WalletSettings::default();
     let super::PoiReadSource::IndexedArtifacts {
         artifact_source: source,
+        wallet_read_fallback,
         ..
     } = settings.poi_read_source().expect("POI source")
     else {
@@ -923,6 +1180,92 @@ fn default_poi_read_source_converts_to_official_indexed_artifacts() {
     assert_eq!(
         source.gateway_urls.len(),
         OFFICIAL_POI_ARTIFACT_GATEWAYS.len()
+    );
+    assert_eq!(wallet_read_fallback, super::PoiProxyFallback::Disabled);
+    assert_ne!(
+        OFFICIAL_POI_ARTIFACT_IPNS_NAME,
+        LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME
+    );
+    assert_ne!(
+        OFFICIAL_POI_ARTIFACT_IPNS_NAME,
+        OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
+    );
+}
+
+#[test]
+fn custom_ppoi_artifact_source_converts_without_official_substitution() {
+    let mut settings = WalletSettings::default();
+    let custom_publisher = format!("0x{}", "42".repeat(32));
+    let custom_ipns = "k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft".to_string();
+    settings
+        .poi
+        .artifact
+        .publisher_pubkey
+        .clone_from(&custom_publisher);
+    settings.poi.artifact.manifest_source =
+        PoiArtifactManifestSourceSetting::IpnsName(custom_ipns.clone());
+
+    let super::PoiReadSource::IndexedArtifacts {
+        artifact_source: source,
+        wallet_read_fallback,
+        ..
+    } = settings.poi_read_source().expect("custom POI source")
+    else {
+        panic!("custom POI source should use indexed artifacts");
+    };
+
+    assert_eq!(
+        alloy::hex::encode_prefixed(source.trusted_publisher_pubkey.as_slice()),
+        custom_publisher
+    );
+    assert_eq!(
+        source.manifest_source,
+        super::PoiArtifactManifestSource::IpnsName(custom_ipns)
+    );
+    assert_eq!(wallet_read_fallback, super::PoiProxyFallback::Disabled);
+}
+
+#[test]
+fn invalid_or_non_ipns_ppoi_artifact_sources_are_rejected_in_settings() {
+    for source in [
+        PoiArtifactManifestSourceSetting::IpnsName("not-an-ipns-name".to_string()),
+        PoiArtifactManifestSourceSetting::Cid(
+            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".to_string(),
+        ),
+        PoiArtifactManifestSourceSetting::Url("https://example.invalid/manifest".to_string()),
+    ] {
+        let mut settings = WalletSettings::default();
+        settings.poi.artifact.manifest_source = source;
+
+        let error = settings
+            .poi_read_source()
+            .expect_err("non-IPNS PPOI source must fail settings validation");
+        assert!(
+            error
+                .messages
+                .iter()
+                .any(|message| message.contains("manifest_source"))
+        );
+    }
+}
+
+#[test]
+fn explicit_poi_proxy_mode_remains_selectable_without_artifact_fallback() {
+    let mut settings = legacy_official_settings();
+    settings.poi.read_source = PoiReadSourceSetting::PoiProxy;
+    settings.poi.proxy.rpc_url = "https://explicit-poi-proxy.example/rpc".to_string();
+
+    let super::PoiReadSource::PoiProxy { rpc_url } =
+        settings.poi_read_source().expect("explicit proxy source")
+    else {
+        panic!("explicit proxy mode should remain selected");
+    };
+    assert_eq!(
+        rpc_url,
+        super::SensitiveUrl::from(
+            reqwest::Url::parse("https://explicit-poi-proxy.example/rpc")
+                .expect("explicit proxy URL")
+        )
     );
 }
 
@@ -963,7 +1306,11 @@ fn poi_runtime_policy_formatting_redacts_configured_endpoints() {
         "https://gateway-user-sentinel:gateway-password-sentinel@gateway-host-sentinel.invalid/gateway-path-sentinel?gateway-query-sentinel#gateway-fragment-sentinel".to_string(),
     ];
 
-    let policy = settings.poi_read_source().expect("sensitive POI policy");
+    let policy = super::PoiReadSource::IndexedArtifacts {
+        artifact_source: settings.poi.artifact.source_config(),
+        rpc_url: settings.poi_rpc_url().expect("sensitive POI RPC URL"),
+        wallet_read_fallback: super::PoiProxyFallback::Disabled,
+    };
     let formatted = format!("{policy:?}");
     for sentinel in [
         "rpc-user-sentinel",

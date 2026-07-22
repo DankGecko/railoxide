@@ -11,14 +11,17 @@ impl PlatformAttentionState {
         }
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     pub(super) fn sync_badge_count(&self, count: usize) {
         self.native.sync_badge_count(count);
     }
 
+    #[allow(clippy::missing_const_for_fn, clippy::needless_pass_by_ref_mut)]
     pub(super) fn request_attention(&mut self) {
         self.native.request_attention();
     }
 
+    #[allow(clippy::missing_const_for_fn, clippy::needless_pass_by_ref_mut)]
     pub(super) fn clear_attention(&mut self) {
         self.native.clear_attention();
     }
@@ -145,14 +148,17 @@ mod imp {
     pub(super) struct NativePlatformAttentionState;
 
     impl NativePlatformAttentionState {
-        pub(super) fn new(_window: &gpui::Window) -> Self {
+        pub(super) const fn new(_window: &gpui::Window) -> Self {
             Self
         }
 
-        pub(super) fn sync_badge_count(&self, _count: usize) {}
+        #[allow(clippy::unused_self)]
+        pub(super) const fn sync_badge_count(&self, _count: usize) {}
 
-        pub(super) fn request_attention(&mut self) {}
+        #[allow(clippy::unused_self)]
+        pub(super) const fn request_attention(&self) {}
 
-        pub(super) fn clear_attention(&mut self) {}
+        #[allow(clippy::unused_self)]
+        pub(super) const fn clear_attention(&self) {}
     }
 }
