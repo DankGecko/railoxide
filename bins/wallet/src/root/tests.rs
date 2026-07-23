@@ -34,6 +34,7 @@ mod private_display;
 mod progress;
 mod settings;
 mod utxo_rows;
+mod waku_lifecycle;
 mod wallet_management;
 
 use helpers::*;

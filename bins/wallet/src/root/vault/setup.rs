@@ -136,6 +136,7 @@ impl WalletRoot {
                 self.vault_error = None;
                 self.vault_state = VaultState::SetupWallet;
                 self.wallet_setup_mode = WalletSetupMode::Choose;
+                self.ensure_waku_started(cx);
                 cx.notify();
             }
             Err(VaultError::VaultAlreadyExists) => {

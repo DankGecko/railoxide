@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, EventTx, Shared};
-use broadcaster_monitor_waku::{
-    RelayNetworkConfig, WakuMonitorConfig, WakuMonitorDirectPeer, spawn_workers_until_shutdown,
-};
+use broadcaster_monitor_waku::{RelayNetworkConfig, WakuMonitorConfig, WakuMonitorDirectPeer};
 use eyre::WrapErr;
 use gpui::{
     App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
@@ -22,10 +20,9 @@ use ui::icons;
 use ui::logs::{LogStore, LogsPane};
 use ui::theme;
 use wallet_ops::{
-    BroadcasterFeePolicy, HttpContext, PoiReadSource, PublicBroadcasterWakuClient,
-    TokenAnchorRateCache, WalletNetworkConfig, WalletNetworkMode, WalletNetworkProgress,
-    WalletNetworkProgressStage, build_wallet_network_context_with_progress,
-    request_tor_state_reset,
+    BroadcasterFeePolicy, HttpContext, PoiReadSource, TokenAnchorRateCache, WalletNetworkConfig,
+    WalletNetworkMode, WalletNetworkProgress, WalletNetworkProgressStage,
+    build_wallet_network_context_with_progress, request_tor_state_reset,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletSettings,
         build_effective_chain_configs, build_effective_token_registry, default_waku_direct_peers,
@@ -48,8 +45,8 @@ use super::{
 
 struct WalletStartupReady {
     http: HttpContext,
-    waku: Arc<PublicBroadcasterWakuClient>,
-    waku_worker_shutdown: watch::Sender<bool>,
+    waku_config: WakuMonitorConfig,
+    monitor_event_tx: EventTx,
     vault_store: Arc<DesktopVaultStore>,
     chain_ids: Vec<u64>,
     initial_chain_id: u64,
@@ -196,7 +193,6 @@ impl WalletStartupRoot {
 
         let options = self.options.clone();
         let chain_ids = self.chain_ids.clone();
-        let monitor_state = self.monitor_state.clone();
         let startup = self.runtime.spawn(async move {
             if let Some(cleanup) = cleanup {
                 cleanup
@@ -207,7 +203,6 @@ impl WalletStartupRoot {
             build_wallet_startup(
                 options,
                 chain_ids,
-                monitor_state,
                 event_tx,
                 network_context,
                 progress_tx,
@@ -327,7 +322,6 @@ impl WalletStartupRoot {
             WalletRoot::new(
                 self.options.clone(),
                 ready.http,
-                ready.waku_worker_shutdown,
                 ready.vault_store,
                 &enabled_chain_ids,
                 initial_chain_id,
@@ -342,7 +336,8 @@ impl WalletStartupRoot {
                 ready.poi_read_source,
                 self.runtime.clone(),
                 monitor_state,
-                ready.waku,
+                ready.waku_config,
+                ready.monitor_event_tx,
                 public_broadcaster_anchor_cache,
                 public_broadcaster_anchor_refresh,
                 wallet_monitor_event_rx,
@@ -860,7 +855,6 @@ impl Render for WalletStartupRoot {
 async fn build_wallet_startup(
     options: WalletAppOptions,
     _chain_ids: Vec<u64>,
-    monitor_state: Shared,
     event_tx: EventTx,
     network_context: StartupNetworkContext,
     progress_tx: watch::Sender<WalletNetworkProgress>,
@@ -938,29 +932,10 @@ async fn build_wallet_startup(
         "starting wallet"
     );
 
-    let waku = waku_config
-        .build_client()
-        .wrap_err("construct wallet Waku client")?;
-    let worker_waku = Arc::clone(&waku);
-    let (waku_worker_shutdown, waku_worker_shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        if let Err(error) = spawn_workers_until_shutdown(
-            waku_config,
-            worker_waku,
-            monitor_state,
-            event_tx,
-            waku_worker_shutdown_rx,
-        )
-        .await
-        {
-            tracing::error!(%error, "wallet broadcaster monitor workers failed to start");
-        }
-    });
-
     Ok(WalletStartupReady {
         http,
-        waku,
-        waku_worker_shutdown,
+        waku_config,
+        monitor_event_tx: event_tx,
         vault_store,
         chain_ids,
         initial_chain_id,

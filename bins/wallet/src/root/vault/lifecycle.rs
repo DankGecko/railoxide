@@ -395,6 +395,7 @@ impl WalletRoot {
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
         self.wallet_setup_mode = WalletSetupMode::Choose;
+        self.ensure_waku_started(cx);
         self.ensure_chain_load_with_start_policy(
             self.selected_chain,
             Some(created_wallet_init_policy.sync_start_policy()),
@@ -506,6 +507,7 @@ impl WalletRoot {
             self.vault_error = None;
             self.vault_state = VaultState::SetupWallet;
             self.wallet_setup_mode = WalletSetupMode::Choose;
+            self.ensure_waku_started(cx);
             cx.notify();
             return;
         }
@@ -537,6 +539,7 @@ impl WalletRoot {
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
         self.wallet_setup_mode = WalletSetupMode::Choose;
+        self.ensure_waku_started(cx);
         cx.notify();
     }
 
@@ -548,6 +551,8 @@ impl WalletRoot {
             return;
         }
         self.shutdown_wallet_session_store();
+        self.clear_private_broadcaster_progress_state();
+        self.stop_waku();
         window.close_all_dialogs(cx);
         self.clear_spend_authorization(cx);
         self.view_session = None;
@@ -575,7 +580,6 @@ impl WalletRoot {
         self.unshield_forms.clear();
         self.reset_public_wallet_state(window, cx);
         self.private_action_form = None;
-        self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;

@@ -39,14 +39,18 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) -> Option<SendSpendDraft> {
+        let delivery_mode = {
+            let form = self.send_forms.get(&key)?;
+            if form.generating {
+                return None;
+            }
+            form.delivery_mode
+        };
+        self.ensure_waku_for_delivery(delivery_mode, cx);
         let form = self.send_forms.get(&key)?;
-        if form.generating {
-            return None;
-        }
         let asset = form.asset.clone();
         let recipient_input = form.recipient_input.clone();
         let amount_input = form.amount_input.clone();
-        let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
@@ -353,7 +357,20 @@ impl WalletRoot {
         }
 
         let http = self.http.clone();
-        let waku = Arc::clone(&self.waku);
+        let waku = if delivery_mode == DeliveryMode::PublicBroadcaster {
+            let Some(waku) = self.active_waku() else {
+                self.set_send_form_error(
+                    key,
+                    "Public broadcaster delivery is unavailable. Ensure the vault is unlocked and Waku connectivity is active, then try again",
+                    cx,
+                );
+                self.clear_private_broadcaster_progress_state();
+                return;
+            };
+            Some(waku)
+        } else {
+            None
+        };
         let chain_id = asset.chain_id;
         let token = asset.token;
         let join = match delivery_mode {
@@ -400,7 +417,7 @@ impl WalletRoot {
                     fee_policy,
                     trust_filter: self.public_broadcaster_trust_filter(favorites_only_broadcasters),
                     anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
-                    waku,
+                    waku: waku.expect("active Waku delivery client was validated"),
                     response_timeout: self.public_broadcaster_response_timeout,
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),
@@ -649,15 +666,19 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> Option<UnshieldSpendDraft> {
         self.refresh_unshield_native_top_up_state(key, cx);
+        let delivery_mode = {
+            let form = self.unshield_forms.get(&key)?;
+            if form.generating {
+                return None;
+            }
+            form.delivery_mode
+        };
+        self.ensure_waku_for_delivery(delivery_mode, cx);
         let form = self.unshield_forms.get(&key)?;
-        if form.generating {
-            return None;
-        }
         let asset = form.asset.clone();
         let unwrap = form.unwrap;
         let recipient_input = form.recipient_input.clone();
         let amount_input = form.amount_input.clone();
-        let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
@@ -983,7 +1004,20 @@ impl WalletRoot {
         }
 
         let http = self.http.clone();
-        let waku = Arc::clone(&self.waku);
+        let waku = if delivery_mode == DeliveryMode::PublicBroadcaster {
+            let Some(waku) = self.active_waku() else {
+                self.set_unshield_form_error(
+                    key,
+                    "Public broadcaster delivery is unavailable. Ensure the vault is unlocked and Waku connectivity is active, then try again",
+                    cx,
+                );
+                self.clear_private_broadcaster_progress_state();
+                return;
+            };
+            Some(waku)
+        } else {
+            None
+        };
         let chain_id = asset.chain_id;
         let token = asset.token;
         let join = match delivery_mode {
@@ -1035,7 +1069,7 @@ impl WalletRoot {
                     fee_policy,
                     trust_filter: self.public_broadcaster_trust_filter(favorites_only_broadcasters),
                     anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
-                    waku,
+                    waku: waku.expect("active Waku delivery client was validated"),
                     response_timeout: self.public_broadcaster_response_timeout,
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),

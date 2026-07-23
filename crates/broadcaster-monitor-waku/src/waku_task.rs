@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -143,42 +144,40 @@ async fn spawn_workers_inner(
         "subscribing to broadcaster fees content topics"
     );
 
-    spawn_peer_poll_worker(
-        Arc::clone(&waku),
-        shared.clone(),
-        events.clone(),
-        shutdown.clone(),
-    );
-
     if let Some(reason) = waku.disabled_reason() {
         tracing::warn!(%reason, "Waku fee subscription disabled by network policy");
+        if shutdown.is_some() {
+            run_peer_poll_loop(waku, shared, events, shutdown).await;
+        } else {
+            spawn_peer_poll_worker(waku, shared, events, None);
+        }
         return Ok(());
     }
 
-    let subscribe = waku.subscribe_with_fee_history(content_topics);
     let msg_rx = if let Some(shutdown) = shutdown.as_mut() {
-        tokio::select! {
-            result = subscribe => result.wrap_err("subscribe to fees content topics")?,
-            should_shutdown = shutdown_changed_or_requested(shutdown) => {
-                if should_shutdown {
-                    tracing::debug!("fees subscription startup shutting down");
-                    return Ok(());
-                }
-                return Ok(());
-            }
-        }
+        let Some(result) =
+            await_until_shutdown(waku.subscribe_with_fee_history(content_topics), shutdown).await
+        else {
+            tracing::debug!("fees subscription startup shutting down");
+            return Ok(());
+        };
+        result.wrap_err("subscribe to fees content topics")?
     } else {
-        subscribe
+        waku.subscribe_with_fee_history(content_topics)
             .await
             .wrap_err("subscribe to fees content topics")?
     };
 
-    // Fees message pipeline.
-    {
-        let shared = shared.clone();
-        let events = events.clone();
+    if let Some(shutdown) = shutdown {
+        let peer_shutdown = shutdown.clone();
+        tokio::join!(
+            run_fees_loop(msg_rx, shared.clone(), events.clone(), Some(shutdown)),
+            run_peer_poll_loop(waku, shared, events, Some(peer_shutdown)),
+        );
+    } else {
+        spawn_peer_poll_worker(Arc::clone(&waku), shared.clone(), events.clone(), None);
         tokio::spawn(async move {
-            run_fees_loop(msg_rx, shared, events, shutdown).await;
+            run_fees_loop(msg_rx, shared, events, None).await;
         });
     }
 
@@ -332,6 +331,19 @@ async fn shutdown_changed_or_requested(shutdown: &mut watch::Receiver<bool>) -> 
         return true;
     }
     shutdown.changed().await.is_err() || *shutdown.borrow()
+}
+
+async fn await_until_shutdown<F>(
+    future: F,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        result = future => Some(result),
+        _ = shutdown_changed_or_requested(shutdown) => None,
+    }
 }
 
 fn publish_peer_summary(waku: &Client, shared: &Shared, events: &EventTx) {
@@ -562,6 +574,49 @@ mod tests {
         })
         .await
         .expect("disabled Waku status published");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_startup_work() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("request shutdown");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_until_shutdown(std::future::pending::<()>(), &mut shutdown_rx),
+        )
+        .await
+        .expect("pending startup was cancelled");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_workers_and_releases_client() {
+        let opts = WakuMonitorConfig {
+            chain_ids: vec![1],
+            network: RelayNetworkConfig::proxy(reqwest::Client::new()),
+            ..WakuMonitorConfig::default()
+        };
+        let waku = opts.build_client().expect("proxy Waku client");
+        let weak_waku = Arc::downgrade(&waku);
+        let shared = shared();
+        let (events, _event_rx) = event_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("request shutdown");
+
+        spawn_workers_until_shutdown(opts, Arc::clone(&waku), shared, events, shutdown_rx)
+            .await
+            .expect("workers observe shutdown");
+        drop(waku);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak_waku.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker-held client clones released");
     }
 
     #[test]

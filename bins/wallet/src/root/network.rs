@@ -50,7 +50,7 @@ impl WalletRoot {
 
         let http = self.http.clone();
         let runtime = self.runtime.clone();
-        let mut shutdown = self.waku_worker_shutdown.subscribe();
+        let mut shutdown = self.root_shutdown.subscribe();
         cx.spawn(async move |this, cx| {
             loop {
                 tokio::select! {
@@ -122,7 +122,7 @@ impl WalletRoot {
     fn start_new_tor_session(&mut self, cx: &mut Context<'_, Self>) {
         match self.http.start_new_tor_session() {
             Ok(generation) => {
-                let waku_refreshed = self.waku.refresh_network_session();
+                let waku_refreshed = super::refresh_active_waku(self.waku_runtime.as_ref());
                 let walletconnect_refreshed =
                     self.restart_walletconnect_relay_workers_for_network_session(cx);
                 tracing::info!(

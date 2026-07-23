@@ -84,7 +84,7 @@ use waku_relay::msg::ContentTopic;
 use zeroize::{Zeroize, Zeroizing};
 
 pub use local_db::DbStore as WalletDbStore;
-pub use waku_relay::client::Client as PublicBroadcasterWakuClient;
+pub use waku_relay::client::Client as WakuDeliveryClient;
 
 static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
     Mutex<HashMap<PathBuf, watch::Sender<Option<ProverCacheBuildProgress>>>>,

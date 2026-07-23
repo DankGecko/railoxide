@@ -204,11 +204,8 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
 
 impl WalletRoot {
     pub(super) fn clear_private_broadcaster_progress_state(&mut self) {
-        if let Some(mut progress) = self.private_broadcaster_progress.take()
-            && let Some(handle) = progress.task_abort_handle.take()
-        {
-            handle.abort();
-        }
+        cancel_private_broadcaster_progress(&mut self.private_broadcaster_progress);
+        cancel_public_broadcaster_tasks(&mut self.public_broadcaster_task_abort_handles);
         self.drop_trezor_pin_matrix_prompt();
     }
 
@@ -223,6 +220,10 @@ impl WalletRoot {
             return;
         };
         if progress.kind == kind && progress.key == key && progress.generation_id == generation_id {
+            self.public_broadcaster_task_abort_handles
+                .retain(|handle| !handle.is_finished());
+            self.public_broadcaster_task_abort_handles
+                .push(handle.clone());
             progress.task_abort_handle = Some(handle);
         }
     }
@@ -1047,6 +1048,24 @@ impl WalletRoot {
         }
 
         None
+    }
+}
+
+pub(in crate::root) fn cancel_private_broadcaster_progress(
+    progress: &mut Option<PrivateBroadcasterProgressState>,
+) {
+    if let Some(mut progress) = progress.take()
+        && let Some(handle) = progress.task_abort_handle.take()
+    {
+        handle.abort();
+    }
+}
+
+pub(in crate::root) fn cancel_public_broadcaster_tasks(
+    handles: &mut Vec<tokio::task::AbortHandle>,
+) {
+    for handle in handles.drain(..) {
+        handle.abort();
     }
 }
 

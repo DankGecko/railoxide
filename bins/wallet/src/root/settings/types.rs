@@ -127,7 +127,7 @@ pub(in crate::root) const ANCHOR_BPS_SLIDER_MIN: f32 = 0.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_MAX: f32 = 100_000.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_STEP: f32 = 10.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_MAX_BPS: u64 = 100_000;
-pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables embedded Waku libp2p transports to prevent proxy bypass. Public broadcaster discovery and Waku relay are unavailable in Proxy mode.";
+pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables Waku's embedded libp2p transport to prevent proxy bypass. Broadcaster discovery and public broadcaster delivery are unavailable in Proxy mode.";
 
 #[derive(Clone)]
 pub(in crate::root) enum SettingsUrlListKind {
