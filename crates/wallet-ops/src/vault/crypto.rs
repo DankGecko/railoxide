@@ -267,7 +267,7 @@ pub fn encrypt_payload(
     let aad = kind.aad(record_id);
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad: &aad,
@@ -288,7 +288,7 @@ pub fn decrypt_payload(
     let aad = kind.aad(record_id);
     let plaintext = cipher
         .decrypt(
-            XNonce::from_slice(&record.nonce),
+            &XNonce::from(record.nonce),
             Payload {
                 msg: &record.ciphertext,
                 aad: &aad,

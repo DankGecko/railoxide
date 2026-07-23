@@ -74,10 +74,10 @@ pub(crate) fn encode_walletconnect_message_with_nonce(
     plaintext: &[u8],
     nonce: [u8; WALLETCONNECT_NONCE_LEN],
 ) -> Result<WalletConnectEnvelope> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(sym_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*sym_key));
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad: &[],
@@ -98,10 +98,10 @@ pub fn decode_walletconnect_message(
     if envelope.envelope_type != WALLETCONNECT_ENVELOPE_TYPE_0 {
         return Err(WalletConnectError::Crypto);
     }
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(sym_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*sym_key));
     cipher
         .decrypt(
-            Nonce::from_slice(&envelope.nonce),
+            &Nonce::from(envelope.nonce),
             Payload {
                 msg: &envelope.ciphertext,
                 aad: &[],
