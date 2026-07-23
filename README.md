@@ -75,7 +75,7 @@ The installers support macOS, Ubuntu/Debian Linux, and Windows. See [`Install fr
 
 ## Build
 
-Native dependencies include Rust 1.91 and platform-specific C/C++ build dependencies.
+Native dependencies include Rust 1.94 and platform-specific C/C++ build dependencies.
 
 ```bash
 cargo check -p wallet

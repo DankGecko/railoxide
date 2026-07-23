@@ -1,6 +1,6 @@
 This guide builds the RailOxide desktop wallet binary from source on macOS with Ledger and Trezor support enabled.
 
-The commands below were verified on macOS 26.5.1 on Apple Silicon with Xcode Command Line Tools 26.5 and Rust 1.91.0.
+The commands below were verified on macOS 26.5.1 on Apple Silicon with Xcode Command Line Tools 26.5 and Rust 1.94.0.
 
 ## Install Command Line Tools
 
@@ -20,19 +20,19 @@ clang --version
 
 `xcode-select -p` should report `/Library/Developer/CommandLineTools` or a full Xcode developer directory.
 
-## Install Rust 1.91
+## Install Rust 1.94
 
-If Rust 1.91+ is not installed, install it with `rustup`:
+If Rust 1.94+ is not installed, install it with `rustup`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-  sh -s -- -y --default-toolchain 1.91.0
+  sh -s -- -y --default-toolchain 1.94.0
 . "$HOME/.cargo/env"
 rustc --version
 cargo --version
 ```
 
-Both version commands should report `1.91.0` or higher.
+Both version commands should report `1.94.0` or higher.
 
 ## Clone The Repository
 

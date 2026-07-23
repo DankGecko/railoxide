@@ -38,19 +38,19 @@ sudo apt-get install -y \
 
 These packages cover the Rust native build chain, OpenSSL, GPUI's Linux desktop dependencies, and the USB libraries used by hardware-wallet support.
 
-## Install Rust 1.91
+## Install Rust 1.94
 
-If Rust 1.91+ is not installed, install it with `rustup`:
+If Rust 1.94+ is not installed, install it with `rustup`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-  sh -s -- -y --default-toolchain 1.91.0
+  sh -s -- -y --default-toolchain 1.94.0
 . "$HOME/.cargo/env"
 rustc --version
 cargo --version
 ```
 
-Both version commands should report `1.91.0` or higher.
+Both version commands should report `1.94.0` or higher.
 
 ## Clone The Repository
 

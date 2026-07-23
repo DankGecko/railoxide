@@ -24,13 +24,13 @@ cmake --version
 clang --version
 ```
 
-## Install Rust 1.91
+## Install Rust 1.94
 
 Install the toolchain required by the workspace and add the Windows x64 target:
 
 ```powershell
-rustup toolchain install 1.91.0
-rustup target add x86_64-pc-windows-msvc --toolchain 1.91.0
+rustup toolchain install 1.94.0
+rustup target add x86_64-pc-windows-msvc --toolchain 1.94.0
 ```
 
 ## Clone The Repository
@@ -70,8 +70,8 @@ $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [En
 $env:SQLITE3_LIB_DIR = $SqliteRoot
 $env:SQLITE3_INCLUDE_DIR = "$SqliteRoot\sqlite-amalgamation-$SqliteVersion"
 
-cmd.exe /c "`"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=$HostArch && cargo +1.91.0 check -p wallet --features hardware --target x86_64-pc-windows-msvc"
-cmd.exe /c "`"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=$HostArch && cargo +1.91.0 build --release -p wallet --features hardware --target x86_64-pc-windows-msvc"
+cmd.exe /c "`"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=$HostArch && cargo +1.94.0 check -p wallet --features hardware --target x86_64-pc-windows-msvc"
+cmd.exe /c "`"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=$HostArch && cargo +1.94.0 build --release -p wallet --features hardware --target x86_64-pc-windows-msvc"
 ```
 
 The wallet binary is written to:
