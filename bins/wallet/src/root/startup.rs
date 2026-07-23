@@ -25,6 +25,7 @@ use wallet_ops::{
     BroadcasterFeePolicy, HttpContext, PoiReadSource, PublicBroadcasterWakuClient,
     TokenAnchorRateCache, WalletNetworkConfig, WalletNetworkMode, WalletNetworkProgress,
     WalletNetworkProgressStage, build_wallet_network_context_with_progress,
+    request_tor_state_reset,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletSettings,
         build_effective_chain_configs, build_effective_token_registry, default_waku_direct_peers,
@@ -68,6 +69,18 @@ enum StartupNetworkContext {
     Reuse(Box<HttpContext>),
 }
 
+const TOR_BOOTSTRAP_RECOVERY_DELAY: Duration = Duration::from_secs(5);
+const TOR_RESET_TOOLTIP: &str = "Quit RailOxide and clear built-in Tor cache and guard state on next launch. Wallet data is not affected.";
+
+pub(in crate::root) const fn tor_bootstrap_recovery_is_current(
+    expected_generation: u64,
+    current_generation: u64,
+    stage: WalletNetworkProgressStage,
+) -> bool {
+    expected_generation == current_generation
+        && matches!(stage, WalletNetworkProgressStage::BootstrappingTor)
+}
+
 pub(super) struct WalletStartupRoot {
     options: WalletAppOptions,
     runtime: Handle,
@@ -82,6 +95,8 @@ pub(super) struct WalletStartupRoot {
     wallet_root: Option<Entity<WalletRoot>>,
     maintenance_controller: Entity<WalletMaintenanceController>,
     startup_generation: u64,
+    tor_bootstrap_recovery_available: bool,
+    tor_reset_error: Option<Arc<str>>,
 }
 
 impl WalletStartupRoot {
@@ -129,6 +144,8 @@ impl WalletStartupRoot {
             wallet_root: None,
             maintenance_controller,
             startup_generation: 1,
+            tor_bootstrap_recovery_available: false,
+            tor_reset_error: None,
         };
         if let Some(vault_store) = vault_store {
             let (progress_tx, progress_rx) = watch::channel(root.progress.clone());
@@ -167,8 +184,7 @@ impl WalletStartupRoot {
                         if root.startup_generation != generation {
                             return;
                         }
-                        root.progress = progress;
-                        cx.notify();
+                        root.update_network_progress(progress, generation, cx);
                     })
                     .is_err()
                 {
@@ -217,6 +233,41 @@ impl WalletStartupRoot {
             });
         })
         .detach();
+    }
+
+    fn update_network_progress(
+        &mut self,
+        progress: WalletNetworkProgress,
+        generation: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let entered_tor_bootstrap = self.progress.stage
+            != WalletNetworkProgressStage::BootstrappingTor
+            && progress.stage == WalletNetworkProgressStage::BootstrappingTor;
+        self.progress = progress;
+        if self.progress.stage != WalletNetworkProgressStage::BootstrappingTor {
+            self.tor_bootstrap_recovery_available = false;
+        }
+        if entered_tor_bootstrap {
+            self.tor_bootstrap_recovery_available = false;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(TOR_BOOTSTRAP_RECOVERY_DELAY)
+                    .await;
+                let _ = this.update(cx, |root, cx| {
+                    if tor_bootstrap_recovery_is_current(
+                        generation,
+                        root.startup_generation,
+                        root.progress.stage,
+                    ) {
+                        root.tor_bootstrap_recovery_available = true;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     fn finish_startup(
@@ -372,6 +423,8 @@ impl WalletStartupRoot {
         });
         self.wallet_root = None;
         self.error = None;
+        self.tor_reset_error = None;
+        self.tor_bootstrap_recovery_available = false;
         self.progress = WalletNetworkProgress::initial();
         let rev = self.monitor_state.write().clear();
         let _ = self.event_tx.send(rev);
@@ -409,6 +462,26 @@ impl WalletStartupRoot {
             Ok(()) => self.retry_startup(window, cx),
             Err(error) => {
                 self.fail_startup(format!("Failed to reset wallet settings: {error}"), cx);
+            }
+        }
+    }
+
+    fn quit_and_reset_tor_state(&mut self, cx: &mut Context<'_, Self>) {
+        if !self.tor_bootstrap_recovery_available {
+            return;
+        }
+        match request_tor_state_reset(&self.options.db_path) {
+            Ok(marker_path) => {
+                tracing::warn!(
+                    marker_path = %marker_path.display(),
+                    "requested Tor state reset on next wallet startup; quitting wallet"
+                );
+                cx.quit();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to request Tor state reset during startup");
+                self.tor_reset_error = Some(Arc::from(format_report_chain(&error)));
+                cx.notify();
             }
         }
     }
@@ -531,6 +604,8 @@ impl WalletStartupRoot {
         let maintenance_idle = self.maintenance_controller.read(cx).is_idle();
         let maintenance_status = self.maintenance_controller.read(cx).status();
         let action_state = startup_settings_action_state(has_error, maintenance_idle);
+        let tor_reset_available = self.tor_bootstrap_recovery_available;
+        let tor_reset_error = self.tor_reset_error.clone();
         let stage = if has_error {
             "Network startup failed"
         } else {
@@ -630,6 +705,42 @@ impl WalletStartupRoot {
                             .child(SharedString::from(format!("{percent}%"))),
                     ),
             )
+            .when(tor_reset_available, |this| {
+                let reset_root = root.clone();
+                this.child(
+                    div()
+                        .mt(px(14.0))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .when_some(tor_reset_error, |this, error| {
+                            this.child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(theme::DANGER))
+                                    .bg(rgb(theme::SURFACE))
+                                    .p(px(10.0))
+                                    .text_color(rgb(theme::DANGER))
+                                    .child(SharedString::from(error.to_string())),
+                            )
+                        })
+                        .child(
+                            div().flex().justify_end().child(
+                                app_button("wallet-startup-reset-tor-state", "Reset Tor state")
+                                    .outline()
+                                    .danger()
+                                    .disabled(!maintenance_idle)
+                                    .tooltip(TOR_RESET_TOOLTIP)
+                                    .on_click(move |_event, _window, cx| {
+                                        reset_root.update(cx, |root, cx| {
+                                            root.quit_and_reset_tor_state(cx);
+                                        });
+                                    }),
+                            ),
+                        ),
+                )
+            })
             .when(action_state.reset || action_state.retry, |this| {
                 let retry_root = root.clone();
                 let reset_root = root.clone();

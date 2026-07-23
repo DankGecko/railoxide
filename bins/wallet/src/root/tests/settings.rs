@@ -9,6 +9,8 @@ use crate::root::settings::{
     remove_indexed_artifact_gateway_url, set_indexed_artifact_gateway_url,
     should_show_indexed_artifact_custom_settings,
 };
+use crate::root::startup::tor_bootstrap_recovery_is_current;
+use wallet_ops::WalletNetworkProgressStage;
 use wallet_ops::settings::{IndexedArtifactSettings, IndexedArtifactSourceModeSetting};
 
 #[test]
@@ -238,6 +240,25 @@ fn startup_pre_unlock_state_exposes_settings_and_error_recovery() {
     assert!(blocked.reset);
     assert!(blocked.retry);
     assert!(!blocked.maintenance_actions_enabled);
+}
+
+#[test]
+fn tor_bootstrap_recovery_rejects_stale_startup_generations_and_other_stages() {
+    assert!(tor_bootstrap_recovery_is_current(
+        7,
+        7,
+        WalletNetworkProgressStage::BootstrappingTor,
+    ));
+    assert!(!tor_bootstrap_recovery_is_current(
+        6,
+        7,
+        WalletNetworkProgressStage::BootstrappingTor,
+    ));
+    assert!(!tor_bootstrap_recovery_is_current(
+        7,
+        7,
+        WalletNetworkProgressStage::StartingTorBridge,
+    ));
 }
 
 #[test]
