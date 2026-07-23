@@ -9,6 +9,8 @@ mod assets;
 mod cli;
 mod root;
 
+use std::time::Duration;
+
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
@@ -29,6 +31,8 @@ use crate::root::{
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
 struct Quit;
+
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
     let opts = Options::from_args();
@@ -70,7 +74,7 @@ fn main() -> Result<()> {
     });
 
     drop(runtime_guard);
-    drop(runtime);
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     Ok(())
 }
 
