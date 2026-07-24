@@ -150,11 +150,21 @@ fn startup_settings_invalid_record_is_recoverable_error() {
     for chain in settings.chains.per_chain.values_mut() {
         chain.enabled = false;
     }
+    settings.walletconnect.project_id_override = Some("preserved-project-id".to_string());
     let payload = encode_wallet_settings(&settings).expect("encode invalid settings");
     store
         .db()
         .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
         .expect("write invalid settings");
+
+    let editable = load_wallet_settings(store.db().as_ref())
+        .expect("structurally valid settings remain available for repair");
+    assert_eq!(editable, settings);
+    assert_eq!(
+        editable.walletconnect.project_id_override.as_deref(),
+        Some("preserved-project-id")
+    );
+    assert!(editable.validate().is_err());
 
     let error = load_validated_startup_settings(&store).expect_err("settings should fail");
     let message = error.to_string();
@@ -302,6 +312,50 @@ fn settings_apply_classifier_tracks_restart_and_request_changes() {
     assert_eq!(
         classify_settings_apply_mode(&saved, &session_draft),
         SettingsApplyMode::FutureSessions
+    );
+
+    let mut auto_lock_draft = saved.clone();
+    auto_lock_draft.runtime.auto_lock_timeout_secs = None;
+    assert_eq!(
+        classify_settings_apply_mode(&saved, &auto_lock_draft),
+        SettingsApplyMode::FutureSessions
+    );
+}
+
+#[test]
+fn auto_lock_settings_helpers_cover_presets_disabled_discard_and_defaults() {
+    let options = auto_lock_timeout_options();
+    assert_eq!(options.first().expect("Disabled option").1, "Disabled");
+    assert_eq!(
+        options
+            .iter()
+            .find(|(value, _label)| value.as_ref() == "900")
+            .expect("15-minute option")
+            .1,
+        "15 minutes"
+    );
+    for (value, _label) in options {
+        let policy = auto_lock_timeout_from_value(value.as_ref());
+        assert_eq!(auto_lock_timeout_value(policy), value);
+    }
+
+    let defaults = WalletSettings::default();
+    assert_eq!(defaults.runtime.auto_lock_timeout_secs, Some(15 * 60));
+    let mut saved = defaults;
+    saved.runtime.auto_lock_timeout_secs = None;
+    let mut draft = saved.clone();
+    draft.runtime.auto_lock_timeout_secs = Some(30 * 60);
+    assert_eq!(
+        settings_draft_after_discard(&saved)
+            .runtime
+            .auto_lock_timeout_secs,
+        None
+    );
+    assert_eq!(
+        WalletSettings::reset_to_defaults()
+            .runtime
+            .auto_lock_timeout_secs,
+        Some(15 * 60)
     );
 }
 

@@ -38,6 +38,7 @@ use zeroize::Zeroizing;
 
 mod actions;
 mod address_book;
+mod auto_lock;
 mod broadcaster_picker;
 mod broadcaster_preferences;
 mod broadcaster_view;
@@ -77,6 +78,11 @@ pub(crate) use actions::{install_utxo_navigation_bindings, install_wallet_action
 pub(crate) use shell::{WalletAppOptions, open_wallet_window};
 
 use address_book::AddressBookState;
+#[cfg(test)]
+use auto_lock::{AutoLockDeadlineStatus, apply_initial_sync_observation};
+use auto_lock::{
+    AutoLockState, InitialCatchUpFingerprint, InitialSyncActivity, InitialSyncObservation,
+};
 use broadcaster_picker::BroadcasterPickerState;
 use broadcaster_preferences::{
     broadcaster_preference_is_banned, broadcaster_preference_is_favorite,
@@ -224,7 +230,8 @@ use public_broadcaster_cost::{
 use settings::{
     PriceAnchorComponentDialogValues, PriceAnchorDialogValues, SettingsApplyMode,
     StartupSettingsActionState, add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer,
-    add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint, classify_settings_apply_mode,
+    add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint, auto_lock_timeout_from_value,
+    auto_lock_timeout_options, auto_lock_timeout_value, classify_settings_apply_mode,
     display_chain_contract_settings, display_chain_quick_sync_endpoint,
     display_chain_rpc_endpoints, display_price_anchor_entries, display_token_entries,
     display_waku_direct_peers, display_waku_dns_enr_trees, display_waku_doh_endpoint,
@@ -319,6 +326,8 @@ pub(crate) struct WalletRoot {
     effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
+    auto_lock: AutoLockState,
+    initial_sync_activity: InitialSyncActivity,
     public_broadcaster_policy: BroadcasterFeePolicy,
     public_broadcaster_sort_seed: [u8; 32],
     public_broadcaster_response_timeout: Duration,
@@ -834,6 +843,7 @@ impl WalletRoot {
         effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
         effective_token_registry: EffectiveTokenRegistry,
         public_balance_refresh_interval: Duration,
+        auto_lock_timeout: Option<Duration>,
         public_broadcaster_policy: BroadcasterFeePolicy,
         public_broadcaster_response_timeout: Duration,
         public_broadcaster_republish_interval: Duration,
@@ -1085,6 +1095,8 @@ impl WalletRoot {
             effective_chain_configs,
             effective_token_registry,
             public_balance_refresh_interval,
+            auto_lock: AutoLockState::new(auto_lock_timeout),
+            initial_sync_activity: InitialSyncActivity::new(0),
             public_broadcaster_policy,
             public_broadcaster_sort_seed,
             public_broadcaster_response_timeout,
@@ -1227,7 +1239,11 @@ impl WalletRoot {
             logs_open: false,
             drawer_split: cx.new(|_| ResizableState::default()),
         };
-        cx.observe_window_activation(window, |root, window, _cx| {
+        Self::start_auto_lock_monitor(window, cx);
+        cx.observe_window_activation(window, |root, window, cx| {
+            if window.is_window_active() {
+                root.enforce_auto_lock(window, cx);
+            }
             root.sync_walletconnect_attention_for_window(window);
         })
         .detach();

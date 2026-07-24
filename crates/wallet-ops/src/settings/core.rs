@@ -6,7 +6,7 @@ use super::{
 };
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
-pub const WALLET_SETTINGS_VERSION: u32 = 1;
+pub const WALLET_SETTINGS_VERSION: u32 = 2;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 1;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =

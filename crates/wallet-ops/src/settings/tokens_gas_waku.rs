@@ -4,8 +4,8 @@ use super::{
     GAS_LIMIT_BUFFER, GAS_PRICE_BUFFER_DENOMINATOR, GAS_PRICE_BUFFER_NUMERATOR,
     IndexedArtifactSourceConfig, IndexedArtifactSourceModeSetting, MAX_INTERVAL_SECS, Serialize,
     U256, normalize_address_string, public_balance_refresh_interval_secs, supported_chain_id,
-    validate_address, validate_enr_tree, validate_optional_non_empty, validate_range,
-    validate_url_scheme, validate_waku_direct_peer,
+    validate_address, validate_enr_tree, validate_optional_non_empty, validate_optional_range,
+    validate_range, validate_url_scheme, validate_waku_direct_peer,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,15 +256,22 @@ impl ChainGasSettings {
     }
 }
 
+pub const DEFAULT_AUTO_LOCK_TIMEOUT_SECS: u64 = 15 * 60;
+pub const MIN_AUTO_LOCK_TIMEOUT_SECS: u64 = 60;
+pub const MAX_AUTO_LOCK_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+pub const AUTO_LOCK_TIMEOUT_PRESETS_SECS: &[u64] = &[5 * 60, 15 * 60, 30 * 60, 60 * 60];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeSettings {
+    pub auto_lock_timeout_secs: Option<u64>,
     pub public_balance_refresh_interval_secs: u64,
 }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
+            auto_lock_timeout_secs: Some(DEFAULT_AUTO_LOCK_TIMEOUT_SECS),
             public_balance_refresh_interval_secs: public_balance_refresh_interval_secs(),
         }
     }
@@ -272,6 +279,13 @@ impl Default for RuntimeSettings {
 
 impl RuntimeSettings {
     pub(super) fn validate(&self, errors: &mut Vec<String>) {
+        validate_optional_range(
+            "runtime.auto_lock_timeout_secs",
+            self.auto_lock_timeout_secs,
+            MIN_AUTO_LOCK_TIMEOUT_SECS,
+            MAX_AUTO_LOCK_TIMEOUT_SECS,
+            errors,
+        );
         validate_range(
             "runtime.public_balance_refresh_interval_secs",
             self.public_balance_refresh_interval_secs,

@@ -971,7 +971,7 @@ mod tests {
                 "attachments": [
                     {
                         "data": "0x010203",
-                        "digest": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0001"
+                        "digest": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                     },
                     {
                         "data": "0x",

@@ -40,7 +40,7 @@ impl WalletRoot {
         }
         if let Some(session) = self.view_session.as_ref() {
             let vault_view_unlock = Arc::new(session.clone_vault_view_unlock());
-            self.vault_view_unlock = Some(Arc::clone(&vault_view_unlock));
+            self.install_vault_view_unlock(Arc::clone(&vault_view_unlock));
             self.hardware_profile_unlock.vault_view_unlock = Some(Arc::clone(&vault_view_unlock));
             return Some(vault_view_unlock);
         }
@@ -48,7 +48,7 @@ impl WalletRoot {
             match store.unlock_view(password.as_str()) {
                 Ok(view) => {
                     let vault_view_unlock = Arc::new(view);
-                    self.vault_view_unlock = Some(Arc::clone(&vault_view_unlock));
+                    self.install_vault_view_unlock(Arc::clone(&vault_view_unlock));
                     self.hardware_profile_unlock.vault_view_unlock =
                         Some(Arc::clone(&vault_view_unlock));
                     return Some(vault_view_unlock);
@@ -72,7 +72,7 @@ impl WalletRoot {
         match store.unlock_view(password.as_str()) {
             Ok(view) => {
                 let vault_view_unlock = Arc::new(view);
-                self.vault_view_unlock = Some(Arc::clone(&vault_view_unlock));
+                self.install_vault_view_unlock(Arc::clone(&vault_view_unlock));
                 self.hardware_profile_unlock.vault_view_unlock =
                     Some(Arc::clone(&vault_view_unlock));
                 Some(vault_view_unlock)

@@ -6,6 +6,17 @@ use super::{
 };
 
 impl WalletRoot {
+    pub(in crate::root) fn apply_saved_auto_lock_policy(&mut self, settings: &WalletSettings) {
+        self.auto_lock.apply_policy(
+            settings
+                .runtime
+                .auto_lock_timeout_secs
+                .map(Duration::from_secs),
+            self.vault_view_unlock.is_some(),
+            crate::root::auto_lock::AutoLockTimestamp::now(),
+        );
+    }
+
     // GPUI requires a mutable context for Entity::update even though it is only forwarded here.
     #[allow(clippy::needless_pass_by_ref_mut)]
     pub(in crate::root) fn clear_settings_transient_status(&mut self, cx: &mut Context<'_, Self>) {

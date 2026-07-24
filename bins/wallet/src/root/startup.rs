@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,8 +7,9 @@ use broadcaster_monitor::{EventRx, EventTx, Shared};
 use broadcaster_monitor_waku::{RelayNetworkConfig, WakuMonitorConfig, WakuMonitorDirectPeer};
 use eyre::WrapErr;
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
-    Window, div, img, prelude::FluentBuilder as _, px, rgb,
+    App, AppContext, Context, Entity, IntoElement, MouseDownEvent, MouseMoveEvent, ParentElement,
+    Render, ScrollWheelEvent, SharedString, Styled, Subscription, Window, canvas, div, img,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, IconName, Root, Sizable, WindowExt, button::ButtonVariants,
@@ -54,6 +56,7 @@ struct WalletStartupReady {
     effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
+    auto_lock_timeout: Option<Duration>,
     public_broadcaster_policy: BroadcasterFeePolicy,
     public_broadcaster_response_timeout: Duration,
     public_broadcaster_republish_interval: Duration,
@@ -68,6 +71,7 @@ enum StartupNetworkContext {
 
 const TOR_BOOTSTRAP_RECOVERY_DELAY: Duration = Duration::from_secs(5);
 const TOR_RESET_TOOLTIP: &str = "Quit RailOxide and clear built-in Tor cache and guard state on next launch. Wallet data is not affected.";
+type WalletActivityCallback = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
 pub(in crate::root) const fn tor_bootstrap_recovery_is_current(
     expected_generation: u64,
@@ -94,6 +98,7 @@ pub(super) struct WalletStartupRoot {
     startup_generation: u64,
     tor_bootstrap_recovery_available: bool,
     tor_reset_error: Option<Arc<str>>,
+    _activity_keystroke_interceptor: Subscription,
 }
 
 impl WalletStartupRoot {
@@ -127,6 +132,26 @@ impl WalletStartupRoot {
             cx.notify();
         })
         .detach();
+        let wallet_window = window.window_handle();
+        let root_entity = cx.weak_entity();
+        let activity_keystroke_interceptor =
+            cx.intercept_keystrokes(move |_event, event_window, cx| {
+                if event_window.window_handle() != wallet_window {
+                    return;
+                }
+                let locked = root_entity
+                    .update(cx, |startup, cx| {
+                        startup.wallet_root.as_ref().is_some_and(|root| {
+                            root.update(cx, |root, cx| {
+                                root.handle_wallet_activity(event_window, cx)
+                            })
+                        })
+                    })
+                    .unwrap_or(false);
+                if locked {
+                    cx.stop_propagation();
+                }
+            });
         let root = Self {
             options,
             runtime,
@@ -143,6 +168,7 @@ impl WalletStartupRoot {
             startup_generation: 1,
             tor_bootstrap_recovery_available: false,
             tor_reset_error: None,
+            _activity_keystroke_interceptor: activity_keystroke_interceptor,
         };
         if let Some(vault_store) = vault_store {
             let (progress_tx, progress_rx) = watch::channel(root.progress.clone());
@@ -329,6 +355,7 @@ impl WalletStartupRoot {
                 ready.effective_chain_configs,
                 ready.effective_token_registry,
                 ready.public_balance_refresh_interval,
+                ready.auto_lock_timeout,
                 ready.public_broadcaster_policy,
                 ready.public_broadcaster_response_timeout,
                 ready.public_broadcaster_republish_interval,
@@ -843,13 +870,49 @@ impl Render for WalletStartupRoot {
             self.render_splash(window, cx)
         };
 
+        let activity_observer = self.wallet_root.clone().map(|root| {
+            canvas(
+                |_, _window, _cx| {},
+                move |_, (), window, _cx| {
+                    let callback: WalletActivityCallback = Rc::new({
+                        move |window, cx| {
+                            root.update(cx, |root, cx| root.handle_wallet_activity(window, cx))
+                        }
+                    });
+                    register_wallet_activity_listeners(window, callback);
+                },
+            )
+            .absolute()
+            .size_full()
+        });
         div()
             .relative()
             .size_full()
+            .children(activity_observer)
             .child(render_wallet_window_frame(content, window, titlebar_color))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
+}
+
+fn register_wallet_activity_listeners(window: &mut Window, callback: WalletActivityCallback) {
+    let move_callback = Rc::clone(&callback);
+    window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+        if phase.capture() && move_callback(window, cx) {
+            cx.stop_propagation();
+        }
+    });
+    let click_callback = Rc::clone(&callback);
+    window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
+        if phase.capture() && click_callback(window, cx) {
+            cx.stop_propagation();
+        }
+    });
+    window.on_mouse_event(move |_: &ScrollWheelEvent, phase, window, cx| {
+        if phase.capture() && callback(window, cx) {
+            cx.stop_propagation();
+        }
+    });
 }
 
 async fn build_wallet_startup(
@@ -945,6 +1008,10 @@ async fn build_wallet_startup(
         public_balance_refresh_interval: Duration::from_secs(
             settings.runtime.public_balance_refresh_interval_secs,
         ),
+        auto_lock_timeout: settings
+            .runtime
+            .auto_lock_timeout_secs
+            .map(Duration::from_secs),
         public_broadcaster_policy: settings.broadcaster.fee_policy(),
         public_broadcaster_response_timeout: Duration::from_secs(
             settings.broadcaster.response_timeout_secs,
@@ -1038,4 +1105,186 @@ pub(super) fn resolve_initial_chain_id(
                 .copied()
                 .expect("validated wallet settings must enable at least one chain")
         })
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use std::cell::Cell;
+
+    use gpui::{
+        FocusHandle, InteractiveElement as _, KeyDownEvent, Keystroke, Modifiers, MouseButton,
+        ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point,
+    };
+
+    use super::*;
+
+    struct ActivityObserverProbe {
+        count: Rc<Cell<usize>>,
+        stop_activity: Rc<Cell<bool>>,
+        content_clicks: Rc<Cell<usize>>,
+        root_focus: FocusHandle,
+        dialog_focus: FocusHandle,
+        dialog_open: bool,
+        _keystroke_interceptor: Subscription,
+    }
+
+    impl Render for ActivityObserverProbe {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            let count = Rc::clone(&self.count);
+            let stop_activity = Rc::clone(&self.stop_activity);
+            let observer = canvas(
+                |_, _window, _cx| {},
+                move |_, (), window, _cx| {
+                    let count = Rc::clone(&count);
+                    register_wallet_activity_listeners(
+                        window,
+                        Rc::new(move |_window, _cx| {
+                            count.set(count.get() + 1);
+                            stop_activity.get()
+                        }),
+                    );
+                },
+            )
+            .absolute()
+            .size_full();
+            let content_clicks = Rc::clone(&self.content_clicks);
+            div()
+                .debug_selector(|| "activity-probe".to_owned())
+                .relative()
+                .size_full()
+                .track_focus(&self.root_focus)
+                .child(observer)
+                .child(div().size_full().on_mouse_down(
+                    MouseButton::Left,
+                    move |_event, _window, _cx| {
+                        content_clicks.set(content_clicks.get() + 1);
+                    },
+                ))
+                .when(self.dialog_open, |this| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "activity-dialog".to_owned())
+                            .absolute()
+                            .size_full()
+                            .track_focus(&self.dialog_focus)
+                            .occlude()
+                            .on_key_down(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
+                    )
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn wallet_activity_observer_captures_content_and_dialog_events(cx: &mut TestAppContext) {
+        let count = Rc::new(Cell::new(0));
+        let probe_count = Rc::clone(&count);
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            let wallet_window = window.window_handle();
+            let key_count = Rc::clone(&probe_count);
+            let keystroke_interceptor = cx.intercept_keystrokes(move |_event, window, _cx| {
+                if window.window_handle() == wallet_window {
+                    key_count.set(key_count.get() + 1);
+                }
+            });
+            ActivityObserverProbe {
+                count: probe_count,
+                stop_activity: Rc::new(Cell::new(false)),
+                content_clicks: Rc::new(Cell::new(0)),
+                root_focus: cx.focus_handle(),
+                dialog_focus: cx.focus_handle(),
+                dialog_open: false,
+                _keystroke_interceptor: keystroke_interceptor,
+            }
+        });
+        cx.update(|window, app| {
+            window.focus(&probe.read(app).root_focus);
+            window.activate_window();
+        });
+        cx.refresh().expect("refresh test window");
+        cx.run_until_parked();
+        let content_position = cx
+            .debug_bounds("activity-probe")
+            .expect("probe bounds")
+            .center();
+
+        cx.simulate_mouse_move(content_position, None::<MouseButton>, Modifiers::none());
+        cx.simulate_mouse_down(content_position, MouseButton::Left, Modifiers::none());
+        cx.simulate_event(ScrollWheelEvent {
+            position: content_position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-10.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse("a").expect("valid test keystroke"),
+            is_held: false,
+        });
+        assert_eq!(count.get(), 4);
+
+        probe.update(cx, |probe, cx| {
+            probe.dialog_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            window.focus(&probe.read(app).dialog_focus);
+        });
+        let dialog_position = cx
+            .debug_bounds("activity-dialog")
+            .expect("dialog bounds")
+            .center();
+
+        cx.simulate_mouse_move(dialog_position, None::<MouseButton>, Modifiers::none());
+        cx.simulate_mouse_down(dialog_position, MouseButton::Left, Modifiers::none());
+        cx.simulate_event(ScrollWheelEvent {
+            position: dialog_position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-10.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse("b").expect("valid test keystroke"),
+            is_held: false,
+        });
+        assert_eq!(count.get(), 8);
+    }
+
+    #[gpui::test]
+    fn wallet_activity_observer_stops_expired_input_before_content(cx: &mut TestAppContext) {
+        let count = Rc::new(Cell::new(0));
+        let probe_count = Rc::clone(&count);
+        let content_clicks = Rc::new(Cell::new(0));
+        let probe_content_clicks = Rc::clone(&content_clicks);
+        let (probe, cx) = cx.add_window_view(|_window, cx| ActivityObserverProbe {
+            count: probe_count,
+            stop_activity: Rc::new(Cell::new(true)),
+            content_clicks: probe_content_clicks,
+            root_focus: cx.focus_handle(),
+            dialog_focus: cx.focus_handle(),
+            dialog_open: false,
+            _keystroke_interceptor: cx.intercept_keystrokes(|_, _, _| {}),
+        });
+        cx.update(|window, app| {
+            window.focus(&probe.read(app).root_focus);
+            window.activate_window();
+        });
+        cx.refresh().expect("refresh test window");
+        cx.run_until_parked();
+        let content_position = cx
+            .debug_bounds("activity-probe")
+            .expect("probe bounds")
+            .center();
+
+        cx.simulate_mouse_down(content_position, MouseButton::Left, Modifiers::none());
+
+        assert_eq!(count.get(), 1);
+        assert_eq!(content_clicks.get(), 0);
+    }
 }

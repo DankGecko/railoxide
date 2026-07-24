@@ -1,6 +1,6 @@
 use super::{
-    ANCHOR_BPS_SLIDER_MAX, ANCHOR_BPS_SLIDER_MAX_BPS, ANCHOR_BPS_SLIDER_MIN, Pixels,
-    WalletSettings, Window, px,
+    ANCHOR_BPS_SLIDER_MAX, ANCHOR_BPS_SLIDER_MAX_BPS, ANCHOR_BPS_SLIDER_MIN,
+    AUTO_LOCK_TIMEOUT_PRESETS_SECS, Pixels, SharedString, WalletSettings, Window, px,
 };
 
 pub(in crate::root) fn settings_dialog_dimensions(window: &Window) -> (Pixels, Pixels, Pixels) {
@@ -9,6 +9,45 @@ pub(in crate::root) fn settings_dialog_dimensions(window: &Window) -> (Pixels, P
     let content_height = (viewport.height - px(120.0)).max(px(180.0)).min(px(620.0));
     let max_height = (viewport.height - px(32.0)).max(px(240.0));
     (width, content_height, max_height)
+}
+
+const AUTO_LOCK_DISABLED_VALUE: &str = "disabled";
+
+pub(in crate::root) fn auto_lock_timeout_options() -> Vec<(SharedString, SharedString)> {
+    std::iter::once((
+        SharedString::from(AUTO_LOCK_DISABLED_VALUE),
+        SharedString::from("Disabled"),
+    ))
+    .chain(AUTO_LOCK_TIMEOUT_PRESETS_SECS.iter().map(|timeout| {
+        (
+            SharedString::from(timeout.to_string()),
+            SharedString::from(format_auto_lock_timeout(*timeout)),
+        )
+    }))
+    .collect()
+}
+
+pub(in crate::root) fn auto_lock_timeout_value(timeout: Option<u64>) -> SharedString {
+    timeout.map_or_else(
+        || SharedString::from(AUTO_LOCK_DISABLED_VALUE),
+        |timeout| SharedString::from(timeout.to_string()),
+    )
+}
+
+pub(in crate::root) fn auto_lock_timeout_from_value(value: &str) -> Option<u64> {
+    (value != AUTO_LOCK_DISABLED_VALUE)
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+fn format_auto_lock_timeout(timeout_secs: u64) -> String {
+    if timeout_secs.is_multiple_of(60 * 60) {
+        let hours = timeout_secs / (60 * 60);
+        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+    } else {
+        let minutes = timeout_secs / 60;
+        format!("{minutes} minutes")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

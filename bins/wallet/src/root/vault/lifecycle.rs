@@ -358,9 +358,9 @@ impl WalletRoot {
         if close_dialogs {
             window.close_all_dialogs(cx);
         }
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         self.view_session = Some(session);
-        self.vault_view_unlock = Some(vault_view_unlock);
+        self.install_vault_view_unlock(vault_view_unlock);
         self.wallet_metadata = metadata;
         self.wallet_options = wallet_options_from_metadata(self.wallet_metadata.clone());
         self.selected_wallet_id = Some(Arc::clone(&wallet_id));
@@ -503,7 +503,7 @@ impl WalletRoot {
                 self.set_default_wallet_name_from_password(password.as_str(), window, cx);
                 self.setup_password = Some(password);
             }
-            self.vault_view_unlock = Some(vault_view_unlock);
+            self.install_vault_view_unlock(vault_view_unlock);
             self.vault_error = None;
             self.vault_state = VaultState::SetupWallet;
             self.wallet_setup_mode = WalletSetupMode::Choose;
@@ -513,9 +513,9 @@ impl WalletRoot {
         }
 
         window.close_all_dialogs(cx);
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         self.view_session = None;
-        self.vault_view_unlock = Some(vault_view_unlock);
+        self.install_vault_view_unlock(vault_view_unlock);
         self.wallet_metadata = metadata;
         self.wallet_options = active;
         self.selected_wallet_id = None;
@@ -574,7 +574,7 @@ impl WalletRoot {
         self.active_broadcaster_tab = BroadcasterActivityTab::default();
         self.address_book_save_error = None;
         self.selected_wallet_id = None;
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         self.sync_wallet_select(window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
@@ -584,6 +584,7 @@ impl WalletRoot {
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.vault_view_unlock = None;
+        self.auto_lock.disarm();
         self.generated_seed = None;
         self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]

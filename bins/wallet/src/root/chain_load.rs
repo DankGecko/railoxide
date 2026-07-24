@@ -21,7 +21,10 @@ use wallet_ops::{
 };
 
 use super::utxo::should_focus_utxo_table;
-use super::{BroadcasterActivityTab, WalletRoot, WalletTab, count_label, format_report_chain};
+use super::{
+    BroadcasterActivityTab, InitialCatchUpFingerprint, InitialSyncObservation, WalletRoot,
+    WalletTab, count_label, format_report_chain,
+};
 
 pub(super) enum ChainUtxoState {
     Idle,
@@ -1356,7 +1359,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
         self.public_sync_cache_resetting = true;
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         let session_store = self.wallet_sync_lifecycle.public_sync_cache_reset_cell();
         let cleanup = self.wallet_sync_lifecycle.supersede_wallet();
         self.start_wallet_sync_cleanup(cleanup);
@@ -1377,7 +1380,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
         self.public_sync_cache_resetting = true;
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         let session_store = self.wallet_sync_lifecycle.public_sync_cache_reset_cell();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.start_wallet_sync_cleanup(cleanup);
@@ -1415,7 +1418,7 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletSyncLifecycleCleanupWaitGroup {
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.start_wallet_sync_cleanup(cleanup);
         self.reset_wallet_scoped_state(cx);
@@ -1426,7 +1429,7 @@ impl WalletRoot {
     pub(super) fn begin_root_replacement_sync_shutdown(
         &mut self,
     ) -> WalletSyncLifecycleCleanupWaitGroup {
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.start_wallet_sync_cleanup(cleanup);
         self.wallet_sync_lifecycle_shutdown_started = true;
@@ -1466,7 +1469,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> WalletSyncLifecycleCleanupWaitGroup {
         self.merkle_forest_cache_resetting = true;
-        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
+        self.advance_active_wallet_generation();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.start_wallet_sync_cleanup(cleanup);
         self.send_forms.clear();
@@ -1597,6 +1600,11 @@ impl WalletRoot {
             }
         };
         self.finish_chain_load_startup(chain_id, lifecycle_generation, task_id);
+        self.handle_initial_sync_observation(
+            active_wallet_generation,
+            chain_id,
+            InitialSyncObservation::Error,
+        );
         self.chain_states.insert(
             chain_id,
             ChainUtxoState::Error {
@@ -1703,6 +1711,11 @@ impl WalletRoot {
 
         self.chain_states
             .insert(chain_id, ChainUtxoState::Loading { progress: None });
+        self.handle_initial_sync_observation(
+            self.active_wallet_generation,
+            chain_id,
+            InitialSyncObservation::Started,
+        );
         self.sync_utxo_table(cx);
 
         let active_wallet_id: Arc<str> = Arc::from(view_session.wallet_id().to_owned());
@@ -1837,22 +1850,32 @@ impl WalletRoot {
                     ) {
                         return false;
                     }
-                    match root.chain_states.get_mut(&chain_id) {
+                    let fingerprint = match root.chain_states.get_mut(&chain_id) {
                         Some(ChainUtxoState::Loading { progress: state }) => {
                             *state = progress;
-                            cx.notify();
+                            Some(InitialCatchUpFingerprint::new(progress, None))
                         }
                         Some(ChainUtxoState::Syncing {
-                            progress: state, ..
+                            progress: state,
+                            sync_tip,
+                            ..
                         }) => {
                             *state = syncing_progress(progress);
-                            cx.notify();
+                            Some(InitialCatchUpFingerprint::new(*state, Some(*sync_tip)))
                         }
-                        Some(ChainUtxoState::Ready { .. }) => {}
+                        Some(ChainUtxoState::Ready { .. }) => None,
                         Some(ChainUtxoState::Idle | ChainUtxoState::Error { .. }) | None => {
                             return false;
                         }
+                    };
+                    if let Some(fingerprint) = fingerprint {
+                        root.handle_initial_sync_observation(
+                            active_wallet_generation,
+                            chain_id,
+                            InitialSyncObservation::Progress(fingerprint),
+                        );
                     }
+                    cx.notify();
                     true
                 });
                 if !matches!(should_continue, Ok(true)) {
@@ -1903,6 +1926,11 @@ impl WalletRoot {
                                 ppoi_workflow_status: WalletPpoiWorkflowStatus::default(),
                             },
                         );
+                        root.handle_initial_sync_observation(
+                            active_wallet_generation,
+                            chain_id,
+                            InitialSyncObservation::Error,
+                        );
                         if root.selected_chain == chain_id {
                             root.sync_utxo_table(cx);
                         }
@@ -1934,6 +1962,11 @@ impl WalletRoot {
                                 start_block: previous_start_block,
                                 ppoi_workflow_status: WalletPpoiWorkflowStatus::default(),
                             },
+                        );
+                        root.handle_initial_sync_observation(
+                            active_wallet_generation,
+                            chain_id,
+                            InitialSyncObservation::Error,
                         );
                         if root.selected_chain == chain_id {
                             root.sync_utxo_table(cx);
@@ -2036,7 +2069,39 @@ impl WalletRoot {
                         ppoi_workflow_status: initial_ppoi_workflow_status,
                     },
                 };
+                let initially_ready = matches!(&state, ChainUtxoState::Ready { .. });
+                let initially_failed = matches!(&state, ChainUtxoState::Error { .. });
+                let initial_sync_fingerprint = match &state {
+                    ChainUtxoState::Syncing {
+                        progress, sync_tip, ..
+                    } => Some(InitialCatchUpFingerprint::new(*progress, Some(*sync_tip))),
+                    ChainUtxoState::Idle
+                    | ChainUtxoState::Loading { .. }
+                    | ChainUtxoState::Ready { .. }
+                    | ChainUtxoState::Error { .. } => None,
+                };
                 root.chain_states.insert(chain_id, state);
+                if let Some(fingerprint) = initial_sync_fingerprint {
+                    root.handle_initial_sync_observation(
+                        active_wallet_generation,
+                        chain_id,
+                        InitialSyncObservation::Progress(fingerprint),
+                    );
+                }
+                if initially_ready {
+                    root.handle_initial_sync_observation(
+                        active_wallet_generation,
+                        chain_id,
+                        InitialSyncObservation::Ready,
+                    );
+                }
+                if initially_failed {
+                    root.handle_initial_sync_observation(
+                        active_wallet_generation,
+                        chain_id,
+                        InitialSyncObservation::Error,
+                    );
+                }
                 if let Some(progress) = initial_poi_artifact_cache_progress.clone() {
                     root.poi_artifact_cache_progress.insert(chain_id, progress);
                 } else {
@@ -2248,6 +2313,13 @@ impl WalletRoot {
                                 }
                             };
                             root.chain_states.insert(chain_id, state);
+                            if ready {
+                                root.handle_initial_sync_observation(
+                                    active_wallet_generation,
+                                    chain_id,
+                                    InitialSyncObservation::Ready,
+                                );
+                            }
                             if validation_completed {
                                 root.pending_ppoi_validation_toast = Some((
                                     Arc::clone(&result_wallet_id),
@@ -2295,14 +2367,25 @@ impl WalletRoot {
                             let Some(state) = root.chain_states.get_mut(&chain_id) else {
                                 return false;
                             };
-                            match state {
-                                ChainUtxoState::Syncing { sync_tip: state, .. }
-                                | ChainUtxoState::Ready { sync_tip: state, .. } => {
+                            let fingerprint = match state {
+                                ChainUtxoState::Syncing { sync_tip: state, .. } => {
                                     *state = sync_tip;
+                                    Some(InitialCatchUpFingerprint::new(None, Some(sync_tip)))
+                                }
+                                ChainUtxoState::Ready { sync_tip: state, .. } => {
+                                    *state = sync_tip;
+                                    None
                                 }
                                 ChainUtxoState::Idle
                                 | ChainUtxoState::Loading { .. }
                                 | ChainUtxoState::Error { .. } => return false,
+                            };
+                            if let Some(fingerprint) = fingerprint {
+                                root.handle_initial_sync_observation(
+                                    active_wallet_generation,
+                                    chain_id,
+                                    InitialSyncObservation::Progress(fingerprint),
+                                );
                             }
                             cx.notify();
                             true

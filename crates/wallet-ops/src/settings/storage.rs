@@ -1,15 +1,18 @@
 use super::{
-    DbStore, WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY,
-    WALLET_UI_STATE_VERSION, WalletSettings, WalletSettingsError, WalletUiState,
-    WalletUiStateError,
+    DEFAULT_AUTO_LOCK_TIMEOUT_SECS, DbStore, WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION,
+    WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WalletSettings, WalletSettingsError,
+    WalletUiState, WalletUiStateError,
 };
 
+/// Loads and migrates a supported settings record without requiring semantic validity.
+/// Runtime consumers must validate the returned settings before using them.
 pub fn load_wallet_settings(store: &DbStore) -> Result<WalletSettings, WalletSettingsError> {
     let Some(payload) = store.get_app_settings_record(WALLET_SETTINGS_KEY)? else {
         return Ok(WalletSettings::default());
     };
-    let mut settings = decode_wallet_settings(&payload)?;
-    if settings.poi.artifact.migrate_legacy_official_identity() {
+    let (mut settings, version_migrated) = decode_wallet_settings_with_migration(&payload)?;
+    let identity_migrated = settings.poi.artifact.migrate_legacy_official_identity();
+    if version_migrated || identity_migrated {
         let payload = encode_wallet_settings(&settings)?;
         store.put_app_settings_record(WALLET_SETTINGS_KEY, &payload)?;
     }
@@ -66,13 +69,23 @@ pub fn encode_wallet_settings(settings: &WalletSettings) -> Result<Vec<u8>, Wall
 }
 
 pub fn decode_wallet_settings(data: &[u8]) -> Result<WalletSettings, WalletSettingsError> {
-    let settings: WalletSettings = rmp_serde::from_slice(data)?;
-    if settings.version != WALLET_SETTINGS_VERSION {
-        return Err(WalletSettingsError::UnsupportedVersion {
-            version: settings.version,
-        });
-    }
-    Ok(settings)
+    decode_wallet_settings_with_migration(data).map(|(settings, _migrated)| settings)
+}
+
+fn decode_wallet_settings_with_migration(
+    data: &[u8],
+) -> Result<(WalletSettings, bool), WalletSettingsError> {
+    let mut settings: WalletSettings = rmp_serde::from_slice(data)?;
+    let migrated = match settings.version {
+        WALLET_SETTINGS_VERSION => false,
+        1 => {
+            settings.version = WALLET_SETTINGS_VERSION;
+            settings.runtime.auto_lock_timeout_secs = Some(DEFAULT_AUTO_LOCK_TIMEOUT_SECS);
+            true
+        }
+        version => return Err(WalletSettingsError::UnsupportedVersion { version }),
+    };
+    Ok((settings, migrated))
 }
 
 pub fn encode_wallet_ui_state(state: &WalletUiState) -> Result<Vec<u8>, WalletUiStateError> {

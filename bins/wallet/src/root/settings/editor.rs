@@ -467,15 +467,15 @@ impl WalletSettingsEditor {
         apply_mode: SettingsApplyMode,
         cx: &mut Context<'_, Self>,
     ) {
-        if apply_mode != SettingsApplyMode::NewRequests {
-            return;
-        }
         let Some(root) = self.active_root.as_ref() else {
             return;
         };
         let settings = self.saved.clone();
         let _ = root.update(cx, |root, cx| {
-            root.apply_saved_request_settings(&settings, cx);
+            root.apply_saved_auto_lock_policy(&settings);
+            if apply_mode == SettingsApplyMode::NewRequests {
+                root.apply_saved_request_settings(&settings, cx);
+            }
         });
     }
 

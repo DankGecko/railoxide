@@ -38,6 +38,15 @@ impl Render for WalletSettingsEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let editor = cx.entity();
         let root_replacement_allowed = self.root_replacement_is_allowed(cx);
+        let auto_lock_timeout = Self::dropdown_field(
+            editor.clone(),
+            auto_lock_timeout_options(),
+            |settings| auto_lock_timeout_value(settings.runtime.auto_lock_timeout_secs),
+            |settings, value| {
+                settings.runtime.auto_lock_timeout_secs =
+                    auto_lock_timeout_from_value(value.as_ref());
+            },
+        );
         let network_mode = Self::dropdown_field(
             editor.clone(),
             vec![
@@ -609,6 +618,12 @@ impl Render for WalletSettingsEditor {
         let discard_editor = editor.clone();
         let reset_editor = editor.clone();
         let apply_editor = editor.clone();
+        let security_page = SettingPage::new("Security").group(
+            settings_group().item(
+                SettingItem::new("Auto-lock vault", auto_lock_timeout)
+                    .description("Lock the vault after this long without wallet activity."),
+            ),
+        );
         let mut privacy_group =
             settings_group().item(SettingItem::new("Network mode", network_mode));
         if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
@@ -786,6 +801,7 @@ impl Render for WalletSettingsEditor {
                         ComponentSettings::new("wallet-settings-editor")
                             .sidebar_width(px(190.0))
                             .with_group_variant(GroupBoxVariant::Normal)
+                            .page(security_page)
                             .page(privacy_page)
                             .page(chains_page)
                             .page(contracts_page)

@@ -131,7 +131,7 @@ impl WalletRoot {
         match store.create_vault(password.as_str()) {
             Ok(created) => {
                 Self::defer_wallet_name_input(PRIMARY_WALLET_LABEL.to_owned(), window, cx);
-                self.vault_view_unlock = Some(Arc::new(created.view));
+                self.install_vault_view_unlock(Arc::new(created.view));
                 self.setup_password = Some(password);
                 self.vault_error = None;
                 self.vault_state = VaultState::SetupWallet;
@@ -223,7 +223,7 @@ impl WalletRoot {
                 root.unlock_in_progress = false;
                 match result {
                     Ok(Ok(unlock)) if unlock.session.is_some() => {
-                        root.vault_view_unlock = Some(unlock.vault_view_unlock);
+                        root.install_vault_view_unlock(unlock.vault_view_unlock);
                         root.enter_view_unlocked(
                             unlock.session.expect("checked above"),
                             unlock.metadata,

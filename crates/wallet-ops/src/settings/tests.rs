@@ -6,14 +6,16 @@ use local_db::{DbConfig, DbStore};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    AUTO_LOCK_TIMEOUT_PRESETS_SECS, DEFAULT_AUTO_LOCK_TIMEOUT_SECS,
     DEFAULT_INDEXED_ARTIFACT_CONCURRENCY, DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
     IndexedArtifactManifestSourceSetting, IndexedArtifactSourceModeSetting,
-    LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_INDEXED_ARTIFACT_GATEWAYS,
-    OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME, OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY,
-    OFFICIAL_POI_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_IPNS_NAME,
-    OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY, PoiArtifactManifestSourceSetting, PoiReadSourceSetting,
-    WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION,
-    WakuDirectPeerSetting, WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
+    LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME, MAX_AUTO_LOCK_TIMEOUT_SECS, MIN_AUTO_LOCK_TIMEOUT_SECS,
+    OFFICIAL_INDEXED_ARTIFACT_GATEWAYS, OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME,
+    OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY, OFFICIAL_POI_ARTIFACT_GATEWAYS,
+    OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
+    PoiArtifactManifestSourceSetting, PoiReadSourceSetting, WALLET_SETTINGS_KEY,
+    WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WakuDirectPeerSetting,
+    WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
     build_effective_chain_configs, build_effective_token_registry, decode_wallet_settings,
     decode_wallet_ui_state, encode_wallet_settings, load_wallet_settings, load_wallet_ui_state,
     save_wallet_settings, save_wallet_ui_state, should_show_chain_deployment_metadata_settings,
@@ -60,9 +62,31 @@ struct ReleasedV1WalletSettingsWire {
     broadcaster: super::PublicBroadcasterSettings,
     tokens: super::TokenSettings,
     gas: super::GasSettings,
-    runtime: super::RuntimeSettings,
+    runtime: ReleasedV1RuntimeSettingsWire,
     waku: super::WakuSettings,
     walletconnect: super::WalletConnectSettings,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReleasedV1RuntimeSettingsWire {
+    public_balance_refresh_interval_secs: u64,
+}
+
+impl Default for ReleasedV1RuntimeSettingsWire {
+    fn default() -> Self {
+        Self {
+            public_balance_refresh_interval_secs: crate::public_balance_refresh_interval_secs(),
+        }
+    }
+}
+
+fn released_v1_settings_payload() -> Vec<u8> {
+    let settings = ReleasedV1WalletSettingsWire {
+        version: 1,
+        ..ReleasedV1WalletSettingsWire::default()
+    };
+    rmp_serde::to_vec_named(&settings).expect("encode released v1 settings")
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -120,6 +144,10 @@ fn missing_settings_synthesizes_official_indexed_artifact_defaults() {
 
     let settings = load_wallet_settings(&store).expect("load settings");
     assert_eq!(settings.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(
+        settings.runtime.auto_lock_timeout_secs,
+        Some(DEFAULT_AUTO_LOCK_TIMEOUT_SECS)
+    );
     assert_eq!(
         settings.poi.read_source,
         PoiReadSourceSetting::IndexedArtifacts
@@ -181,7 +209,6 @@ fn exact_legacy_official_identity_migrates_in_place() {
     put_unmigrated_settings(&store, &legacy_official_settings());
 
     let migrated = load_wallet_settings(&store).expect("load and migrate settings");
-    assert_eq!(migrated.version, 1);
     assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
     assert_eq!(
         migrated.poi.artifact.publisher_pubkey,
@@ -322,32 +349,12 @@ fn migrated_official_settings_survive_database_restart() {
 }
 
 #[test]
-fn frozen_released_v1_decoder_can_reset_migrated_settings_before_unlock() {
-    let migrated_payload =
-        encode_wallet_settings(&WalletSettings::default()).expect("encode migrated v1 settings");
+fn frozen_released_v1_decoder_rejects_current_settings() {
+    let current_payload =
+        encode_wallet_settings(&WalletSettings::default()).expect("encode current settings");
 
-    let mut released: ReleasedV1WalletSettingsWire = rmp_serde::from_slice(&migrated_payload)
-        .expect("released v1 decoder accepts migrated record");
-    assert_eq!(released.version, 1);
-    released.poi.artifact.publisher_pubkey = OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY.to_string();
-    released.poi.artifact.manifest_source = ReleasedV1PoiArtifactManifestSourceWire::IpnsName(
-        LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string(),
-    );
-    released.poi.artifact.gateway_urls = OFFICIAL_POI_ARTIFACT_GATEWAYS
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    released.poi.artifact.max_manifest_age_secs = None;
-    let restored_payload = rmp_serde::to_vec_named(&released).expect("released v1 reset persists");
-    let restored = decode_wallet_settings(&restored_payload).expect("decode released reset record");
-
-    assert_eq!(restored.version, WALLET_SETTINGS_VERSION);
-    assert_eq!(
-        restored.poi.artifact.manifest_source,
-        PoiArtifactManifestSourceSetting::IpnsName(
-            LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string()
-        )
-    );
+    rmp_serde::from_slice::<ReleasedV1WalletSettingsWire>(&current_payload)
+        .expect_err("released v1 decoder rejects the version 2 auto-lock field");
 }
 
 #[test]
@@ -397,6 +404,115 @@ fn settings_roundtrip_through_local_db() {
     save_wallet_settings(&store, &settings).expect("save settings");
     let loaded = load_wallet_settings(&store).expect("load settings");
     assert_eq!(loaded, settings);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn version_1_settings_migrate_and_rewrite_with_auto_lock_default() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let released_payload = released_v1_settings_payload();
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &released_payload)
+        .expect("store released v1 settings");
+
+    let migrated = load_wallet_settings(&store).expect("migrate released v1 settings");
+    assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(
+        migrated.runtime.auto_lock_timeout_secs,
+        Some(DEFAULT_AUTO_LOCK_TIMEOUT_SECS)
+    );
+    assert_eq!(
+        migrated.poi.artifact.manifest_source,
+        PoiArtifactManifestSourceSetting::IpnsName(OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string())
+    );
+
+    let rewritten = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read rewritten settings")
+        .expect("rewritten settings record");
+    assert_ne!(rewritten, released_payload);
+    let rewritten = decode_wallet_settings(&rewritten).expect("decode rewritten settings");
+    assert_eq!(
+        rewritten.poi.artifact.manifest_source,
+        PoiArtifactManifestSourceSetting::IpnsName(OFFICIAL_POI_ARTIFACT_IPNS_NAME.to_string())
+    );
+    assert_eq!(rewritten, migrated);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn current_auto_lock_timeout_and_disabled_policy_are_preserved() {
+    for policy in [Some(30 * 60), None] {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let mut settings = WalletSettings::default();
+        settings.runtime.auto_lock_timeout_secs = policy;
+        save_wallet_settings(&store, &settings).expect("save current settings");
+        let persisted = store
+            .get_app_settings_record(WALLET_SETTINGS_KEY)
+            .expect("read current settings")
+            .expect("current settings record");
+
+        let loaded = load_wallet_settings(&store).expect("load current settings");
+        assert_eq!(loaded.runtime.auto_lock_timeout_secs, policy);
+        assert_eq!(
+            store
+                .get_app_settings_record(WALLET_SETTINGS_KEY)
+                .expect("reread current settings")
+                .expect("current settings record"),
+            persisted,
+            "loading current settings must not rewrite the record"
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+#[test]
+fn stored_invalid_settings_load_for_repair_but_cannot_be_saved() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut settings = WalletSettings::default();
+    settings.runtime.auto_lock_timeout_secs = Some(MIN_AUTO_LOCK_TIMEOUT_SECS - 1);
+    settings.walletconnect.project_id_override = Some("preserved-project-id".to_string());
+    let payload = rmp_serde::to_vec_named(&settings).expect("encode invalid settings fixture");
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &payload)
+        .expect("store invalid settings fixture");
+
+    let loaded = load_wallet_settings(&store).expect("load invalid settings for repair");
+    assert_eq!(loaded, settings);
+    assert_eq!(
+        loaded.walletconnect.project_id_override.as_deref(),
+        Some("preserved-project-id")
+    );
+    assert!(loaded.validate().is_err());
+    let error =
+        save_wallet_settings(&store, &loaded).expect_err("invalid settings rejected on save");
+    assert!(matches!(error, WalletSettingsError::Validation(_)));
+    assert_eq!(
+        store
+            .get_app_settings_record(WALLET_SETTINGS_KEY)
+            .expect("reread invalid settings")
+            .expect("invalid settings record"),
+        payload,
+        "loading and rejected saving must not rewrite a current-version record"
+    );
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -535,6 +651,43 @@ fn validation_rejects_ambiguous_proxy_and_disabled_chains() {
             .iter()
             .any(|message| message.contains("at least one supported chain"))
     );
+}
+
+#[test]
+fn auto_lock_settings_default_disabled_and_bounds_are_validated() {
+    let mut settings = WalletSettings::default();
+    assert_eq!(
+        settings.runtime.auto_lock_timeout_secs,
+        Some(DEFAULT_AUTO_LOCK_TIMEOUT_SECS)
+    );
+    assert!(
+        AUTO_LOCK_TIMEOUT_PRESETS_SECS.contains(&DEFAULT_AUTO_LOCK_TIMEOUT_SECS),
+        "the default must be exposed as a Settings preset"
+    );
+
+    settings.runtime.auto_lock_timeout_secs = None;
+    settings.validate().expect("Disabled is valid");
+
+    for timeout in [MIN_AUTO_LOCK_TIMEOUT_SECS, MAX_AUTO_LOCK_TIMEOUT_SECS] {
+        settings.runtime.auto_lock_timeout_secs = Some(timeout);
+        settings.validate().expect("timeout bound is valid");
+    }
+
+    for timeout in [
+        MIN_AUTO_LOCK_TIMEOUT_SECS - 1,
+        MAX_AUTO_LOCK_TIMEOUT_SECS + 1,
+    ] {
+        settings.runtime.auto_lock_timeout_secs = Some(timeout);
+        let error = settings
+            .validate()
+            .expect_err("out-of-range timeout rejected");
+        assert!(
+            error
+                .messages
+                .iter()
+                .any(|message| message.contains("runtime.auto_lock_timeout_secs"))
+        );
+    }
 }
 
 #[test]

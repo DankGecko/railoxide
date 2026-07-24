@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::auto_lock::AutoLockTimestamp;
 use crate::root::chain_load::{
     ChainProgressProjection, InstalledObserverProjection, WalletReadinessDisposition,
     WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, WalletSyncLifecycleCleanupWaitGroup,
@@ -20,6 +21,8 @@ use wallet_ops::{
     WalletSessionStore, WalletSyncTip,
 };
 
+use std::time::Duration;
+
 #[test]
 fn terminal_wallet_readiness_is_not_projected_as_syncing() {
     assert_eq!(
@@ -32,6 +35,129 @@ fn terminal_wallet_readiness_is_not_projected_as_syncing() {
         wallet_readiness_disposition(&WalletReadiness::Shutdown),
         WalletReadinessDisposition::Error(Arc::from("wallet sync session stopped")),
     );
+}
+
+fn observer_progress(current_block: u64) -> InitialCatchUpFingerprint {
+    InitialCatchUpFingerprint::new(
+        Some(SyncProgressUpdate::new(
+            SyncProgressStage::IndexingUtxos,
+            0,
+            current_block,
+            100,
+        )),
+        None,
+    )
+}
+
+#[test]
+fn initial_sync_observation_boundary_tracks_activity_and_first_ready() {
+    let started = AutoLockTimestamp::now();
+    let timeout = Duration::from_mins(1);
+    let mut tracker = InitialSyncActivity::new(1);
+    let mut auto_lock = AutoLockState::new(Some(timeout));
+    auto_lock.arm_after_view_unlock(started);
+
+    assert!(!apply_initial_sync_observation(
+        &mut tracker,
+        &mut auto_lock,
+        true,
+        1,
+        1,
+        InitialSyncObservation::Started,
+        started,
+    ));
+    let progress_at = started + Duration::from_secs(20);
+    assert!(apply_initial_sync_observation(
+        &mut tracker,
+        &mut auto_lock,
+        true,
+        1,
+        1,
+        InitialSyncObservation::Progress(observer_progress(10)),
+        progress_at,
+    ));
+    assert!(!apply_initial_sync_observation(
+        &mut tracker,
+        &mut auto_lock,
+        true,
+        1,
+        1,
+        InitialSyncObservation::Progress(observer_progress(10)),
+        progress_at + Duration::from_secs(10),
+    ));
+    assert!(!apply_initial_sync_observation(
+        &mut tracker,
+        &mut auto_lock,
+        true,
+        1,
+        1,
+        InitialSyncObservation::Error,
+        progress_at + Duration::from_secs(20),
+    ));
+    let ready_at = progress_at + Duration::from_secs(30);
+    assert!(apply_initial_sync_observation(
+        &mut tracker,
+        &mut auto_lock,
+        true,
+        1,
+        1,
+        InitialSyncObservation::Ready,
+        ready_at,
+    ));
+    assert!(!apply_initial_sync_observation(
+        &mut tracker,
+        &mut auto_lock,
+        true,
+        1,
+        1,
+        InitialSyncObservation::Progress(observer_progress(20)),
+        ready_at + Duration::from_secs(10),
+    ));
+    assert_eq!(
+        auto_lock.deadline_status(
+            true,
+            ready_at + timeout.saturating_sub(Duration::from_secs(1)),
+        ),
+        AutoLockDeadlineStatus::Waiting
+    );
+}
+
+#[test]
+fn initial_sync_observation_boundary_resets_wallets_and_tracks_new_chains() {
+    let started = AutoLockTimestamp::now();
+    let mut tracker = InitialSyncActivity::new(1);
+    let mut auto_lock = AutoLockState::new(Some(Duration::from_mins(1)));
+    auto_lock.arm_after_view_unlock(started);
+
+    for (generation, chain_id) in [(1, 1), (1, 137), (2, 1)] {
+        assert!(!apply_initial_sync_observation(
+            &mut tracker,
+            &mut auto_lock,
+            true,
+            generation,
+            chain_id,
+            InitialSyncObservation::Started,
+            started,
+        ));
+        assert!(apply_initial_sync_observation(
+            &mut tracker,
+            &mut auto_lock,
+            true,
+            generation,
+            chain_id,
+            InitialSyncObservation::Progress(observer_progress(10)),
+            started + Duration::from_secs(generation + chain_id),
+        ));
+        assert!(apply_initial_sync_observation(
+            &mut tracker,
+            &mut auto_lock,
+            true,
+            generation,
+            chain_id,
+            InitialSyncObservation::Ready,
+            started + Duration::from_secs(generation + chain_id + 1),
+        ));
+    }
 }
 
 #[test]
