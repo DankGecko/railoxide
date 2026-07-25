@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use eyre::{Result, WrapErr};
 use public_broadcaster_protocol::Payload as FeePayload;
@@ -14,7 +14,7 @@ use waku_relay::client::{
 pub use waku_relay::client::{DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID};
 use waku_relay::msg::ContentTopic;
 
-use broadcaster_monitor::{EventTx, FeeRow, PeerRow, PeerSummary, Shared};
+use broadcaster_monitor::{EventTx, FeeRow, PeerRow, PeerSummary, Shared, publish_revision};
 
 pub const DEFAULT_MAX_PEERS: usize = 10;
 pub const DEFAULT_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
@@ -201,29 +201,65 @@ async fn run_fees_loop(
     events: EventTx,
     mut shutdown: Option<watch::Receiver<bool>>,
 ) {
+    #[allow(clippy::large_enum_variant)]
+    enum LoopEvent {
+        Message(Option<WakuMessage>),
+        PromotePending,
+        Shutdown,
+    }
+
+    let pending_timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(pending_timer);
     loop {
-        let msg = if let Some(shutdown) = shutdown.as_mut() {
+        let pending_deadline = shared.read().next_pending_fee_announcement_deadline();
+        if let Some(deadline) = pending_deadline {
+            pending_timer
+                .as_mut()
+                .reset(tokio::time::Instant::from_std(deadline));
+        }
+
+        let event = if let Some(shutdown) = shutdown.as_mut() {
             tokio::select! {
-                msg = msg_rx.recv() => msg,
+                biased;
                 should_shutdown = shutdown_changed_or_requested(shutdown) => {
                     if should_shutdown {
-                        tracing::debug!("fees subscription worker shutting down");
-                        return;
+                        LoopEvent::Shutdown
+                    } else {
+                        continue;
                     }
-                    continue;
                 }
+                () = pending_timer.as_mut(), if pending_deadline.is_some() => LoopEvent::PromotePending,
+                msg = msg_rx.recv() => LoopEvent::Message(msg),
             }
         } else {
-            msg_rx.recv().await
+            tokio::select! {
+                msg = msg_rx.recv() => LoopEvent::Message(msg),
+                () = pending_timer.as_mut(), if pending_deadline.is_some() => LoopEvent::PromotePending,
+            }
         };
-        let Some(msg) = msg else {
-            break;
-        };
-        let Some(chain_id) = extract_fees_chain_id(&msg.content_topic) else {
-            tracing::trace!(topic = %msg.content_topic, "ignoring non-fees content topic");
-            continue;
-        };
-        handle_fees_message(chain_id, &msg.payload, &shared, &events);
+
+        match event {
+            LoopEvent::Message(Some(msg)) => {
+                let Some(chain_id) = extract_fees_chain_id(&msg.content_topic) else {
+                    tracing::trace!(topic = %msg.content_topic, "ignoring non-fees content topic");
+                    continue;
+                };
+                handle_fees_message(chain_id, &msg.payload, &shared, &events);
+            }
+            LoopEvent::Message(None) => break,
+            LoopEvent::PromotePending => {
+                let revisions = shared
+                    .write()
+                    .promote_due_fee_announcements(Instant::now(), SystemTime::now());
+                for revision in revisions {
+                    publish_revision(&events, revision);
+                }
+            }
+            LoopEvent::Shutdown => {
+                tracing::debug!("fees subscription worker shutting down");
+                return;
+            }
+        }
     }
     tracing::warn!("fees subscription channel closed");
 }
@@ -235,6 +271,24 @@ pub fn handle_fees_message(
     payload: &[u8],
     shared: &Shared,
     events: &EventTx,
+) -> usize {
+    handle_fees_message_at(
+        chain_id,
+        payload,
+        shared,
+        events,
+        SystemTime::now(),
+        Instant::now(),
+    )
+}
+
+fn handle_fees_message_at(
+    chain_id: u64,
+    payload: &[u8],
+    shared: &Shared,
+    events: &EventTx,
+    wall_now: SystemTime,
+    monotonic_now: Instant,
 ) -> usize {
     let payload: FeePayload = match serde_json::from_slice(payload) {
         Ok(p) => p,
@@ -262,11 +316,10 @@ pub fn handle_fees_message(
         .map(|key| Arc::from(key.as_str()))
         .collect();
     let fee_expiration = SystemTime::UNIX_EPOCH + Duration::from_millis(body.fee_expiration);
-    let now = SystemTime::now();
-
-    let mut produced = 0;
-    for (token_address, fee) in body.fees {
-        let row = FeeRow {
+    let rows = body
+        .fees
+        .into_iter()
+        .map(|(token_address, fee)| FeeRow {
             chain_id,
             railgun_address: railgun_address.clone(),
             token_address,
@@ -280,14 +333,23 @@ pub fn handle_fees_message(
             relay_adapt_7702: body.relay_adapt_7702,
             required_poi_list_keys: required_poi_list_keys.clone(),
             identifier: identifier.clone(),
-            last_seen: now,
+            last_seen: wall_now,
             reliability: body.reliability,
-        };
-        let rev = shared.write().upsert_fee(row);
-        let _ = events.send(rev);
-        produced += 1;
+        })
+        .collect();
+    let outcome = shared.write().admit_fee_announcement(
+        chain_id,
+        &railgun_address,
+        fee_expiration,
+        wall_now,
+        monotonic_now,
+        signature_valid,
+        rows,
+    );
+    if let Some(rev) = outcome.revision() {
+        publish_revision(events, rev);
     }
-    produced
+    outcome.visible_rows()
 }
 
 /// Extract the chain id from a `/railgun/v2/0-{chain_id}-fees/json` topic.
@@ -349,7 +411,7 @@ where
 fn publish_peer_summary(waku: &Client, shared: &Shared, events: &EventTx) {
     let (summary, rows) = peer_state_for_client(waku);
     if let Some(rev) = shared.write().set_peers(summary, rows) {
-        let _ = events.send(rev);
+        publish_revision(events, rev);
     }
 }
 
@@ -404,7 +466,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use alloy::primitives::address;
+    use alloy::primitives::{U256, address};
     use alloy::uint;
     use broadcaster_monitor::{event_channel, shared};
     use public_broadcaster_protocol::Body as FeeBody;
@@ -669,5 +731,190 @@ mod tests {
         assert_eq!(row.required_poi_list_keys, vec![Arc::from("poi-list")]);
         assert_eq!(row.identifier.as_deref(), Some("broadcaster-one"));
         assert!(!row.signature_valid);
+    }
+
+    #[test]
+    fn handle_fees_message_emits_one_revision_for_all_token_rows() {
+        const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+
+        let body = FeeBody {
+            fees: HashMap::from([
+                (
+                    address!("0000000000000000000000000000000000000001"),
+                    uint!(42_U256),
+                ),
+                (
+                    address!("0000000000000000000000000000000000000002"),
+                    uint!(84_U256),
+                ),
+            ]),
+            fee_expiration: 1_900_000_000_000,
+            fees_id: "fees-id".to_string(),
+            railgun_address: RAILGUN_ADDRESS.into(),
+            available_wallets: 3,
+            version: "8.2.3".to_string(),
+            relay_adapt: address!("0000000000000000000000000000000000000003"),
+            relay_adapt_7702: None,
+            required_poi_list_keys: Vec::new(),
+            reliability: 0.91,
+            identifier: None,
+        };
+        let payload = FeePayload {
+            data: serde_json::to_vec(&body).expect("serialize fees body"),
+            signature: vec![0; 64],
+        };
+        let payload = serde_json::to_vec(&payload).expect("serialize fees payload");
+        let shared = shared();
+        let (tx, rx) = event_channel(16);
+
+        assert_eq!(handle_fees_message(1, &payload, &shared, &tx), 2);
+        assert_eq!(shared.read().fee_rows().len(), 2);
+        assert_eq!(shared.read().rev(), 1);
+        assert_eq!(*rx.borrow(), 1);
+    }
+
+    #[test]
+    fn handle_fees_message_skips_unverified_replacement_after_verified_generation() {
+        const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+
+        let now = SystemTime::now();
+        let expiration = now + Duration::from_mins(5);
+        let broadcaster: Arc<str> = Arc::from(RAILGUN_ADDRESS);
+        let token = address!("0000000000000000000000000000000000000001");
+        let cached_row = FeeRow {
+            chain_id: 1,
+            railgun_address: broadcaster.clone(),
+            token_address: token,
+            fee: uint!(42_U256),
+            signature_valid: true,
+            fees_id: Arc::from("cached-fees-id"),
+            fee_expiration: expiration,
+            available_wallets: 3,
+            version: Arc::from("8.2.3"),
+            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt_7702: None,
+            required_poi_list_keys: Vec::new(),
+            identifier: None,
+            last_seen: now,
+            reliability: 0.91,
+        };
+        let shared = shared();
+        shared.write().admit_fee_announcement(
+            1,
+            &broadcaster,
+            expiration,
+            now,
+            Instant::now(),
+            true,
+            vec![cached_row],
+        );
+
+        let body = FeeBody {
+            fees: HashMap::from([(token, uint!(84_U256))]),
+            fee_expiration: 1_900_000_000_000,
+            fees_id: "replacement-fees-id".to_string(),
+            railgun_address: RAILGUN_ADDRESS.into(),
+            available_wallets: 3,
+            version: "8.2.3".to_string(),
+            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt_7702: None,
+            required_poi_list_keys: Vec::new(),
+            reliability: 0.91,
+            identifier: None,
+        };
+        let payload = FeePayload {
+            data: serde_json::to_vec(&body).expect("serialize fees body"),
+            signature: vec![0; 64],
+        };
+        let payload = serde_json::to_vec(&payload).expect("serialize fees payload");
+        let (tx, rx) = event_channel(16);
+
+        assert_eq!(handle_fees_message(1, &payload, &shared, &tx), 0);
+        let rows = shared.read().fee_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fees_id.as_ref(), "cached-fees-id");
+        assert_eq!(*rx.borrow(), 0);
+    }
+
+    #[test]
+    fn monitor_revisions_never_regress() {
+        let (events, rx) = event_channel(16);
+        publish_revision(&events, 2);
+        publish_revision(&events, 1);
+        assert_eq!(*rx.borrow(), 2);
+    }
+
+    #[tokio::test]
+    async fn fees_worker_promotes_pending_and_then_shuts_down_promptly() {
+        let wall = SystemTime::now();
+        let monotonic = Instant::now()
+            .checked_sub(Duration::from_secs(41))
+            .expect("test monotonic timestamp supports subtraction");
+        let expiration = wall + Duration::from_mins(2);
+        let broadcaster: Arc<str> = Arc::from("0zk-worker");
+        let token = address!("0000000000000000000000000000000000000001");
+        let row = |fee: u64,
+                   fees_id: &'static str,
+                   received_at: SystemTime,
+                   fee_expiration: SystemTime| FeeRow {
+            chain_id: 1,
+            railgun_address: broadcaster.clone(),
+            token_address: token,
+            fee: U256::from(fee),
+            signature_valid: true,
+            fees_id: Arc::from(fees_id),
+            fee_expiration,
+            available_wallets: 1,
+            version: Arc::from("8.2.3"),
+            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt_7702: None,
+            required_poi_list_keys: Vec::new(),
+            identifier: None,
+            last_seen: received_at,
+            reliability: 1.0,
+        };
+        let shared = shared();
+        shared.write().admit_fee_announcement(
+            1,
+            &broadcaster,
+            expiration,
+            wall,
+            monotonic,
+            true,
+            vec![row(100, "active", wall, expiration)],
+        );
+        let pending_wall = wall + Duration::from_secs(1);
+        let pending_expiration = expiration + Duration::from_secs(1);
+        shared.write().admit_fee_announcement(
+            1,
+            &broadcaster,
+            pending_expiration,
+            pending_wall,
+            monotonic + Duration::from_secs(1),
+            true,
+            vec![row(200, "pending", pending_wall, pending_expiration)],
+        );
+
+        let (_msg_tx, msg_rx) = mpsc::channel(1);
+        let (events, mut event_rx) = event_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker_shared = shared.clone();
+        let worker = tokio::spawn(async move {
+            run_fees_loop(msg_rx, worker_shared, events, Some(shutdown_rx)).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), event_rx.changed())
+            .await
+            .expect("pending fee promotion timed out")
+            .expect("fee event channel closed");
+        assert_eq!(shared.read().fee_rows()[0].fees_id.as_ref(), "pending");
+
+        shutdown_tx
+            .send(true)
+            .expect("request fees worker shutdown");
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("fees worker shutdown timed out")
+            .expect("fees worker task failed");
     }
 }

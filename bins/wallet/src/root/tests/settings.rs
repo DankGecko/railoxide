@@ -120,6 +120,30 @@ fn utxo_table_focus_is_activity_scoped() {
 }
 
 #[test]
+fn utxo_age_refresh_is_visible_activity_scoped() {
+    assert!(!should_refresh_utxo_ages(
+        Activity::Wallet,
+        WalletTab::Private,
+        true
+    ));
+    assert!(!should_refresh_utxo_ages(
+        Activity::Broadcaster,
+        WalletTab::Activity,
+        true
+    ));
+    assert!(!should_refresh_utxo_ages(
+        Activity::Wallet,
+        WalletTab::Activity,
+        false
+    ));
+    assert!(should_refresh_utxo_ages(
+        Activity::Wallet,
+        WalletTab::Activity,
+        true
+    ));
+}
+
+#[test]
 fn startup_settings_load_defaults_without_persisting() {
     let root = temp_wallet_db_root("startup-defaults");
     let store = DesktopVaultStore::open(root.clone()).expect("open wallet store");

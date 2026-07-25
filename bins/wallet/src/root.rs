@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use broadcaster_monitor::{EventRx, EventTx, Shared};
+use broadcaster_monitor::{EventRx, EventTx, Shared, publish_revision};
 use broadcaster_monitor_waku::{RelayNetworkMode, WakuMonitorConfig, spawn_workers_until_shutdown};
 use gpui::{AppContext, Context, Entity, Focusable, Pixels, SharedString, Window, px};
 use gpui_component::{
@@ -134,14 +134,22 @@ use ui_helpers::{
     dialog_max_height, labeled_field, rgb_with_alpha, scrollable_dialog_content,
     secondary_dialog_content_width, token_label_row,
 };
-use utxo::{BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table};
+use utxo::{
+    BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table, should_refresh_utxo_ages,
+};
 use vault::{VaultState, WalletOption, WalletSetupMode, vault_error_kind};
 use wallet_header::{ChainSelectItem, WalletSelectItem};
 
 #[cfg(test)]
 use broadcaster_picker::{
-    BroadcasterChoice, broadcaster_candidate_estimated_fee_amount_for_estimate,
-    broadcaster_choice_supported_by_candidates,
+    BroadcasterChoice, BroadcasterPickerEntry, BroadcasterPickerFeeEstimateRetryState,
+    BroadcasterPickerFeeStatus, BroadcasterPickerGroupKey, BroadcasterPickerRow,
+    BroadcasterPickerTier, BroadcasterPickerViewMode,
+    broadcaster_candidate_estimated_fee_amount_for_estimate,
+    broadcaster_choice_supported_by_candidates, broadcaster_picker_fee_estimate_retry_delay,
+    broadcaster_picker_fee_status, broadcaster_picker_fee_status_detail,
+    broadcaster_picker_fee_text_colors, broadcaster_picker_scroll_hint_visible,
+    group_minimum_estimated_fee_labels, project_broadcaster_picker_entries,
     should_preserve_estimate_after_broadcaster_policy_change,
 };
 #[cfg(test)]
@@ -295,7 +303,6 @@ const SIDEBAR_AUTO_COLLAPSE_WIDTH: Pixels = px(900.0);
 const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
-const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH: Pixels = px(560.0);
 const PUBLIC_ACCOUNT_DIALOG_WIDTH: Pixels = px(460.0);
@@ -546,8 +553,9 @@ fn stop_waku_runtime(
     };
     let _ = runtime.worker_shutdown.send(true);
     drop(runtime);
-    let rev = monitor_state.write().clear();
-    let _ = monitor_event_tx.send(rev);
+    if let Some(rev) = monitor_state.write().clear() {
+        publish_revision(monitor_event_tx, rev);
+    }
     true
 }
 
@@ -562,8 +570,9 @@ fn complete_waku_worker_generation(
 ) -> WakuWorkerCompletionAction {
     if *stopping_generation == Some(generation) {
         *stopping_generation = None;
-        let rev = monitor_state.write().clear();
-        let _ = monitor_event_tx.send(rev);
+        if let Some(rev) = monitor_state.write().clear() {
+            publish_revision(monitor_event_tx, rev);
+        }
         return WakuWorkerCompletionAction::FinalizedStop {
             restart: view_unlocked,
         };
@@ -1605,12 +1614,14 @@ impl WalletRoot {
                     .await;
                 if this
                     .update(cx, |root, cx| {
-                        if matches!(
-                            root.chain_states.get(&root.selected_chain),
-                            Some(state) if state.snapshot().is_some()
+                        if should_refresh_utxo_ages(
+                            root.active_activity,
+                            root.active_wallet_tab,
+                            root.chain_states
+                                .get(&root.selected_chain)
+                                .is_some_and(|state| state.snapshot().is_some()),
                         ) {
                             root.utxo_table.update(cx, |_table, cx| cx.notify());
-                            cx.notify();
                         }
                     })
                     .is_err()

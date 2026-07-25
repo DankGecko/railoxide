@@ -837,17 +837,29 @@ impl WalletRoot {
         allow: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, fee_token, choice, generating, current_allow, favorites_only)) =
-            self.send_forms.get(&key).map(|form| {
-                (
-                    form.asset.chain_id,
-                    form.selected_fee_token,
-                    form.broadcaster_choice.clone(),
-                    form.generating,
-                    form.allow_suspicious_broadcasters,
-                    form.favorites_only_broadcasters,
-                )
-            })
+        let Some((
+            chain_id,
+            fee_token,
+            choice,
+            generating,
+            current_allow,
+            favorites_only,
+            resolved_random_broadcaster,
+            random_estimate_in_flight,
+        )) = self.send_forms.get(&key).map(|form| {
+            (
+                form.asset.chain_id,
+                form.selected_fee_token,
+                form.broadcaster_choice.clone(),
+                form.generating,
+                form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
+                form.cost_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.broadcaster.railgun_address.clone()),
+                form.cost_estimate_pending || form.estimating_cost,
+            )
+        })
         else {
             return;
         };
@@ -863,8 +875,13 @@ impl WalletRoot {
             favorites_only,
             policy,
         );
-        let preserve_estimate =
-            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let preserve_estimate = should_preserve_estimate_after_broadcaster_policy_change(
+            &choice,
+            resolved_random_broadcaster.as_deref(),
+            random_estimate_in_flight,
+            &candidates,
+            policy,
+        );
         let reset_specific =
             matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
         let Some(form) = self.send_forms.get_mut(&key) else {
@@ -874,7 +891,7 @@ impl WalletRoot {
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }
-        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        let should_reestimate = !preserve_estimate;
         if should_reestimate {
             form.error = None;
             form.result = None;
@@ -884,8 +901,10 @@ impl WalletRoot {
         }
         cx.notify();
         if should_reestimate {
+            self.invalidate_broadcaster_picker_fee_estimate(DeliveryFormKind::Send, key, cx);
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            self.schedule_broadcaster_picker_fee_estimate(DeliveryFormKind::Send, key, cx);
         }
     }
 
@@ -910,17 +929,29 @@ impl WalletRoot {
         enabled: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, fee_token, choice, generating, allow_suspicious, current_enabled)) =
-            self.send_forms.get(&key).map(|form| {
-                (
-                    form.asset.chain_id,
-                    form.selected_fee_token,
-                    form.broadcaster_choice.clone(),
-                    form.generating,
-                    form.allow_suspicious_broadcasters,
-                    form.favorites_only_broadcasters,
-                )
-            })
+        let Some((
+            chain_id,
+            fee_token,
+            choice,
+            generating,
+            allow_suspicious,
+            current_enabled,
+            resolved_random_broadcaster,
+            random_estimate_in_flight,
+        )) = self.send_forms.get(&key).map(|form| {
+            (
+                form.asset.chain_id,
+                form.selected_fee_token,
+                form.broadcaster_choice.clone(),
+                form.generating,
+                form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
+                form.cost_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.broadcaster.railgun_address.clone()),
+                form.cost_estimate_pending || form.estimating_cost,
+            )
+        })
         else {
             return;
         };
@@ -931,8 +962,13 @@ impl WalletRoot {
         let candidates = self.current_public_broadcaster_candidates(
             chain_id, fee_token, false, false, enabled, policy,
         );
-        let preserve_estimate =
-            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let preserve_estimate = should_preserve_estimate_after_broadcaster_policy_change(
+            &choice,
+            resolved_random_broadcaster.as_deref(),
+            random_estimate_in_flight,
+            &candidates,
+            policy,
+        );
         let reset_specific =
             matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
         let Some(form) = self.send_forms.get_mut(&key) else {
@@ -942,7 +978,7 @@ impl WalletRoot {
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }
-        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        let should_reestimate = !preserve_estimate;
         if should_reestimate {
             form.error = None;
             form.result = None;
@@ -952,8 +988,10 @@ impl WalletRoot {
         }
         cx.notify();
         if should_reestimate {
+            self.invalidate_broadcaster_picker_fee_estimate(DeliveryFormKind::Send, key, cx);
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            self.schedule_broadcaster_picker_fee_estimate(DeliveryFormKind::Send, key, cx);
         }
     }
 
@@ -1740,6 +1778,8 @@ impl WalletRoot {
             generating,
             current_allow,
             favorites_only,
+            resolved_random_broadcaster,
+            random_estimate_in_flight,
         )) = self.unshield_forms.get(&key).map(|form| {
             (
                 form.asset.chain_id,
@@ -1750,6 +1790,10 @@ impl WalletRoot {
                 form.generating,
                 form.allow_suspicious_broadcasters,
                 form.favorites_only_broadcasters,
+                form.cost_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.broadcaster.railgun_address.clone()),
+                form.cost_estimate_pending || form.estimating_cost,
             )
         })
         else {
@@ -1767,8 +1811,13 @@ impl WalletRoot {
             favorites_only,
             policy,
         );
-        let preserve_estimate =
-            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let preserve_estimate = should_preserve_estimate_after_broadcaster_policy_change(
+            &choice,
+            resolved_random_broadcaster.as_deref(),
+            random_estimate_in_flight,
+            &candidates,
+            policy,
+        );
         let reset_specific =
             matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
         let Some(form) = self.unshield_forms.get_mut(&key) else {
@@ -1778,7 +1827,7 @@ impl WalletRoot {
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }
-        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        let should_reestimate = !preserve_estimate;
         if should_reestimate {
             form.error = None;
             form.result = None;
@@ -1788,8 +1837,10 @@ impl WalletRoot {
         }
         cx.notify();
         if should_reestimate {
+            self.invalidate_broadcaster_picker_fee_estimate(DeliveryFormKind::Unshield, key, cx);
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+            self.schedule_broadcaster_picker_fee_estimate(DeliveryFormKind::Unshield, key, cx);
         }
     }
 
@@ -1808,6 +1859,8 @@ impl WalletRoot {
             generating,
             allow_suspicious,
             current_enabled,
+            resolved_random_broadcaster,
+            random_estimate_in_flight,
         )) = self.unshield_forms.get(&key).map(|form| {
             (
                 form.asset.chain_id,
@@ -1818,6 +1871,10 @@ impl WalletRoot {
                 form.generating,
                 form.allow_suspicious_broadcasters,
                 form.favorites_only_broadcasters,
+                form.cost_estimate
+                    .as_ref()
+                    .map(|estimate| estimate.broadcaster.railgun_address.clone()),
+                form.cost_estimate_pending || form.estimating_cost,
             )
         })
         else {
@@ -1835,8 +1892,13 @@ impl WalletRoot {
             enabled,
             policy,
         );
-        let preserve_estimate =
-            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let preserve_estimate = should_preserve_estimate_after_broadcaster_policy_change(
+            &choice,
+            resolved_random_broadcaster.as_deref(),
+            random_estimate_in_flight,
+            &candidates,
+            policy,
+        );
         let reset_specific =
             matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
         let Some(form) = self.unshield_forms.get_mut(&key) else {
@@ -1846,7 +1908,7 @@ impl WalletRoot {
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }
-        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        let should_reestimate = !preserve_estimate;
         if should_reestimate {
             form.error = None;
             form.result = None;
@@ -1856,8 +1918,10 @@ impl WalletRoot {
         }
         cx.notify();
         if should_reestimate {
+            self.invalidate_broadcaster_picker_fee_estimate(DeliveryFormKind::Unshield, key, cx);
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+            self.schedule_broadcaster_picker_fee_estimate(DeliveryFormKind::Unshield, key, cx);
         }
     }
 

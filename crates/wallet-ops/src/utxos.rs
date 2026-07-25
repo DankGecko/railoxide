@@ -102,17 +102,26 @@ impl UtxoOutput {
         if value.is_zero() {
             return None;
         }
-        Some(Utxo::new(
-            Note::new_unshield(Address::ZERO, token, value),
-            self.tree,
-            self.position,
-            UtxoSource {
+        // Max-spendable selection only reads the note token/value and tree/position.
+        // Avoid Utxo::new here because it computes two unused Poseidon commitments.
+        Some(Utxo {
+            note: Note::new_unshield(Address::ZERO, token, value),
+            tree: self.tree,
+            position: self.position,
+            source: UtxoSource {
                 tx_hash: FixedBytes::ZERO,
                 block_number: self.source_block_number,
                 block_timestamp: self.source_block_timestamp,
             },
-            UtxoCommitmentKind::Transact,
-        ))
+            poi: UtxoPoiMetadata {
+                commitment_kind: UtxoCommitmentKind::Transact,
+                commitment: FixedBytes::ZERO,
+                npk: FixedBytes::ZERO,
+                blinded_commitment: FixedBytes::ZERO,
+                statuses: BTreeMap::new(),
+                refreshed_at: None,
+            },
+        })
     }
 }
 

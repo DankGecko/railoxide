@@ -130,9 +130,9 @@ pub(in crate::root) fn render_public_broadcaster_settings(
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(app_muted_text("Allow suspicious broadcasters"))
+                        .child(app_muted_text("Allow out-of-range fees"))
                         .child(cost_estimate_detail_text(
-                            "Suspicious broadcasters advertise fees outside the anchor range.",
+                            "Allow broadcaster fees outside the configured anchor range.",
                         ))
                         .when(!generating, |this| {
                             this.on_mouse_down(MouseButton::Left, move |_, _window, cx| {

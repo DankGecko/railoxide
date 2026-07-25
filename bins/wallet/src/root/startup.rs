@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use broadcaster_monitor::{EventRx, EventTx, Shared};
+use broadcaster_monitor::{EventRx, EventTx, Shared, publish_revision};
 use broadcaster_monitor_waku::{RelayNetworkConfig, WakuMonitorConfig, WakuMonitorDirectPeer};
 use eyre::WrapErr;
 use gpui::{
@@ -448,8 +448,9 @@ impl WalletStartupRoot {
         self.tor_reset_error = None;
         self.tor_bootstrap_recovery_available = false;
         self.progress = WalletNetworkProgress::initial();
-        let rev = self.monitor_state.write().clear();
-        let _ = self.event_tx.send(rev);
+        if let Some(rev) = self.monitor_state.write().clear() {
+            publish_revision(&self.event_tx, rev);
+        }
         let (progress_tx, progress_rx) = watch::channel(self.progress.clone());
         let network_context = reusable_http.map_or(StartupNetworkContext::Build, |http| {
             StartupNetworkContext::Reuse(Box::new(http))

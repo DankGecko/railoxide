@@ -422,6 +422,21 @@ fn max_amount_from_outputs_uses_planner_batched_selection() {
 }
 
 #[test]
+fn max_amount_from_outputs_does_not_reconstruct_display_commitments() {
+    let token = address(0x11);
+    let (mut outputs, _) = utxo_outputs_from_utxos(vec![utxo(token, 5, 0, 1)]);
+    outputs[0].commitment = "not-a-commitment".to_string();
+    outputs[0].npk = "not-an-npk".to_string();
+    outputs[0].blinded_commitment = "not-a-blinded-commitment".to_string();
+
+    assert_eq!(max_send_amount_from_outputs(&outputs, token), uint!(5_U256));
+    assert_eq!(
+        max_unshield_amount_from_outputs(&outputs, token),
+        uint!(5_U256)
+    );
+}
+
+#[test]
 fn max_amount_from_outputs_excludes_non_poi_verified_utxos() {
     let token = address(0x11);
     let mut valid = utxo(token, 5, 0, 1);

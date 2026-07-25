@@ -19,7 +19,7 @@ use wallet_ops::{
     select_public_broadcaster_with_policy_and_trust, settings::EffectiveTokenRegistry,
 };
 
-use super::broadcaster_picker::broadcaster_candidate_label;
+use super::broadcaster_picker::{BroadcasterPickerFeeEstimateContext, broadcaster_candidate_label};
 use super::private_action::{
     delivery_element_id, native_top_up_request_from_plan,
     send_public_broadcaster_estimate_input_error, unshield_public_broadcaster_estimate_input_error,
@@ -652,17 +652,29 @@ impl WalletRoot {
                 }
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
-                match result {
+                let picker_context = match result {
                     Ok(estimate) => {
+                        let context = BroadcasterPickerFeeEstimateContext::from_estimate(&estimate);
                         form.error = None;
                         form.cost_estimate = Some(estimate);
+                        Some(context)
                     }
                     Err(error) => {
                         form.cost_estimate = None;
                         form.error = Some(Arc::from(format_report_chain(&error)));
+                        None
                     }
+                };
+                if let Some(context) = picker_context {
+                    root.adopt_broadcaster_picker_fee_estimate(
+                        DeliveryFormKind::Send,
+                        key,
+                        context,
+                        cx,
+                    );
+                } else {
+                    cx.notify();
                 }
-                cx.notify();
             });
         })
         .detach();
@@ -825,17 +837,29 @@ impl WalletRoot {
                 }
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
-                match result {
+                let picker_context = match result {
                     Ok(estimate) => {
+                        let context = BroadcasterPickerFeeEstimateContext::from_estimate(&estimate);
                         form.error = None;
                         form.cost_estimate = Some(estimate);
+                        Some(context)
                     }
                     Err(error) => {
                         form.cost_estimate = None;
                         form.error = Some(Arc::from(format_report_chain(&error)));
+                        None
                     }
+                };
+                if let Some(context) = picker_context {
+                    root.adopt_broadcaster_picker_fee_estimate(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        context,
+                        cx,
+                    );
+                } else {
+                    cx.notify();
                 }
-                cx.notify();
             });
         })
         .detach();

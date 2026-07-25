@@ -418,16 +418,43 @@ fn unsupported_specific_broadcaster_is_detected_for_fee_token_change() {
     ));
     assert!(should_preserve_estimate_after_broadcaster_policy_change(
         &choice,
+        None,
+        false,
+        &candidates,
+        policy
+    ));
+    assert!(should_preserve_estimate_after_broadcaster_policy_change(
+        &BroadcasterChoice::Random,
+        Some(&candidates[0].railgun_address),
+        false,
         &candidates,
         policy
     ));
     assert!(!should_preserve_estimate_after_broadcaster_policy_change(
         &BroadcasterChoice::Random,
+        Some(&candidates[0].railgun_address),
+        true,
         &candidates,
         policy
     ));
     assert!(!should_preserve_estimate_after_broadcaster_policy_change(
+        &BroadcasterChoice::Random,
+        None,
+        false,
+        &candidates,
+        policy
+    ));
+    assert!(!should_preserve_estimate_after_broadcaster_policy_change(
+        &BroadcasterChoice::Random,
+        Some(&candidates[0].railgun_address),
+        false,
+        &unsupported,
+        policy
+    ));
+    assert!(!should_preserve_estimate_after_broadcaster_policy_change(
         &choice,
+        None,
+        false,
         &unsupported,
         policy
     ));

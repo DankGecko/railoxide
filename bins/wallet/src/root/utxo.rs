@@ -1555,6 +1555,14 @@ pub(super) fn should_focus_utxo_table(
         && state.is_some_and(ChainUtxoState::renders_table)
 }
 
+pub(super) fn should_refresh_utxo_ages(
+    active_activity: Activity,
+    active_wallet_tab: WalletTab,
+    has_snapshot: bool,
+) -> bool {
+    active_activity == Activity::Wallet && active_wallet_tab.shows_utxos() && has_snapshot
+}
+
 pub(super) fn recoverable_poi_candidate_count(snapshot: &ListUtxosOutput) -> usize {
     snapshot
         .utxos

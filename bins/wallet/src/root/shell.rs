@@ -3,16 +3,16 @@ use std::collections::btree_map::Entry;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
 use broadcaster_monitor::{EventRx, EventTx, Shared};
 use gpui::ObjectFit;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Bounds, Context, Entity, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Point, Render, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage as _, Window, WindowBounds, WindowOptions,
-    bounce, div, ease_in_out, img, prelude::FluentBuilder as _, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Point, Render, SharedString, StatefulInteractiveElement, Styled,
+    StyledImage as _, Window, WindowBounds, WindowOptions, div, img, prelude::FluentBuilder as _,
+    px, rgb, size,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
@@ -2175,23 +2175,12 @@ fn healthy_presence_dot() -> gpui::Div {
         .child(
             div()
                 .absolute()
+                .top(px(3.0))
+                .left(px(3.0))
                 .size(px(9.0))
                 .rounded_full()
                 .bg(rgb_with_alpha(theme::SUCCESS, 0.38))
-                .with_animation(
-                    "presence-pulse",
-                    Animation::new(Duration::from_secs_f64(2.0))
-                        .repeat()
-                        .with_easing(bounce(ease_in_out)),
-                    |this, delta| {
-                        let size = delta.mul_add(7.0, 9.0);
-                        let offset = (SLOT_SIZE - size) / 2.0;
-                        this.size(px(size))
-                            .top(px(offset))
-                            .left(px(offset))
-                            .opacity(delta.mul_add(-0.34, 0.52))
-                    },
-                ),
+                .opacity(0.52),
         )
         .child(div().size(px(6.0)).rounded_full().bg(rgb(theme::SUCCESS)))
 }
