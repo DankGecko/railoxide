@@ -81,6 +81,46 @@ To store wallet data in a custom location:
 ./target/release/wallet --db-path "$HOME/RailOxideData"
 ```
 
+## Profile Rust Heap Memory
+
+The optional `heap-profiling` feature replaces the Rust global allocator with a
+profiling-enabled jemalloc build. It is intended only for local profiling and is
+not enabled by default in release or packaged wallet builds.
+
+Build the unstripped profiling binary with frame pointers:
+
+```bash
+RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --profile profiling -p wallet --features heap-profiling
+```
+
+Run `target/profiling/wallet`, wait until the wallet reaches the state to
+inspect, then press `Command-Option-Shift-H`. The wallet writes a sampled heap
+profile to the macOS per-user temporary directory and logs the exact path.
+Profiling builds also log each GPUI asset cache miss with its source path,
+encoded size, format, and SVG intrinsic dimensions when present. Each heap dump
+log also reports jemalloc's live allocated, active, resident, and retained byte
+counts for comparison with the process footprint.
+
+Install `jeprof` and the Rust stack-processing tools if needed:
+
+```bash
+brew install jemalloc
+cargo install rustfilt inferno
+```
+
+Generate a Rust-demangled heap flamegraph using the same unstripped executable.
+The script rebases wallet addresses from the runtime Mach-O mapping so `jeprof`
+does not assign symbols using unadjusted macOS ASLR addresses:
+
+```bash
+PROFILE_PATH="dump.heap"
+scripts/render-wallet-heap-profile \
+  --profile "$PROFILE_PATH" \
+  --binary target/profiling/wallet \
+  --output /tmp/railoxide-heap.svg
+```
+
 ## Package A macOS App
 
 The repository includes a packaging script that builds the hardware-enabled wallet, creates `RailOxide.app`, ad-hoc signs it by default, and creates a DMG. By default, the script builds with `hardware,gpui/runtime_shaders` so it works on Command Line Tools-only installs:

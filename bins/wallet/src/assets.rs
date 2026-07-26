@@ -151,17 +151,22 @@ impl From<WalletIconSource> for ImageSource {
 
 impl AssetSource for WalletAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some(bytes) = railgun_asset(path) {
-            return Ok(Some(Cow::Borrowed(bytes)));
-        }
-        if let Some(bytes) = embedded_asset::<UiAssets>(UI_ASSET_PREFIX, path) {
-            return Ok(Some(bytes));
-        }
-        if let Some(bytes) = embedded_asset::<RailgunUiAssets>(RAILGUN_UI_ASSET_PREFIX, path) {
-            return Ok(Some(bytes));
-        }
+        let asset = if let Some(bytes) = railgun_asset(path) {
+            Some(Cow::Borrowed(bytes))
+        } else if let Some(bytes) = embedded_asset::<UiAssets>(UI_ASSET_PREFIX, path) {
+            Some(bytes)
+        } else if let Some(bytes) = embedded_asset::<RailgunUiAssets>(RAILGUN_UI_ASSET_PREFIX, path)
+        {
+            Some(bytes)
+        } else {
+            gpui_component_assets::Assets.load(path)?
+        };
 
-        gpui_component_assets::Assets.load(path)
+        #[cfg(feature = "heap-profiling")]
+        if let Some(bytes) = asset.as_deref() {
+            trace_image_asset(path, bytes);
+        }
+        Ok(asset)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -175,6 +180,77 @@ impl AssetSource for WalletAssets {
                 .map(|asset| SharedString::from(*asset)),
         );
         Ok(assets)
+    }
+}
+
+#[cfg(feature = "heap-profiling")]
+fn trace_image_asset(path: &str, bytes: &[u8]) {
+    let format = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if std::str::from_utf8(bytes).is_ok_and(|text| text.contains("<svg")) {
+        "svg"
+    } else {
+        "other"
+    };
+    tracing::info!(
+        target: "wallet::heap_profile",
+        asset_path = path,
+        encoded_bytes = bytes.len(),
+        asset_format = format,
+        svg_width = ?svg_attribute(bytes, "width"),
+        svg_height = ?svg_attribute(bytes, "height"),
+        svg_view_box = ?svg_attribute(bytes, "viewBox"),
+        "loaded GPUI image asset source"
+    );
+}
+
+#[cfg(feature = "heap-profiling")]
+fn svg_attribute<'a>(bytes: &'a [u8], name: &str) -> Option<&'a str> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let svg = &text[text.find("<svg")?..];
+    let mut quote = None;
+    let header_end = svg.char_indices().find_map(|(index, character)| {
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            }
+            return None;
+        }
+        if character == '"' || character == '\'' {
+            quote = Some(character);
+            None
+        } else {
+            (character == '>').then_some(index)
+        }
+    })?;
+    let header = &svg[..header_end];
+    let mut attributes = &header["<svg".len()..];
+    loop {
+        attributes = attributes.trim_start();
+        if attributes.is_empty() {
+            return None;
+        }
+        let attribute_end = attributes
+            .find(|character: char| character.is_whitespace() || character == '=')
+            .unwrap_or(attributes.len());
+        let attribute_name = &attributes[..attribute_end];
+        attributes = attributes[attribute_end..].trim_start();
+        let Some(remainder) = attributes.strip_prefix('=') else {
+            continue;
+        };
+        let remainder = remainder.trim_start();
+        let quote = remainder.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let value = &remainder[quote.len_utf8()..];
+        let end = value.find(quote)?;
+        attributes = &value[end + quote.len_utf8()..];
+        if attribute_name == name {
+            return Some(&value[..end]);
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="512" height="512">
   <!-- Transparent hematite hero, matching the sidebar logo geometry. -->
   <polygon points="844,759 597,892 293,854 464,683" fill="#1F1812"/>
   <polygon points="920,474 844,759 464,683 692,550" fill="#44322A"/>

@@ -7,6 +7,7 @@ rust-version.workspace = true
 [features]
 default = []
 hardware = ["wallet-ops/hardware"]
+heap-profiling = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 
 [[bin]]
 name = "wallet"
@@ -42,6 +43,8 @@ wallet-ops = { path = "../../crates/wallet-ops" }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"

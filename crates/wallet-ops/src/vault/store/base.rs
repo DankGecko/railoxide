@@ -4,9 +4,14 @@ use super::{
     create_with_params, current_vault_version, reencrypt_metadata, unlock_view,
 };
 
+const DESKTOP_DB_CACHE_SIZE_BYTES: usize = 128 * 1024 * 1024;
+
 impl DesktopVaultStore {
     pub fn open(db_path: PathBuf) -> Result<Self, VaultError> {
-        let db = DbStore::open(DbConfig { root_dir: db_path })?;
+        let db = DbStore::open_with_cache_size_bytes(
+            DbConfig { root_dir: db_path },
+            DESKTOP_DB_CACHE_SIZE_BYTES,
+        )?;
         Ok(Self { db: Arc::new(db) })
     }
 

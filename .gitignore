@@ -2,6 +2,10 @@
 /target/
 /result
 
+/*.heap
+/heap*.svg
+/debug.log
+
 # IDE files
 /.idea
 .vscode/
