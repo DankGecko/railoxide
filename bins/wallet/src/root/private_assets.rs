@@ -26,7 +26,9 @@ use super::chain_load::loading_summary;
 use super::public_account::render_public_address_qr_dialog_content;
 use super::utxo::{
     UtxoDisplayRow, blocked_shield_refund_action_available, blocked_shield_refund_origin_resolving,
-    blocked_shield_rescue_display_rows, recoverable_poi_candidate_count, short_hash,
+    blocked_shield_rescue_display_rows, display_rows_from_output, now_epoch_secs,
+    recoverable_poi_candidate_count, shield_poi_wait_display, shield_poi_wait_time_display,
+    short_hash,
 };
 use super::{
     ChainUtxoState, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, UnshieldAsset, WalletRoot, centered_message,
@@ -61,16 +63,24 @@ pub(super) struct FormattedTokenTotal {
 struct PrivatePendingAssetLine {
     label: String,
     amount: String,
+    shield_wait: Option<PrivatePendingShieldWait>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrivatePendingShieldWait {
+    pub(super) output_count: usize,
+    pub(super) latest_source_block_timestamp: u64,
+    pub(super) total_value: Option<U256>,
+    pub(super) has_delayed: bool,
 }
 
 #[derive(Clone)]
-struct PrivatePendingSummary {
+pub(super) struct PrivatePendingSummary {
     blocked_shield_rows: Vec<UtxoDisplayRow>,
     pending_poi_assets: Vec<PrivatePendingAssetLine>,
     pending_incoming_assets: Vec<PrivatePendingAssetLine>,
     pending_outgoing_assets: Vec<PrivatePendingAssetLine>,
-    pending_incoming_outputs: usize,
-    pending_outgoing_outputs: usize,
+    affected_asset_count: usize,
     recoverable_poi_outputs: usize,
     recoverable_ppoi_states: Vec<UtxoPpoiState>,
     poi_refreshing: bool,
@@ -361,19 +371,24 @@ pub(super) fn should_show_pending_amount(pending_total: Option<U256>) -> bool {
     pending_total.is_some_and(|amount| !amount.is_zero())
 }
 
-fn private_pending_summary(
+pub(super) fn private_pending_summary(
     assets: &[FormattedTokenTotal],
     snapshot: &ListUtxosOutput,
     blocked_shield_rows: Vec<UtxoDisplayRow>,
     poi_refreshing: bool,
     poi_refresh_session: Option<Arc<wallet_ops::WalletSession>>,
 ) -> Option<PrivatePendingSummary> {
+    let shield_waits = pending_shield_waits_by_token(snapshot, now_epoch_secs());
     let pending_poi_assets = assets
         .iter()
         .filter(|asset| should_show_pending_poi_amount(asset.pending_poi_total))
         .map(|asset| PrivatePendingAssetLine {
             label: asset.label.clone(),
             amount: asset.pending_poi_amount.clone(),
+            shield_wait: asset
+                .token
+                .and_then(|token| shield_waits.get(&token).copied())
+                .filter(|wait| pending_shield_wait_matches_total(*wait, asset.pending_poi_total)),
         })
         .collect::<Vec<_>>();
     let pending_incoming_assets = assets
@@ -382,6 +397,7 @@ fn private_pending_summary(
         .map(|asset| PrivatePendingAssetLine {
             label: asset.label.clone(),
             amount: asset.pending_incoming_amount.clone(),
+            shield_wait: None,
         })
         .collect::<Vec<_>>();
     let pending_outgoing_assets = assets
@@ -390,13 +406,21 @@ fn private_pending_summary(
         .map(|asset| PrivatePendingAssetLine {
             label: asset.label.clone(),
             amount: asset.pending_outgoing_amount.clone(),
+            shield_wait: None,
         })
         .collect::<Vec<_>>();
-    let pending_incoming_outputs = snapshot.utxos.iter().filter(|row| row.pending_new).count();
-    let pending_outgoing_outputs = snapshot
-        .utxos
+    let affected_asset_count = assets
         .iter()
-        .filter(|row| row.pending_spent || row.local_pending_spent)
+        .filter(|asset| {
+            should_show_pending_poi_amount(asset.pending_poi_total)
+                || should_show_pending_amount(asset.pending_incoming_total)
+                || should_show_pending_amount(asset.pending_outgoing_total)
+                || asset.token.is_some_and(|token| {
+                    snapshot.utxos.iter().any(|row| {
+                        row.is_ppoi_retry_eligible() && parse_address(&row.token) == Some(token)
+                    })
+                })
+        })
         .count();
     let recoverable_poi_outputs = recoverable_poi_candidate_count(snapshot);
     let mut recoverable_ppoi_states = Vec::new();
@@ -425,8 +449,7 @@ fn private_pending_summary(
         pending_poi_assets,
         pending_incoming_assets,
         pending_outgoing_assets,
-        pending_incoming_outputs,
-        pending_outgoing_outputs,
+        affected_asset_count,
         recoverable_poi_outputs,
         recoverable_ppoi_states,
         poi_refreshing,
@@ -434,31 +457,72 @@ fn private_pending_summary(
     })
 }
 
-const fn private_pending_summary_detail(summary: &PrivatePendingSummary) -> &'static str {
-    if !summary.blocked_shield_rows.is_empty() {
-        if summary.blocked_shield_rows.len() == 1 {
-            "A blocked Shield can be reviewed and refunded."
-        } else {
-            "Blocked Shields can be reviewed and refunded."
-        }
-    } else if summary.recoverable_poi_outputs > 0 {
-        "Some private outputs need PPOI submission or status checks before they become spendable."
-    } else if !summary.pending_poi_assets.is_empty() {
-        "Some private outputs are waiting for PPOI validation before they become spendable."
-    } else if summary.pending_incoming_outputs > 0 && summary.pending_outgoing_outputs > 0 {
-        "Incoming private outputs and outgoing private spends are waiting for confirmation."
-    } else if summary.pending_incoming_outputs > 0 {
-        "Incoming private outputs are waiting for confirmation."
+pub(super) fn pending_shield_waits_by_token(
+    snapshot: &ListUtxosOutput,
+    now_epoch_secs: u64,
+) -> BTreeMap<Address, PrivatePendingShieldWait> {
+    let mut waits = BTreeMap::new();
+    for row in display_rows_from_output(snapshot, "", false) {
+        let Some(display) = shield_poi_wait_display(&row, now_epoch_secs) else {
+            continue;
+        };
+        let Some(token) = parse_address(&row.token_address) else {
+            continue;
+        };
+        let wait = waits.entry(token).or_insert(PrivatePendingShieldWait {
+            output_count: 0,
+            latest_source_block_timestamp: 0,
+            total_value: Some(U256::ZERO),
+            has_delayed: false,
+        });
+        wait.output_count += 1;
+        wait.latest_source_block_timestamp = wait
+            .latest_source_block_timestamp
+            .max(row.source_block_timestamp);
+        wait.total_value = wait
+            .total_value
+            .and_then(|total| row.raw_value.and_then(|value| total.checked_add(value)));
+        wait.has_delayed |= display.delayed;
+    }
+    waits
+}
+
+pub(super) fn pending_shield_wait_matches_total(
+    wait: PrivatePendingShieldWait,
+    pending_poi_total: Option<U256>,
+) -> bool {
+    wait.total_value
+        .is_some_and(|total_value| pending_poi_total == Some(total_value))
+}
+
+pub(super) const fn private_pending_summary_detail(
+    summary: &PrivatePendingSummary,
+) -> Option<&'static str> {
+    if summary.blocked_shield_rows.is_empty() {
+        None
+    } else if summary.blocked_shield_rows.len() == 1 {
+        Some("A blocked Shield can be reviewed and refunded.")
     } else {
-        "Outgoing private spends are waiting for confirmation."
+        Some("Blocked Shields can be reviewed and refunded.")
     }
 }
 
-const fn private_pending_summary_title(summary: &PrivatePendingSummary) -> &'static str {
-    if summary.blocked_shield_rows.is_empty() {
-        "Private balance update pending"
+pub(super) fn private_pending_summary_title(summary: &PrivatePendingSummary) -> String {
+    if !summary.blocked_shield_rows.is_empty() {
+        "Private assets need attention".to_string()
+    } else if !summary.pending_poi_assets.is_empty()
+        || !summary.pending_incoming_assets.is_empty()
+        || summary.recoverable_poi_outputs > 0
+    {
+        format!(
+            "{} not yet spendable",
+            pending_asset_count_label(summary.affected_asset_count)
+        )
     } else {
-        "Private assets need attention"
+        format!(
+            "{} awaiting confirmation",
+            pending_asset_count_label(summary.affected_asset_count)
+        )
     }
 }
 
@@ -723,16 +787,19 @@ impl WalletRoot {
     }
 
     pub(super) fn open_private_pending_status_dialog(
+        &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         window.close_all_dialogs(cx);
+        self.private_pending_status_dialog_open = true;
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
         let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
+            let close_root = root.clone();
             let content_root = root.clone();
             let content = content_root
                 .read(cx)
@@ -751,6 +818,11 @@ impl WalletRoot {
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Private asset status"))
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, _cx| {
+                        root.private_pending_status_dialog_open = false;
+                    });
+                })
                 .child(scrollable_dialog_content(content_max_height, content))
         });
     }
@@ -785,11 +857,38 @@ impl WalletRoot {
         )
     }
 
+    pub(super) fn private_pending_status_has_shield_timer(&self) -> bool {
+        let Some(snapshot) = self
+            .chain_states
+            .get(&self.selected_chain)
+            .and_then(ChainUtxoState::snapshot)
+        else {
+            return false;
+        };
+        let waits = pending_shield_waits_by_token(snapshot, now_epoch_secs());
+        format_private_asset_rows_from_snapshot(
+            snapshot,
+            Some(&self.effective_token_registry),
+            Some(&self.public_broadcaster_anchor_cache),
+        )
+        .iter()
+        .filter(|asset| should_show_pending_poi_amount(asset.pending_poi_total))
+        .any(|asset| {
+            asset
+                .token
+                .and_then(|token| waits.get(&token).copied())
+                .is_some_and(|wait| {
+                    pending_shield_wait_matches_total(wait, asset.pending_poi_total)
+                })
+        })
+    }
+
     fn render_private_pending_status_card(
         root: &Entity<Self>,
         summary: &PrivatePendingSummary,
     ) -> gpui::Div {
         let details_root = root.clone();
+        let detail = private_pending_summary_detail(summary);
 
         div()
             .w_full()
@@ -819,11 +918,13 @@ impl WalletRoot {
                             .flex_col()
                             .gap_1()
                             .child(app_strong_text(private_pending_summary_title(summary)))
-                            .child(
-                                app_muted_text(private_pending_summary_detail(summary))
-                                    .line_height(px(18.0))
-                                    .whitespace_normal(),
-                            ),
+                            .when_some(detail, |column, detail| {
+                                column.child(
+                                    app_muted_text(detail)
+                                        .line_height(px(18.0))
+                                        .whitespace_normal(),
+                                )
+                            }),
                     )
                     .child(
                         app_button_base("wallet-private-pending-details")
@@ -832,8 +933,8 @@ impl WalletRoot {
                             .compact()
                             .child("Details")
                             .on_click(move |_event, window, cx| {
-                                details_root.update(cx, |_root, cx| {
-                                    Self::open_private_pending_status_dialog(window, cx);
+                                details_root.update(cx, |root, cx| {
+                                    root.open_private_pending_status_dialog(window, cx);
                                 });
                             }),
                     ),
@@ -846,6 +947,7 @@ impl WalletRoot {
         content_width: Pixels,
     ) -> gpui::Div {
         let retry_available = summary.poi_refresh_session.is_some();
+        let close_root = root.clone();
         let retry_root = root.clone();
         let retrying = summary.poi_refreshing;
         let recoverable = summary.recoverable_poi_outputs;
@@ -856,7 +958,6 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .gap_3()
-            .child(private_pending_dialog_intro())
             .when(!summary.blocked_shield_rows.is_empty(), |this| {
                 this.child(private_blocked_shield_detail_section(
                     root,
@@ -866,38 +967,34 @@ impl WalletRoot {
             .when(!summary.pending_incoming_assets.is_empty(), |this| {
                 this.child(private_pending_detail_section(
                     "Pending incoming",
-                    pending_output_count_label(summary.pending_incoming_outputs),
-                    "Detected private outputs waiting for chain confirmation and safe-head finality.",
+                    pending_asset_count_label(summary.pending_incoming_assets.len()),
+                    "Waiting for the network to confirm.",
                     &summary.pending_incoming_assets,
                     "+",
                     theme::WARNING,
                     RailgunActionIcon::Clock,
-                    None,
                 ))
             })
             .when(!summary.pending_outgoing_assets.is_empty(), |this| {
                 this.child(private_pending_detail_section(
                     "Pending outgoing",
-                    pending_output_count_label(summary.pending_outgoing_outputs),
-                    "Detected or locally submitted private spends waiting for confirmation.",
+                    pending_asset_count_label(summary.pending_outgoing_assets.len()),
+                    "Waiting for the network to confirm.",
                     &summary.pending_outgoing_assets,
                     "-",
                     theme::WARNING,
                     RailgunActionIcon::Clock,
-                    None,
                 ))
             })
             .when(!summary.pending_poi_assets.is_empty(), |this| {
                 this.child(private_pending_detail_section(
-                    "PPOI pending",
+                    "Not yet spendable",
                     pending_asset_count_label(summary.pending_poi_assets.len()),
-                    "Balances are detected but not PPOI-verified yet, so they are not spendable.",
+                    "These need Private Proof of Innocence (PPOI) verification before they can be spent. It usually completes on its own.",
                     &summary.pending_poi_assets,
                     "",
                     theme::WARNING,
                     RailgunActionIcon::Clock,
-                    (recoverable == 0)
-                        .then_some("No confirmed PPOI outputs are currently eligible for retry."),
                 ))
             })
             .when(show_recovery, |this| {
@@ -918,6 +1015,9 @@ impl WalletRoot {
                             .outline()
                             .small()
                             .on_click(move |_event, window, cx| {
+                                close_root.update(cx, |root, _cx| {
+                                    root.private_pending_status_dialog_open = false;
+                                });
                                 window.close_dialog(cx);
                             }),
                     )
@@ -1068,6 +1168,7 @@ impl WalletRoot {
         let show_pending_outgoing = should_show_pending_amount(asset.pending_outgoing_total);
         let pending_incoming_amount = asset.pending_incoming_amount.clone();
         let pending_outgoing_amount = asset.pending_outgoing_amount.clone();
+        let asset_label = asset.label.clone();
         let (primary_amount, secondary_amount) = private_asset_display_amounts(&asset);
         let row_group = SharedString::from(format!("wallet-private-asset-row-{ix}"));
         let send_root = root.clone();
@@ -1168,17 +1269,17 @@ impl WalletRoot {
                     })
                     .when(show_pending_poi, |column| {
                         column.child(private_asset_pending_label(format!(
-                            "Pending POI: {pending_poi_amount}"
+                            "{pending_poi_amount} {asset_label} not yet spendable"
                         )))
                     })
                     .when(show_pending_incoming, |column| {
                         column.child(private_asset_pending_label(format!(
-                            "Pending: +{pending_incoming_amount}"
+                            "+{pending_incoming_amount} {asset_label} arriving"
                         )))
                     })
                     .when(show_pending_outgoing, |column| {
                         column.child(private_asset_pending_label(format!(
-                            "Pending: -{pending_outgoing_amount}"
+                            "-{pending_outgoing_amount} {asset_label} leaving"
                         )))
                     }),
             )
@@ -1212,20 +1313,12 @@ fn private_asset_pending_label(label: impl Into<SharedString>) -> gpui::Div {
 
 pub(super) fn retry_poi_label(count: usize, retrying: bool) -> String {
     if retrying {
-        "Submitting PPOIs…".to_string()
+        "Submitting…".to_string()
     } else if count == 1 {
-        "Retry PPOI".to_string()
+        "Retry".to_string()
     } else {
-        format!("Retry PPOI submissions ({count})")
+        format!("Retry ({count})")
     }
-}
-
-fn private_pending_dialog_intro() -> gpui::Div {
-    div()
-        .text_size(px(13.0))
-        .line_height(px(19.0))
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child("Private balances update automatically from scanned Railgun events.")
 }
 
 fn private_pending_status_empty(content_width: Pixels) -> gpui::Div {
@@ -1234,7 +1327,7 @@ fn private_pending_status_empty(content_width: Pixels) -> gpui::Div {
         .text_size(px(13.0))
         .line_height(px(19.0))
         .text_color(rgb(theme::TEXT_MUTED))
-        .child("No private asset status currently needs attention.")
+        .child("Nothing needs attention right now.")
 }
 
 fn private_pending_detail_section(
@@ -1245,7 +1338,6 @@ fn private_pending_detail_section(
     prefix: &'static str,
     accent_color: u32,
     icon: RailgunActionIcon,
-    footer_note: Option<&'static str>,
 ) -> gpui::Div {
     let content = div()
         .flex()
@@ -1267,15 +1359,7 @@ fn private_pending_detail_section(
             assets
                 .iter()
                 .map(|asset| private_pending_asset_amount_row(asset, prefix)),
-        )
-        .when_some(footer_note, |content, note| {
-            content.child(
-                app_muted_text(note)
-                    .text_size(px(12.0))
-                    .line_height(px(17.0))
-                    .whitespace_normal(),
-            )
-        });
+        );
     private_pending_section_card(accent_color, content)
 }
 
@@ -1337,7 +1421,7 @@ fn private_blocked_shield_detail_section(
             RailgunActionIcon::Shield,
         ))
         .child(
-            app_muted_text("Blocked Shield outputs cannot be spent privately, but can be refunded to the original public source account when the origin is available.")
+            app_muted_text("These can't be spent privately. When the original account is known, you can refund them to it.")
                 .text_size(px(12.0))
                 .line_height(px(17.0))
                 .whitespace_normal(),
@@ -1441,6 +1525,10 @@ fn private_pending_asset_amount_row(
     asset: &PrivatePendingAssetLine,
     prefix: &'static str,
 ) -> gpui::Div {
+    let shield_wait = asset.shield_wait.and_then(|wait| {
+        shield_poi_wait_time_display(wait.latest_source_block_timestamp, now_epoch_secs())
+            .map(|display| (wait, display))
+    });
     div()
         .flex()
         .items_center()
@@ -1449,19 +1537,51 @@ fn private_pending_asset_amount_row(
         .text_size(px(12.0))
         .child(
             div()
+                .flex_1()
                 .min_w(px(0.0))
-                .truncate()
-                .text_color(rgb(theme::TEXT))
-                .child(SharedString::from(asset.label.clone())),
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(rgb(theme::TEXT))
+                        .child(SharedString::from(asset.label.clone())),
+                )
+                .when_some(shield_wait, |this, (wait, display)| {
+                    let label = if wait.has_delayed && wait.output_count == 1 {
+                        "Shield · taking longer than usual".to_string()
+                    } else if wait.has_delayed {
+                        format!(
+                            "{} Shields · some taking longer than usual",
+                            wait.output_count
+                        )
+                    } else if wait.output_count == 1 {
+                        format!("Shield · ready in {}", display.label)
+                    } else {
+                        format!(
+                            "{} Shields · ready in up to {}",
+                            wait.output_count, display.label
+                        )
+                    };
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(11.0))
+                            .line_height(px(14.0))
+                            .text_color(rgb(theme::WARNING))
+                            .child(Icon::new(RailgunActionIcon::Clock).xsmall())
+                            .child(SharedString::from(label)),
+                    )
+                }),
         )
         .child(
             div()
                 .flex_none()
                 .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(format!(
-                    "{prefix}{} {}",
-                    asset.amount, asset.label
-                ))),
+                .child(SharedString::from(format!("{prefix}{}", asset.amount))),
         )
 }
 
@@ -1477,7 +1597,7 @@ fn private_pending_retry_section(recoverable: usize, states: &[UtxoPpoiState]) -
             RailgunActionIcon::Clock,
         ))
         .child(
-            app_muted_text("PPOI submission is normally automatic. Retry checks these outputs and also processes recipient and broadcaster-fee outputs created by this wallet.")
+            app_muted_text("Submission is normally automatic. Retrying re-checks these and any related outputs from this wallet.")
                 .text_size(px(12.0))
                 .line_height(px(17.0))
                 .whitespace_normal(),

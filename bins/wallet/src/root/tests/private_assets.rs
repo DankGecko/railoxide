@@ -67,6 +67,51 @@ fn private_asset_rows_use_totals_formatting() {
 }
 
 #[test]
+fn pending_shield_waits_group_by_token_and_use_latest_source() {
+    let token = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let mut first = utxo_output(&token.to_checksum(None), "1000000", false);
+    first.commitment_kind = "Shield".to_string();
+    first.activity_classification = "Shield".to_string();
+    first.ppoi_state = UtxoPpoiState::Missing;
+    first.poi_spendable = false;
+    first.source_block_timestamp = 1_000;
+    let mut latest = first.clone();
+    latest.position = 8;
+    latest.source_block_timestamp = 4_500;
+    let mut private_output = first.clone();
+    private_output.position = 9;
+    private_output.commitment_kind = "Transact".to_string();
+    private_output.activity_classification = "Private Output".to_string();
+    private_output.source_block_timestamp = 1_300;
+    let snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 3,
+        unspent_count: 3,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![first, latest, private_output],
+        totals: Vec::new(),
+    };
+
+    let waits = pending_shield_waits_by_token(&snapshot, 5_000);
+    let wait = waits.get(&token).expect("USDC Shield wait");
+
+    assert_eq!(wait.output_count, 2);
+    assert_eq!(wait.latest_source_block_timestamp, 4_500);
+    assert_eq!(wait.total_value, Some(uint!(2_000_000_U256)));
+    assert!(wait.has_delayed);
+    assert!(pending_shield_wait_matches_total(
+        *wait,
+        Some(uint!(2_000_000_U256))
+    ));
+    assert!(!pending_shield_wait_matches_total(
+        *wait,
+        Some(uint!(3_000_000_U256))
+    ));
+}
+
+#[test]
 fn private_action_tooltips_distinguish_syncing_and_ready() {
     assert_eq!(
         private_send_action_tooltip(true, true, true, "No spendable private balance"),
@@ -366,9 +411,73 @@ fn private_asset_rows_hide_zero_pending_poi() {
 
 #[test]
 fn private_pending_retry_labels_use_submission_copy() {
-    assert_eq!(retry_poi_label(1, false), "Retry PPOI");
-    assert_eq!(retry_poi_label(2, false), "Retry PPOI submissions (2)");
-    assert_eq!(retry_poi_label(0, true), "Submitting PPOIs…");
+    assert_eq!(retry_poi_label(1, false), "Retry");
+    assert_eq!(retry_poi_label(2, false), "Retry (2)");
+    assert_eq!(retry_poi_label(0, true), "Submitting…");
+}
+
+#[test]
+fn private_pending_banner_collapses_pending_states_to_one_line() {
+    let token = Address::from([0x11; 20]);
+    let mut incoming = unshield_utxo_output(token, 7, 0, 2);
+    incoming.pending_new = true;
+    let incoming_snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "incoming".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![incoming],
+        totals: Vec::new(),
+    };
+    let incoming_assets = format_private_asset_rows_from_snapshot(&incoming_snapshot, None, None);
+    let incoming_summary = private_pending_summary(
+        &incoming_assets,
+        &incoming_snapshot,
+        Vec::new(),
+        false,
+        None,
+    )
+    .expect("incoming summary");
+
+    assert_eq!(
+        private_pending_summary_title(&incoming_summary),
+        "1 asset not yet spendable"
+    );
+    assert_eq!(private_pending_summary_detail(&incoming_summary), None);
+
+    let mut outgoing = unshield_utxo_output(token, 5, 0, 1);
+    outgoing.pending_spent = true;
+    let outgoing_snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "outgoing".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![outgoing],
+        totals: vec![wallet_ops::TokenTotal {
+            token: token.to_checksum(None),
+            total: "5".to_string(),
+            poi_verified_total: "5".to_string(),
+        }],
+    };
+    let outgoing_assets = format_private_asset_rows_from_snapshot(&outgoing_snapshot, None, None);
+    let outgoing_summary = private_pending_summary(
+        &outgoing_assets,
+        &outgoing_snapshot,
+        Vec::new(),
+        false,
+        None,
+    )
+    .expect("outgoing summary");
+
+    assert_eq!(
+        private_pending_summary_title(&outgoing_summary),
+        "1 asset awaiting confirmation"
+    );
+    assert_eq!(private_pending_summary_detail(&outgoing_summary), None);
 }
 
 #[test]

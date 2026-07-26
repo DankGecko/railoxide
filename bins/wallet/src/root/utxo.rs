@@ -6,9 +6,9 @@ use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    App, Context, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
-    prelude::FluentBuilder as _, px, rgb,
+    App, Context, Edges, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
@@ -49,7 +49,7 @@ use super::{
     scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 
-use crate::assets::WalletIconSource;
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 #[derive(Clone, Copy)]
 enum UtxoNavigation {
@@ -60,7 +60,7 @@ enum UtxoNavigation {
 }
 
 const POI_COLUMN_INDEX: usize = 4;
-const POI_COLUMN_WIDTH: f32 = 180.0;
+const POI_COLUMN_WIDTH: f32 = 200.0;
 const BLOCKED_SHIELD_RESCUE_RESOLVING_REASON: &str = "Resolving source transaction origin...";
 const BLOCKED_SHIELD_REFUND_IN_FLIGHT_REASON: &str =
     "Blocked Shield refund submission is already in progress.";
@@ -135,9 +135,47 @@ impl WalletRoot {
             .chain_states
             .get(&self.selected_chain)
             .is_some_and(ChainUtxoState::poi_refreshing);
+        let finality_context = self.utxo_finality_context();
         self.utxo_table.update(cx, |state, cx| {
-            state.delegate_mut().set_rows(rows, poi_refreshing);
+            state
+                .delegate_mut()
+                .set_rows(rows, poi_refreshing, finality_context);
             cx.notify();
+        });
+    }
+
+    fn utxo_finality_context(&self) -> UtxoFinalityContext {
+        let sync_tip = self
+            .chain_states
+            .get(&self.selected_chain)
+            .and_then(ChainUtxoState::sync_tip);
+        UtxoFinalityContext::new(
+            sync_tip.and_then(|tip| tip.head_block),
+            sync_tip.and_then(|tip| tip.safe_head_block),
+            self.effective_chain_configs
+                .get(&self.selected_chain)
+                .map(|config| config.finality_depth),
+        )
+    }
+
+    pub(super) fn sync_utxo_finality_context(&self, cx: &mut Context<'_, Self>) {
+        let context = self.utxo_finality_context();
+        self.utxo_table.update(cx, |state, cx| {
+            if state.delegate_mut().set_finality_context(context) {
+                cx.notify();
+            }
+        });
+    }
+
+    pub(super) fn sync_utxo_poi_refreshing(
+        &self,
+        poi_refreshing: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.utxo_table.update(cx, |state, cx| {
+            if state.delegate_mut().set_poi_refreshing(poi_refreshing) {
+                cx.notify();
+            }
         });
     }
 
@@ -770,7 +808,7 @@ impl WalletRoot {
                         .on_action(window.listener_for(root, Self::on_action_utxo_page_down))
                         .on_action(window.listener_for(root, Self::on_action_utxo_home))
                         .on_action(window.listener_for(root, Self::on_action_utxo_end))
-                        .child(Table::new(&self.utxo_table)),
+                        .child(Table::new(&self.utxo_table).large()),
                 ),
             _ => centered_message("Select a chain to load UTXOs"),
         }
@@ -871,6 +909,7 @@ impl WalletRoot {
                     .when(
                         global_poi_retry_available(
                             poi_refresh_session.is_some(),
+                            poi_refreshing,
                             ppoi_workflow_status.needs_attention,
                             owned_ppoi_retry_candidates,
                         ),
@@ -1043,13 +1082,16 @@ pub(super) struct UtxoDisplayRow {
     pub(super) token: String,
     pub(super) token_icon_path: Option<WalletIconSource>,
     pub(super) amount: String,
+    pub(super) raw_value: Option<U256>,
     pub(super) activity_classification: String,
     pub(super) poi_status: String,
     pub(super) ppoi_state: UtxoPpoiState,
     pub(super) poi_spendable: bool,
     pub(super) source_tx_hash: String,
+    pub(super) source_block_number: u64,
     pub(super) source_block_timestamp: u64,
     pub(super) spent_tx_hash: Option<String>,
+    pub(super) spent_block_number: Option<u64>,
     pub(super) token_address: String,
     pub(super) is_spent: bool,
     pub(super) pending_new: bool,
@@ -1058,12 +1100,34 @@ pub(super) struct UtxoDisplayRow {
     pub(super) blocked_shield_rescue: Option<BlockedShieldRescueInfo>,
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(super) struct UtxoFinalityContext {
+    head_block: Option<u64>,
+    safe_head_block: Option<u64>,
+    finality_depth: Option<u64>,
+}
+
+impl UtxoFinalityContext {
+    pub(super) const fn new(
+        head_block: Option<u64>,
+        safe_head_block: Option<u64>,
+        finality_depth: Option<u64>,
+    ) -> Self {
+        Self {
+            head_block,
+            safe_head_block,
+            finality_depth,
+        }
+    }
+}
+
 pub(super) struct UtxoDelegate {
     root: WeakEntity<WalletRoot>,
     rows: Arc<[UtxoDisplayRow]>,
     columns: [Column; 7],
     tx_search_input: Entity<InputState>,
     poi_refreshing: bool,
+    finality_context: UtxoFinalityContext,
 }
 
 impl UtxoDelegate {
@@ -1077,6 +1141,12 @@ impl UtxoDelegate {
                     .movable(false),
                 Column::new("generated", "generated")
                     .width(px(130.0))
+                    .paddings(Edges {
+                        top: px(2.0),
+                        right: px(12.0),
+                        bottom: px(2.0),
+                        left: px(12.0),
+                    })
                     .movable(false),
                 Column::new("token", "token")
                     .width(px(150.0))
@@ -1084,7 +1154,7 @@ impl UtxoDelegate {
                 Column::new("amount", "amount")
                     .width(px(160.0))
                     .movable(false),
-                Column::new("poi", "POI")
+                Column::new("poi", "PPOI")
                     .width(px(POI_COLUMN_WIDTH))
                     .movable(false),
                 Column::new("source_tx", "source tx")
@@ -1096,12 +1166,35 @@ impl UtxoDelegate {
             ],
             tx_search_input,
             poi_refreshing: false,
+            finality_context: UtxoFinalityContext::default(),
         }
     }
 
-    pub(super) fn set_rows(&mut self, rows: Vec<UtxoDisplayRow>, poi_refreshing: bool) {
+    pub(super) fn set_rows(
+        &mut self,
+        rows: Vec<UtxoDisplayRow>,
+        poi_refreshing: bool,
+        finality_context: UtxoFinalityContext,
+    ) {
         self.rows = Arc::from(rows);
         self.poi_refreshing = poi_refreshing;
+        self.finality_context = finality_context;
+    }
+
+    pub(super) fn set_finality_context(&mut self, context: UtxoFinalityContext) -> bool {
+        if self.finality_context == context {
+            return false;
+        }
+        self.finality_context = context;
+        true
+    }
+
+    pub(super) const fn set_poi_refreshing(&mut self, poi_refreshing: bool) -> bool {
+        if self.poi_refreshing == poi_refreshing {
+            return false;
+        }
+        self.poi_refreshing = poi_refreshing;
+        true
     }
 
     pub(super) fn set_column_widths(&mut self, widths: &[Pixels]) {
@@ -1141,7 +1234,7 @@ impl TableDelegate for UtxoDelegate {
             .size_full()
             .flex()
             .items_center()
-            .child("POI")
+            .child("PPOI")
             .into_any_element()
     }
 
@@ -1179,14 +1272,42 @@ impl TableDelegate for UtxoDelegate {
                 .child(SharedString::from(row.tree_position.clone()))
                 .into_any_element(),
             1 => {
-                let tooltip = SharedString::from(local_datetime_label(row.source_block_timestamp));
+                let finality = pending_finality_display(row, self.finality_context);
+                let tooltip = SharedString::from(finality.as_ref().map_or_else(
+                    || local_datetime_label(row.source_block_timestamp),
+                    |(_, detail)| {
+                        format!(
+                            "Generated {}. {detail}",
+                            local_datetime_label(row.source_block_timestamp)
+                        )
+                    },
+                ));
                 div()
                     .id(SharedString::from(format!("wallet-generated-{row_ix}")))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .justify_center()
+                    .gap(px(2.0))
                     .text_color(utxo_cell_text_color(row, rgb(theme::TEXT_MUTED)))
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .child(SharedString::from(generated_age_label(
-                        row.source_block_timestamp,
-                    )))
+                    .child(div().text_size(px(13.0)).line_height(px(16.0)).child(
+                        SharedString::from(generated_age_label(row.source_block_timestamp)),
+                    ))
+                    .when_some(finality, |this, (label, _)| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(rgb(theme::WARNING))
+                                .child(Icon::new(RailgunActionIcon::Clock).xsmall())
+                                .child(SharedString::from(label)),
+                        )
+                    })
                     .into_any_element()
             }
             2 => {
@@ -1232,6 +1353,7 @@ impl TableDelegate for UtxoDelegate {
                 .child(SharedString::from(row.amount.clone()))
                 .into_any_element(),
             4 => div()
+                .h_full()
                 .flex()
                 .items_center()
                 .gap_1()
@@ -1294,16 +1416,133 @@ fn poi_status_indicator(row: &UtxoDisplayRow, row_ix: usize) -> gpui::AnyElement
     } else {
         Tag::warning()
     };
-    let detail = ppoi_row_state_detail(row.ppoi_state, row.is_spent);
+    let (label, detail, show_clock) = match shield_poi_wait_display(row, now_epoch_secs()) {
+        Some(display) => (display.label, display.detail, true),
+        None => (
+            row.poi_status.clone(),
+            ppoi_row_state_detail(row.ppoi_state, row.is_spent),
+            false,
+        ),
+    };
     div()
         .id(SharedString::from(format!("wallet-poi-status-{row_ix}")))
         .tooltip(move |window, cx| Tooltip::new(detail).build(window, cx))
         .child(
-            tag.small()
-                .outline()
-                .child(SharedString::from(row.poi_status.clone())),
+            tag.small().outline().child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(show_clock, |this| {
+                        this.child(Icon::new(RailgunActionIcon::Clock).xsmall())
+                    })
+                    .child(SharedString::from(label)),
+            ),
         )
         .into_any_element()
+}
+
+pub(super) struct ShieldPoiWaitDisplay {
+    pub(super) label: String,
+    pub(super) detail: &'static str,
+    pub(super) delayed: bool,
+}
+
+pub(super) fn shield_poi_wait_display(
+    row: &UtxoDisplayRow,
+    now_epoch_secs: u64,
+) -> Option<ShieldPoiWaitDisplay> {
+    if row.activity_classification != "Shield"
+        || row.poi_spendable
+        || row.is_spent
+        || row.pending_new
+        || row.pending_spent
+        || row.local_pending_spent
+        || row.source_block_timestamp == 0
+        || !matches!(
+            row.ppoi_state,
+            UtxoPpoiState::Missing | UtxoPpoiState::Unknown | UtxoPpoiState::ProofSubmitted
+        )
+    {
+        return None;
+    }
+
+    shield_poi_wait_time_display(row.source_block_timestamp, now_epoch_secs)
+}
+
+pub(super) fn shield_poi_wait_time_display(
+    source_block_timestamp: u64,
+    now_epoch_secs: u64,
+) -> Option<ShieldPoiWaitDisplay> {
+    let deadline = source_block_timestamp.checked_add(SECONDS_PER_HOUR)?;
+    let remaining_secs = deadline
+        .saturating_sub(now_epoch_secs)
+        .min(SECONDS_PER_HOUR);
+    if remaining_secs == 0 {
+        return Some(ShieldPoiWaitDisplay {
+            label: "Taking longer than usual".to_string(),
+            detail: "Shield PPOI verification is taking longer than usual. Timing may vary.",
+            delayed: true,
+        });
+    }
+
+    let remaining_minutes = remaining_secs.div_ceil(SECONDS_PER_MINUTE);
+    let label = if remaining_minutes >= 60 {
+        "~1h".to_string()
+    } else {
+        format!("~{remaining_minutes}m")
+    };
+    Some(ShieldPoiWaitDisplay {
+        label,
+        detail: "Estimated time remaining for Shield PPOI verification. This typically takes about one hour; timing may vary.",
+        delayed: false,
+    })
+}
+
+pub(super) fn pending_finality_display(
+    row: &UtxoDisplayRow,
+    context: UtxoFinalityContext,
+) -> Option<(String, String)> {
+    let (block_number, progress_subject, pending_object, indexing_detail) = if row.pending_spent {
+        (
+            row.spent_block_number?,
+            "spend",
+            "spend",
+            "The spend transaction reached the chain safe head. Waiting for the wallet snapshot to mark this output spent.",
+        )
+    } else if row.pending_new {
+        (
+            row.source_block_number,
+            "receive",
+            "output",
+            "The source transaction reached the chain safe head. Waiting for the wallet snapshot to include this output.",
+        )
+    } else {
+        return None;
+    };
+    if block_number == 0 {
+        return None;
+    }
+    let head_block = context.head_block?;
+    let safe_head_block = context.safe_head_block?;
+    let finality_depth = context.finality_depth?;
+    if finality_depth == 0 || safe_head_block > head_block || head_block < block_number {
+        return None;
+    }
+    if safe_head_block >= block_number {
+        return Some(("Indexing".to_string(), indexing_detail.to_string()));
+    }
+
+    let elapsed = head_block - block_number;
+    if elapsed >= finality_depth {
+        return None;
+    }
+    Some((
+        format!("{elapsed}/{finality_depth} blocks"),
+        format!(
+            "Pending {progress_subject}: {elapsed} of {finality_depth} finality blocks elapsed. This {pending_object} remains pending until it reaches the chain safe head."
+        ),
+    ))
 }
 
 fn ppoi_retry_action(
@@ -1586,10 +1825,12 @@ pub(super) fn should_show_ppoi_retry_action(row: &UtxoDisplayRow) -> bool {
 
 pub(super) const fn global_poi_retry_available(
     session_available: bool,
+    refreshing: bool,
     workflow_needs_attention: u64,
     owned_retry_candidates: usize,
 ) -> bool {
-    session_available && (workflow_needs_attention > 0 || owned_retry_candidates > 0)
+    session_available
+        && (owned_retry_candidates > 0 || (!refreshing && workflow_needs_attention > 0))
 }
 
 pub(super) const fn poi_retry_button_label(refreshing: bool) -> &'static str {
@@ -1602,24 +1843,20 @@ pub(super) const fn poi_retry_button_label(refreshing: bool) -> &'static str {
 
 pub(super) const fn ppoi_state_detail(state: UtxoPpoiState) -> &'static str {
     match state {
-        UtxoPpoiState::Valid => "This output has valid PPOI and is spendable.",
+        UtxoPpoiState::Valid => "Verified and spendable.",
         UtxoPpoiState::Missing => {
-            "The PPOI service has no proof for this output. The sending wallet normally submits it, and this output stays unspendable until validation succeeds. If retry here does not resolve it, open and sync the sending wallet, then retry PPOI submissions there."
+            "No proof has been submitted for this output yet. Retrying usually resolves it."
         }
-        UtxoPpoiState::ProofSubmitted => "The PPOI proof was submitted and is awaiting validation.",
-        UtxoPpoiState::Unknown => "This output's PPOI status needs checking.",
-        UtxoPpoiState::ShieldBlocked => {
-            "This Shield output is blocked and must use the refund action instead."
-        }
-        UtxoPpoiState::Mixed => {
-            "Active PPOI lists report mixed states; this output stays unspendable while its status is checked."
-        }
+        UtxoPpoiState::ProofSubmitted => "Submitted, awaiting verification.",
+        UtxoPpoiState::Unknown => "Status not yet checked.",
+        UtxoPpoiState::ShieldBlocked => "Blocked — use refund instead.",
+        UtxoPpoiState::Mixed => "Verification lists disagree; not spendable while this is checked.",
     }
 }
 
 pub(super) const fn ppoi_row_state_detail(state: UtxoPpoiState, is_spent: bool) -> &'static str {
     if is_spent && matches!(state, UtxoPpoiState::Valid) {
-        "This spent output has valid historical PPOI status."
+        "Verified — already spent."
     } else {
         ppoi_state_detail(state)
     }
@@ -1629,12 +1866,15 @@ pub(super) const fn ppoi_workflow_status_title(
     status: WalletPpoiWorkflowStatus,
     refreshing: bool,
 ) -> Option<&'static str> {
-    if refreshing {
+    let has_work = status.awaiting_submission > 0
+        || status.awaiting_validation > 0
+        || status.needs_attention > 0;
+    if refreshing && has_work {
         Some("Submitting PPOIs…")
     } else if status.needs_attention > 0 {
         Some("PPOI submission needs attention")
     } else if status.awaiting_validation > 0 {
-        Some("Awaiting PPOI validation")
+        Some("Awaiting PPOI verification")
     } else if status.awaiting_submission > 0 {
         Some("PPOI submission pending")
     } else {
@@ -1653,7 +1893,7 @@ pub(super) fn ppoi_workflow_status_detail(status: WalletPpoiWorkflowStatus) -> S
     if status.awaiting_validation > 0 {
         parts.push(ppoi_workflow_count_label(
             status.awaiting_validation,
-            "awaiting validation",
+            "awaiting verification",
         ));
     }
     if status.needs_attention > 0 {
@@ -1663,7 +1903,7 @@ pub(super) fn ppoi_workflow_status_detail(status: WalletPpoiWorkflowStatus) -> S
         ));
     }
     if parts.is_empty() {
-        "Checking sender-created PPOI contexts.".to_string()
+        "Checking proofs from the sending wallet.".to_string()
     } else {
         parts.join(" · ")
     }
@@ -1886,6 +2126,7 @@ fn matches_utxo_filters(row: &UtxoOutput, tx_query: &str, show_spent_utxos: bool
 }
 
 fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
+    let raw_value = U256::from_str_radix(&row.value, 10).ok();
     let Some(address) = parse_address(&row.token) else {
         return UtxoDisplayRow {
             utxo_id: blocked_shield_rescue_utxo_id_from_output(row),
@@ -1893,13 +2134,16 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
             token: row.token.clone(),
             token_icon_path: None,
             amount: row.value.clone(),
+            raw_value,
             activity_classification: row.activity_classification.clone(),
             poi_status: format_poi_status(row),
             ppoi_state: row.ppoi_state,
             poi_spendable: row.poi_spendable,
             source_tx_hash: row.source_tx_hash.clone(),
+            source_block_number: row.source_block_number,
             source_block_timestamp: row.source_block_timestamp,
             spent_tx_hash: row.spent_tx_hash.clone(),
+            spent_block_number: row.spent_block_number,
             token_address: row.token.clone(),
             is_spent: row.is_spent,
             pending_new: row.pending_new,
@@ -1910,8 +2154,8 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
     };
 
     let (token, amount, token_icon_path) = if let Some(token) = lookup_token(chain_id, &address) {
-        let amount = U256::from_str_radix(&row.value, 10).map_or_else(
-            |_| row.value.clone(),
+        let amount = raw_value.map_or_else(
+            || row.value.clone(),
             |value| format_token_amount(value, token.decimals),
         );
         (
@@ -1929,13 +2173,16 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         token,
         token_icon_path,
         amount,
+        raw_value,
         activity_classification: row.activity_classification.clone(),
         poi_status: format_poi_status(row),
         ppoi_state: row.ppoi_state,
         poi_spendable: row.poi_spendable,
         source_tx_hash: row.source_tx_hash.clone(),
+        source_block_number: row.source_block_number,
         source_block_timestamp: row.source_block_timestamp,
         spent_tx_hash: row.spent_tx_hash.clone(),
+        spent_block_number: row.spent_block_number,
         token_address: address.to_checksum(None),
         is_spent: row.is_spent,
         pending_new: row.pending_new,
@@ -2060,7 +2307,7 @@ fn local_datetime_label(timestamp: u64) -> String {
         .to_string()
 }
 
-fn now_epoch_secs() -> u64 {
+pub(super) fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

@@ -198,16 +198,19 @@ fn ppoi_row_retry_eligibility_includes_actionable_states_and_excludes_spent() {
 }
 
 #[test]
-fn missing_ppoi_detail_gives_sender_retry_instructions() {
-    let detail = ppoi_state_detail(UtxoPpoiState::Missing);
-
-    assert!(detail.contains("PPOI service has no proof"));
-    assert!(detail.contains("sending wallet normally submits"));
-    assert!(detail.contains("stays unspendable"));
-    assert!(detail.contains("open and sync the sending wallet"));
-    assert!(detail.contains("retry PPOI submissions there"));
-    assert!(ppoi_state_detail(UtxoPpoiState::ProofSubmitted).contains("awaiting validation"));
-    assert!(ppoi_state_detail(UtxoPpoiState::Unknown).contains("status needs checking"));
+fn ppoi_state_details_use_concise_user_copy() {
+    assert_eq!(
+        ppoi_state_detail(UtxoPpoiState::Missing),
+        "No proof has been submitted for this output yet. Retrying usually resolves it."
+    );
+    assert_eq!(
+        ppoi_state_detail(UtxoPpoiState::ProofSubmitted),
+        "Submitted, awaiting verification."
+    );
+    assert_eq!(
+        ppoi_state_detail(UtxoPpoiState::Unknown),
+        "Status not yet checked."
+    );
 }
 
 #[test]
@@ -224,10 +227,11 @@ fn global_sender_retry_requires_actionable_work() {
     };
 
     assert_eq!(recoverable_poi_candidate_count(&snapshot), 0);
-    assert!(!global_poi_retry_available(true, 0, 0));
-    assert!(!global_poi_retry_available(false, 1, 0));
-    assert!(global_poi_retry_available(true, 1, 0));
-    assert!(global_poi_retry_available(true, 0, 1));
+    assert!(!global_poi_retry_available(true, false, 0, 0));
+    assert!(!global_poi_retry_available(false, false, 1, 0));
+    assert!(global_poi_retry_available(true, false, 1, 0));
+    assert!(!global_poi_retry_available(true, true, 1, 0));
+    assert!(global_poi_retry_available(true, true, 0, 1));
     assert_eq!(poi_retry_button_label(false), "Retry PPOI submissions");
     assert_eq!(poi_retry_button_label(true), "Submitting PPOIs…");
 }
@@ -236,9 +240,10 @@ fn global_sender_retry_requires_actionable_work() {
 fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
     let healthy = wallet_ops::WalletPpoiWorkflowStatus::default();
     assert_eq!(ppoi_workflow_status_title(healthy, false), None);
+    assert_eq!(ppoi_workflow_status_title(healthy, true), None);
     assert_eq!(
-        ppoi_workflow_status_title(healthy, true),
-        Some("Submitting PPOIs…")
+        ppoi_workflow_status_detail(healthy),
+        "Checking proofs from the sending wallet."
     );
 
     let pending = wallet_ops::WalletPpoiWorkflowStatus {
@@ -249,11 +254,15 @@ fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
     };
     assert_eq!(
         ppoi_workflow_status_title(pending, false),
-        Some("Awaiting PPOI validation")
+        Some("Awaiting PPOI verification")
+    );
+    assert_eq!(
+        ppoi_workflow_status_title(pending, true),
+        Some("Submitting PPOIs…")
     );
     assert_eq!(
         ppoi_workflow_status_detail(pending),
-        "1 PPOI awaiting submission · 2 PPOIs awaiting validation"
+        "1 PPOI awaiting submission · 2 PPOIs awaiting verification"
     );
 
     let attention = wallet_ops::WalletPpoiWorkflowStatus {
@@ -271,7 +280,7 @@ fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
 fn spent_valid_ppoi_detail_is_historical_not_spendable() {
     assert_eq!(
         ppoi_row_state_detail(UtxoPpoiState::Valid, true),
-        "This spent output has valid historical PPOI status."
+        "Verified — already spent."
     );
     assert!(!ppoi_row_state_detail(UtxoPpoiState::Valid, true).contains("spendable"));
     assert!(ppoi_row_state_detail(UtxoPpoiState::Valid, false).contains("spendable"));
@@ -304,6 +313,200 @@ fn display_rows_include_activity_classification() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].activity_classification, "Blocked Shield");
     assert_eq!(rows[0].poi_status, "ShieldBlocked");
+    assert_eq!(rows[0].source_block_number, 11);
+}
+
+#[test]
+fn pending_receive_finality_tracks_depth_and_indexing() {
+    let mut pending = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    pending.pending_new = true;
+    pending.source_block_number = 100;
+    let row = display_rows_from_output(
+        &ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            local_pending_spent_count: 0,
+            utxos: vec![pending],
+            totals: Vec::new(),
+        },
+        "",
+        false,
+    )
+    .remove(0);
+
+    for (context, expected) in [
+        (
+            UtxoFinalityContext::new(Some(100), Some(88), Some(12)),
+            Some("0/12 blocks"),
+        ),
+        (
+            UtxoFinalityContext::new(Some(105), Some(93), Some(12)),
+            Some("5/12 blocks"),
+        ),
+        (
+            UtxoFinalityContext::new(Some(112), Some(100), Some(12)),
+            Some("Indexing"),
+        ),
+        (UtxoFinalityContext::new(Some(99), Some(87), Some(12)), None),
+    ] {
+        assert_eq!(
+            pending_finality_display(&row, context)
+                .as_ref()
+                .map(|(label, _)| label.as_str()),
+            expected
+        );
+    }
+}
+
+#[test]
+fn pending_spend_finality_tracks_depth_and_skips_local_locks() {
+    let mut pending = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    pending.pending_new = true;
+    pending.source_block_number = 20;
+    pending.pending_spent = true;
+    pending.spent_block_number = Some(100);
+    let row = display_rows_from_output(
+        &ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            local_pending_spent_count: 0,
+            utxos: vec![pending],
+            totals: Vec::new(),
+        },
+        "",
+        false,
+    )
+    .remove(0);
+
+    for (context, expected) in [
+        (
+            UtxoFinalityContext::new(Some(100), Some(88), Some(12)),
+            Some("0/12 blocks"),
+        ),
+        (
+            UtxoFinalityContext::new(Some(105), Some(93), Some(12)),
+            Some("5/12 blocks"),
+        ),
+        (
+            UtxoFinalityContext::new(Some(112), Some(100), Some(12)),
+            Some("Indexing"),
+        ),
+    ] {
+        assert_eq!(
+            pending_finality_display(&row, context)
+                .as_ref()
+                .map(|(label, _)| label.as_str()),
+            expected
+        );
+    }
+    assert!(
+        pending_finality_display(
+            &row,
+            UtxoFinalityContext::new(Some(105), Some(93), Some(12))
+        )
+        .is_some_and(|(_, detail)| detail.starts_with("Pending spend:"))
+    );
+
+    let mut local = row;
+    local.pending_new = false;
+    local.pending_spent = false;
+    local.local_pending_spent = true;
+    local.spent_block_number = None;
+    assert_eq!(
+        pending_finality_display(
+            &local,
+            UtxoFinalityContext::new(Some(105), Some(93), Some(12))
+        ),
+        None
+    );
+}
+
+#[test]
+fn shield_poi_wait_display_counts_down_then_expires() {
+    let mut shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    shield.activity_classification = "Shield".to_string();
+    shield.ppoi_state = UtxoPpoiState::Missing;
+    shield.poi_spendable = false;
+    shield.source_block_timestamp = 1_000;
+    let row = display_rows_from_output(
+        &ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            local_pending_spent_count: 0,
+            utxos: vec![shield],
+            totals: Vec::new(),
+        },
+        "",
+        false,
+    )
+    .remove(0);
+
+    assert_eq!(
+        shield_poi_wait_display(&row, 1_000).map(|display| display.label),
+        Some("~1h".to_string())
+    );
+    assert_eq!(
+        shield_poi_wait_display(&row, 1_061).map(|display| display.label),
+        Some("~59m".to_string())
+    );
+    assert_eq!(
+        shield_poi_wait_display(&row, 4_599).map(|display| display.label),
+        Some("~1m".to_string())
+    );
+    assert_eq!(
+        shield_poi_wait_display(&row, 4_600).map(|display| display.label),
+        Some("Taking longer than usual".to_string())
+    );
+}
+
+#[test]
+fn shield_poi_wait_display_preserves_authoritative_states() {
+    let mut shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    shield.activity_classification = "Shield".to_string();
+    shield.ppoi_state = UtxoPpoiState::Missing;
+    shield.poi_spendable = false;
+    let row = display_rows_from_output(
+        &ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            local_pending_spent_count: 0,
+            utxos: vec![shield],
+            totals: Vec::new(),
+        },
+        "",
+        false,
+    )
+    .remove(0);
+
+    let mut private_output = row.clone();
+    private_output.activity_classification = "Private Output".to_string();
+    assert!(shield_poi_wait_display(&private_output, row.source_block_timestamp).is_none());
+
+    let mut valid = row.clone();
+    valid.ppoi_state = UtxoPpoiState::Valid;
+    valid.poi_spendable = true;
+    assert!(shield_poi_wait_display(&valid, row.source_block_timestamp).is_none());
+
+    let mut blocked = row.clone();
+    blocked.activity_classification = "Blocked Shield".to_string();
+    blocked.ppoi_state = UtxoPpoiState::ShieldBlocked;
+    assert!(shield_poi_wait_display(&blocked, row.source_block_timestamp).is_none());
+
+    let mut pending = row.clone();
+    pending.pending_new = true;
+    assert!(shield_poi_wait_display(&pending, row.source_block_timestamp).is_none());
 }
 
 #[test]

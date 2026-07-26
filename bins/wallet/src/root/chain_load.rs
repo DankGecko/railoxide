@@ -634,6 +634,15 @@ impl ChainUtxoState {
         }
     }
 
+    pub(super) const fn set_poi_refreshing(&mut self, refreshing: bool) {
+        match self {
+            Self::Syncing { poi_refreshing, .. } | Self::Ready { poi_refreshing, .. } => {
+                *poi_refreshing = refreshing;
+            }
+            Self::Idle | Self::Loading { .. } | Self::Error { .. } => {}
+        }
+    }
+
     pub(super) const fn ppoi_workflow_status(&self) -> WalletPpoiWorkflowStatus {
         match self {
             Self::Syncing {
@@ -724,14 +733,6 @@ pub(super) struct WalletStatusCounts {
 }
 
 impl WalletStatusCounts {
-    pub(super) const fn has_private_attention(self) -> bool {
-        self.pending_incoming_outputs > 0
-            || self.pending_outgoing_outputs > 0
-            || self.pending_poi_assets > 0
-            || self.recoverable_poi_outputs > 0
-            || self.blocked_shield_outputs > 0
-    }
-
     pub(super) const fn ppoi_attention_count(self) -> usize {
         self.recoverable_poi_outputs + self.blocked_shield_outputs
     }
@@ -871,10 +872,13 @@ pub(super) const fn ppoi_presence_status(
 pub(super) fn ready_wallet_status_labels(counts: WalletStatusCounts) -> SyncStatusLabels {
     let title = if counts.blocked_shield_outputs > 0 {
         "Private assets need attention"
-    } else if counts.recoverable_poi_outputs > 0 {
-        "PPOI retry available"
-    } else if counts.has_private_attention() {
-        "Private balance update pending"
+    } else if counts.recoverable_poi_outputs > 0
+        || counts.pending_poi_assets > 0
+        || counts.pending_incoming_outputs > 0
+    {
+        "Not yet spendable"
+    } else if counts.pending_outgoing_outputs > 0 {
+        "Waiting for confirmation"
     } else {
         "Wallet ready"
     };
@@ -892,26 +896,36 @@ fn ready_wallet_status_detail(counts: WalletStatusCounts) -> String {
         } else {
             " need attention"
         };
-        return count_label(counts.blocked_shield_outputs, "blocked Shield output") + verb;
+        return count_label(counts.blocked_shield_outputs, "blocked Shield") + verb;
     }
     if counts.recoverable_poi_outputs > 0 {
-        return count_label(counts.recoverable_poi_outputs, "output") + " can retry PPOI";
+        return if counts.recoverable_poi_outputs == 1 {
+            "1 PPOI verification retry is available".to_string()
+        } else {
+            format!(
+                "{} PPOI verification retries are available",
+                counts.recoverable_poi_outputs
+            )
+        };
     }
     let mut parts = Vec::new();
     if counts.pending_incoming_outputs > 0 {
         parts.push(count_label(
             counts.pending_incoming_outputs,
-            "incoming output",
+            "incoming transfer",
         ));
     }
     if counts.pending_outgoing_outputs > 0 {
         parts.push(count_label(
             counts.pending_outgoing_outputs,
-            "outgoing output",
+            "outgoing transfer",
         ));
     }
     if counts.pending_poi_assets > 0 {
-        parts.push(count_label(counts.pending_poi_assets, "PPOI-pending asset"));
+        parts.push(format!(
+            "{} awaiting PPOI verification",
+            count_label(counts.pending_poi_assets, "asset")
+        ));
     }
     if parts.is_empty() {
         "Private wallet synced and ready".to_string()
@@ -2178,6 +2192,9 @@ impl WalletRoot {
                             break;
                         }
                         let observation = observation_rx.borrow_and_update().clone();
+                        let latest_poi_refreshing = poi_refreshing_rx
+                            .as_ref()
+                            .map(|rx| *rx.borrow());
                         let ppoi_workflow_status = observation.ppoi_workflow_status;
                         let validation_completed = ppoi_validation_completion_is_current(
                             last_ppoi_validation_revision,
@@ -2236,7 +2253,7 @@ impl WalletRoot {
                             };
                             let became_ready =
                                 ready && matches!(&state, ChainUtxoState::Syncing { .. });
-                            let state = match state {
+                            let mut state = match state {
                                 ChainUtxoState::Syncing {
                                     progress,
                                     session,
@@ -2312,6 +2329,9 @@ impl WalletRoot {
                                     return false;
                                 }
                             };
+                            if let Some(latest_poi_refreshing) = latest_poi_refreshing {
+                                state.set_poi_refreshing(latest_poi_refreshing);
+                            }
                             root.chain_states.insert(chain_id, state);
                             if ready {
                                 root.handle_initial_sync_observation(
@@ -2387,6 +2407,9 @@ impl WalletRoot {
                                     InitialSyncObservation::Progress(fingerprint),
                                 );
                             }
+                            if root.selected_chain == chain_id {
+                                root.sync_utxo_finality_context(cx);
+                            }
                             cx.notify();
                             true
                         });
@@ -2419,17 +2442,12 @@ impl WalletRoot {
                             let Some(state) = root.chain_states.get_mut(&chain_id) else {
                                 return false;
                             };
-                            match state {
-                                ChainUtxoState::Syncing { poi_refreshing: state, .. }
-                                | ChainUtxoState::Ready { poi_refreshing: state, .. } => {
-                                    *state = poi_refreshing;
-                                }
-                                ChainUtxoState::Idle
-                                | ChainUtxoState::Loading { .. }
-                                | ChainUtxoState::Error { .. } => return false,
+                            if !matches!(state, ChainUtxoState::Syncing { .. } | ChainUtxoState::Ready { .. }) {
+                                return false;
                             }
+                            state.set_poi_refreshing(poi_refreshing);
                             if root.selected_chain == chain_id {
-                                root.sync_utxo_table(cx);
+                                root.sync_utxo_poi_refreshing(poi_refreshing, cx);
                             }
                             cx.notify();
                             true

@@ -266,6 +266,9 @@ impl WalletRoot {
 
 impl Render for WalletRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        if self.private_pending_status_dialog_open && !window.has_active_dialog(cx) {
+            self.private_pending_status_dialog_open = false;
+        }
         let pending_ppoi_validation_toast = self.pending_ppoi_validation_toast.take();
         if pending_ppoi_validation_toast.is_some_and(|(wallet_id, wallet_generation)| {
             ppoi_validation_toast_scope_is_current(
@@ -275,7 +278,7 @@ impl Render for WalletRoot {
                 wallet_generation,
             )
         }) {
-            window.push_notification(Notification::success("PPOI validation complete."), cx);
+            window.push_notification(Notification::success("PPOI verification complete."), cx);
         }
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.sync_walletconnect_attention_for_window(window);
@@ -1537,8 +1540,8 @@ fn render_ppoi_hover_action_note(
         .hover(move |this| this.bg(rgb_with_alpha(color, 0.14)))
         .on_click(move |_event, window, cx| {
             cx.stop_propagation();
-            root.update(cx, |_root, cx| {
-                WalletRoot::open_private_pending_status_dialog(window, cx);
+            root.update(cx, |root, cx| {
+                root.open_private_pending_status_dialog(window, cx);
             });
         })
 }

@@ -6,6 +6,7 @@ use super::private_action::{
 };
 use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
+    private_pending_summary, private_pending_summary_detail, private_pending_summary_title,
     private_send_action_tooltip, private_unshield_action_tooltip, should_show_pending_amount,
     should_show_pending_poi_amount, total_private_balance_usd_amount,
 };

@@ -188,9 +188,10 @@ use private_action::{
 #[cfg(test)]
 use private_assets::{
     format_private_asset_rows, format_total, max_send_amount_from_snapshot,
-    max_unshield_amount_from_snapshot, private_asset_display_amounts,
-    refresh_form_asset_from_snapshot, retry_poi_label, send_asset_key_from_formatted,
-    send_key_matches_asset, unshield_asset_key_from_formatted, unshield_key_matches_asset,
+    max_unshield_amount_from_snapshot, pending_shield_wait_matches_total,
+    pending_shield_waits_by_token, private_asset_display_amounts, refresh_form_asset_from_snapshot,
+    retry_poi_label, send_asset_key_from_formatted, send_key_matches_asset,
+    unshield_asset_key_from_formatted, unshield_key_matches_asset,
 };
 #[cfg(test)]
 use private_broadcaster::{
@@ -264,11 +265,12 @@ use spend_authorization::{
 use startup::{load_validated_startup_settings, resolve_initial_chain_id};
 #[cfg(test)]
 use utxo::{
-    UtxoDisplayRow, activity_classification_icon_style, apply_blocked_shield_rescue_rows,
-    blocked_shield_refund_action_available, blocked_shield_refund_origin_resolving,
-    display_rows_from_output, format_compact_age, global_poi_retry_available,
-    poi_retry_button_label, ppoi_row_state_detail, ppoi_state_detail, ppoi_workflow_status_detail,
-    ppoi_workflow_status_title, recoverable_poi_candidate_count,
+    UtxoDisplayRow, UtxoFinalityContext, activity_classification_icon_style,
+    apply_blocked_shield_rescue_rows, blocked_shield_refund_action_available,
+    blocked_shield_refund_origin_resolving, display_rows_from_output, format_compact_age,
+    global_poi_retry_available, pending_finality_display, poi_retry_button_label,
+    ppoi_row_state_detail, ppoi_state_detail, ppoi_workflow_status_detail,
+    ppoi_workflow_status_title, recoverable_poi_candidate_count, shield_poi_wait_display,
     should_show_blocked_shield_refund_action, should_show_ppoi_retry_action,
 };
 #[cfg(test)]
@@ -416,6 +418,7 @@ pub(crate) struct WalletRoot {
     chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
     pending_ppoi_validation_toast: Option<(Arc<str>, u64)>,
+    private_pending_status_dialog_open: bool,
     poi_artifact_cache_progress: BTreeMap<u64, PoiArtifactCacheProgress>,
     poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts,
     wallet_sync_lifecycle: WalletSyncLifecycle,
@@ -1186,6 +1189,7 @@ impl WalletRoot {
             chain_select: chain_select.clone(),
             chain_states,
             pending_ppoi_validation_toast: None,
+            private_pending_status_dialog_open: false,
             poi_artifact_cache_progress: BTreeMap::new(),
             poi_artifact_cache_retry_attempts: PoiArtifactCacheRetryAttempts::default(),
             wallet_sync_lifecycle: WalletSyncLifecycle::new(),
@@ -1622,6 +1626,11 @@ impl WalletRoot {
                                 .is_some_and(|state| state.snapshot().is_some()),
                         ) {
                             root.utxo_table.update(cx, |_table, cx| cx.notify());
+                        }
+                        if root.private_pending_status_dialog_open
+                            && root.private_pending_status_has_shield_timer()
+                        {
+                            cx.notify();
                         }
                     })
                     .is_err()

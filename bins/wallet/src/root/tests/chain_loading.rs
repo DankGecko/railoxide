@@ -1547,7 +1547,7 @@ fn ready_wallet_status_labels_prioritize_actionable_private_attention() {
         SyncStatusLabels {
             title: "Private assets need attention".to_string(),
             percent: 100,
-            detail: "1 blocked Shield output needs attention".to_string(),
+            detail: "1 blocked Shield needs attention".to_string(),
         }
     );
     assert_eq!(
@@ -1556,9 +1556,9 @@ fn ready_wallet_status_labels_prioritize_actionable_private_attention() {
             ..WalletStatusCounts::default()
         }),
         SyncStatusLabels {
-            title: "PPOI retry available".to_string(),
+            title: "Not yet spendable".to_string(),
             percent: 100,
-            detail: "3 outputs can retry PPOI".to_string(),
+            detail: "3 PPOI verification retries are available".to_string(),
         }
     );
     assert_eq!(
@@ -1569,9 +1569,22 @@ fn ready_wallet_status_labels_prioritize_actionable_private_attention() {
             ..WalletStatusCounts::default()
         }),
         SyncStatusLabels {
-            title: "Private balance update pending".to_string(),
+            title: "Not yet spendable".to_string(),
             percent: 100,
-            detail: "1 incoming output · 2 outgoing outputs · 1 PPOI-pending asset".to_string(),
+            detail:
+                "1 incoming transfer · 2 outgoing transfers · 1 asset awaiting PPOI verification"
+                    .to_string(),
+        }
+    );
+    assert_eq!(
+        ready_wallet_status_labels(WalletStatusCounts {
+            pending_outgoing_outputs: 2,
+            ..WalletStatusCounts::default()
+        }),
+        SyncStatusLabels {
+            title: "Waiting for confirmation".to_string(),
+            percent: 100,
+            detail: "2 outgoing transfers".to_string(),
         }
     );
 }
