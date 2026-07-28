@@ -1,10 +1,10 @@
 use alloy::network::TransactionBuilder as _;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use eyre::{Result, WrapErr, eyre};
 
-use super::contracts::PublicErc20;
+use super::contracts::{PublicErc20, PublicRelayAdapt, RelayAdaptCall};
 use super::runtime::{public_chain_runtime_config, public_shield_token};
 use super::signer::vaulted_public_signer;
 use super::submission::{
@@ -16,10 +16,7 @@ use super::types::{
     PublicActionSessionEvent, PublicAssetId, PublicSendRequest, PublicSendResult,
     PublicShieldRequest,
 };
-use crate::{
-    HttpContext, ShieldSendOutput, WETH_DEPOSIT_SELECTOR, query_rpc_pool_with_http_client,
-    report_chain_string,
-};
+use crate::{HttpContext, ShieldSendOutput, query_rpc_pool_with_http_client, report_chain_string};
 
 pub async fn submit_public_send(
     request: PublicSendRequest,
@@ -159,10 +156,6 @@ pub async fn submit_public_shield_with_progress(
         signer.derive_shield_private_key().await?
     };
     emit_refreshed_public_action_hardware_session(event_tx.as_ref(), &signer);
-    let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
-        chain.railgun_contract,
-        request.amount,
-    );
     let shield_data = broadcaster_core::contracts::shield::build_shield_calldata(
         addr_data.master_public_key,
         &addr_data.viewing_public_key,
@@ -175,19 +168,24 @@ pub async fn submit_public_shield_with_progress(
     let from_address = signer.address();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
 
-    let wrap_receipt = if request.asset == PublicAssetId::Native {
-        let tx_req = TransactionRequest::default()
+    let approve_receipt = if request.asset == PublicAssetId::Native {
+        None
+    } else {
+        let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
+            chain.railgun_contract,
+            request.amount,
+        );
+        let approve_tx = TransactionRequest::default()
             .with_chain_id(request.chain_id)
             .with_from(from_address)
             .with_to(token)
-            .with_input(WETH_DEPOSIT_SELECTOR.to_vec())
-            .with_value(request.amount)
+            .with_input(approve_data)
             .with_nonce(0);
-        let outcome = submit_public_action_step_session(
-            PublicActionProgressStep::Wrap,
-            tx_req,
+        let approve_outcome = submit_public_action_step_session(
+            PublicActionProgressStep::Approve,
+            approve_tx,
             &signer,
-            "public-shield-wrap",
+            "public-shield-approve",
             &query_rpc_pool,
             http.network_mode(),
             request.chain_id,
@@ -200,59 +198,34 @@ pub async fn submit_public_shield_with_progress(
             &mut progress,
         )
         .await?;
-        let receipt = outcome.receipt;
+        let receipt = approve_outcome.receipt;
         if !receipt.status {
             return Err(eyre!(
-                "public shield wrap transaction reverted ({})",
+                "public shield approve transaction reverted ({})",
                 receipt.tx_hash
             ));
         }
-        nonce = Some(outcome.next_nonce);
-        gas_fee = outcome.gas_fee;
+        nonce = Some(approve_outcome.next_nonce);
+        gas_fee = approve_outcome.gas_fee;
         Some(receipt)
-    } else {
-        None
     };
 
-    let approve_tx = TransactionRequest::default()
-        .with_chain_id(request.chain_id)
-        .with_from(from_address)
-        .with_to(token)
-        .with_input(approve_data)
-        .with_nonce(0);
-    let approve_outcome = submit_public_action_step_session(
-        PublicActionProgressStep::Approve,
-        approve_tx,
-        &signer,
-        "public-shield-approve",
-        &query_rpc_pool,
-        http.network_mode(),
-        request.chain_id,
-        from_address,
-        &chain.gas,
-        nonce,
-        gas_fee,
-        &mut command_rx,
-        event_tx.as_ref(),
-        &mut progress,
-    )
-    .await?;
-    let approve_receipt = approve_outcome.receipt;
-    if !approve_receipt.status {
-        return Err(eyre!(
-            "public shield approve transaction reverted ({})",
-            approve_receipt.tx_hash
-        ));
-    }
-    nonce = Some(approve_outcome.next_nonce);
-    gas_fee = approve_outcome.gas_fee;
-
-    let shield_tx = TransactionRequest::default()
-        .with_chain_id(request.chain_id)
-        .with_from(from_address)
-        .with_to(chain.railgun_contract)
-        .with_input(shield_data)
-        .with_nonce(0);
+    let shield_tx = if request.asset == PublicAssetId::Native {
+        public_native_shield_transaction_request(
+            request.chain_id,
+            from_address,
+            chain.relay_adapt_contract,
+            request.amount,
+            shield_data,
+        )
+    } else {
+        TransactionRequest::default()
+            .with_chain_id(request.chain_id)
+            .with_from(from_address)
+            .with_to(chain.railgun_contract)
+            .with_input(shield_data)
+            .with_nonce(0)
+    };
     let shield_receipt = submit_public_action_step_session(
         PublicActionProgressStep::Shield,
         shield_tx,
@@ -279,10 +252,46 @@ pub async fn submit_public_shield_with_progress(
     }
 
     Ok(ShieldSendOutput {
-        wrap: wrap_receipt,
+        wrap: None,
         approve: approve_receipt,
         shield: shield_receipt,
     })
+}
+
+pub(super) fn public_native_shield_transaction_request(
+    chain_id: u64,
+    from: Address,
+    relay_adapt: Address,
+    amount: U256,
+    shield_data: Vec<u8>,
+) -> TransactionRequest {
+    let calls = vec![
+        RelayAdaptCall {
+            to: relay_adapt,
+            data: PublicRelayAdapt::wrapBaseCall { _amount: amount }
+                .abi_encode()
+                .into(),
+            value: U256::ZERO,
+        },
+        RelayAdaptCall {
+            to: relay_adapt,
+            data: Bytes::from(shield_data),
+            value: U256::ZERO,
+        },
+    ];
+    TransactionRequest::default()
+        .with_chain_id(chain_id)
+        .with_from(from)
+        .with_to(relay_adapt)
+        .with_input(
+            PublicRelayAdapt::multicallCall {
+                _requireSuccess: true,
+                _calls: calls,
+            }
+            .abi_encode(),
+        )
+        .with_value(amount)
+        .with_nonce(0)
 }
 
 pub(super) fn public_send_transaction_request(

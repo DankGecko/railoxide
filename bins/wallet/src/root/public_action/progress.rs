@@ -204,8 +204,6 @@ pub(in crate::root) fn public_action_progress_steps_for_source(
     match mode {
         PublicActionMode::Send => steps.push(PublicActionProgressStep::Send),
         PublicActionMode::Shield if asset == PublicAssetId::Native => {
-            steps.push(PublicActionProgressStep::Wrap);
-            steps.push(PublicActionProgressStep::Approve);
             steps.push(PublicActionProgressStep::Shield);
         }
         PublicActionMode::Shield => {

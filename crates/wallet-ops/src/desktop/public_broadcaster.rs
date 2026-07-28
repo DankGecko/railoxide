@@ -586,7 +586,8 @@ pub struct TxReceiptOutput {
 pub struct ShieldSendOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrap: Option<TxReceiptOutput>,
-    pub approve: TxReceiptOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approve: Option<TxReceiptOutput>,
     pub shield: TxReceiptOutput,
 }
 

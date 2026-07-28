@@ -25,6 +25,7 @@ pub(super) fn public_shield_token(
 pub(super) struct PublicChainRuntimeConfig {
     pub(super) rpc_urls: Vec<Url>,
     pub(super) railgun_contract: Address,
+    pub(super) relay_adapt_contract: Address,
     pub(super) wrapped_native_token: Option<Address>,
     pub(super) multicall_contract: Address,
     pub(super) gas: EffectiveChainGasSettings,
@@ -39,6 +40,7 @@ pub(super) fn public_chain_runtime_config(
         return Ok(PublicChainRuntimeConfig {
             rpc_urls: defaults.rpc_urls,
             railgun_contract: defaults.contract,
+            relay_adapt_contract: defaults.relay_adapt_contract,
             wrapped_native_token: wrapped_native_token_for_chain(chain_id),
             multicall_contract: defaults.multicall_contract,
             gas: EffectiveChainGasSettings {
@@ -60,6 +62,10 @@ pub(super) fn public_chain_runtime_config(
     let rpc_urls = effective_rpc_urls_for_chain(&defaults, Some(effective_chain))?;
     let railgun_contract =
         parse_effective_address("railgun contract", &effective_chain.railgun_contract)?;
+    let relay_adapt_contract = parse_effective_address(
+        "relay adapt contract",
+        &effective_chain.relay_adapt_contract,
+    )?;
     let wrapped_native_token = effective_chain
         .wrapped_native_token
         .as_deref()
@@ -71,6 +77,7 @@ pub(super) fn public_chain_runtime_config(
     Ok(PublicChainRuntimeConfig {
         rpc_urls,
         railgun_contract,
+        relay_adapt_contract,
         wrapped_native_token,
         multicall_contract,
         gas: effective_chain.gas.clone(),

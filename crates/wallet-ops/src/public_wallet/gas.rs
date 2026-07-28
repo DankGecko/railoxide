@@ -19,6 +19,7 @@ const PUBLIC_ERC20_SEND_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_WRAP_GAS_UNITS: u64 = 50_000;
 pub(super) const PUBLIC_NATIVE_APPROVE_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_SHIELD_GAS_UNITS: u64 = 650_000;
+pub(super) const PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS: u64 = 800_000;
 const PUBLIC_ACTION_BNB_CHAIN_ID: u64 = 56;
 
 #[must_use]
@@ -102,18 +103,15 @@ const fn public_action_estimated_gas_units_with_buffer(
             };
             gas_units.saturating_add(gas_limit_buffer)
         }
-        PublicActionKind::Shield => {
-            let wrap_gas = if matches!(asset, PublicAssetId::Native) {
-                PUBLIC_NATIVE_WRAP_GAS_UNITS.saturating_add(gas_limit_buffer)
-            } else {
-                0
-            };
-            wrap_gas
-                .saturating_add(PUBLIC_NATIVE_APPROVE_GAS_UNITS)
+        PublicActionKind::Shield => match asset {
+            PublicAssetId::Native => {
+                PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS.saturating_add(gas_limit_buffer)
+            }
+            PublicAssetId::Erc20(_) => PUBLIC_NATIVE_APPROVE_GAS_UNITS
                 .saturating_add(gas_limit_buffer)
                 .saturating_add(PUBLIC_NATIVE_SHIELD_GAS_UNITS)
-                .saturating_add(gas_limit_buffer)
-        }
+                .saturating_add(gas_limit_buffer),
+        },
     }
 }
 
@@ -187,6 +185,6 @@ const fn public_native_step_gas_units(step: PublicActionProgressStep) -> u64 {
         PublicActionProgressStep::Send => PUBLIC_NATIVE_SEND_GAS_UNITS,
         PublicActionProgressStep::Wrap => PUBLIC_NATIVE_WRAP_GAS_UNITS,
         PublicActionProgressStep::Approve => PUBLIC_NATIVE_APPROVE_GAS_UNITS,
-        PublicActionProgressStep::Shield => PUBLIC_NATIVE_SHIELD_GAS_UNITS,
+        PublicActionProgressStep::Shield => PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS,
     }
 }

@@ -443,51 +443,8 @@ fn public_send_stop_footer_follows_send_handoff_boundary() {
 }
 
 #[test]
-fn public_shield_stop_footer_allows_prerequisites_until_final_shield() {
+fn erc20_public_shield_stop_footer_allows_approval_until_final_shield() {
     let prerequisite_attempt_steps = vec![
-        PublicActionStepState {
-            step: PublicActionProgressStep::Wrap,
-            status: PublicActionStepStatus::Pending,
-            tx_hash: Some(Arc::from("0xwrap")),
-            message: None,
-        },
-        PublicActionStepState {
-            step: PublicActionProgressStep::Approve,
-            status: PublicActionStepStatus::NotStarted,
-            tx_hash: None,
-            message: None,
-        },
-        PublicActionStepState {
-            step: PublicActionProgressStep::Shield,
-            status: PublicActionStepStatus::NotStarted,
-            tx_hash: None,
-            message: None,
-        },
-    ];
-
-    assert!(!public_action_step_is_final_handoff(
-        PublicActionMode::Shield,
-        PublicActionProgressStep::Wrap,
-    ));
-    assert!(!public_action_step_is_final_handoff(
-        PublicActionMode::Shield,
-        PublicActionProgressStep::Approve,
-    ));
-    assert!(public_action_step_is_final_handoff(
-        PublicActionMode::Shield,
-        PublicActionProgressStep::Shield,
-    ));
-    assert_eq!(
-        public_action_progress_footer_action(true, &prerequisite_attempt_steps),
-        ProgressFooterAction::Stop,
-    );
-    let approve_attempt_steps = vec![
-        PublicActionStepState {
-            step: PublicActionProgressStep::Wrap,
-            status: PublicActionStepStatus::Done,
-            tx_hash: Some(Arc::from("0xwrap")),
-            message: None,
-        },
         PublicActionStepState {
             step: PublicActionProgressStep::Approve,
             status: PublicActionStepStatus::Pending,
@@ -501,8 +458,17 @@ fn public_shield_stop_footer_allows_prerequisites_until_final_shield() {
             message: None,
         },
     ];
+
+    assert!(!public_action_step_is_final_handoff(
+        PublicActionMode::Shield,
+        PublicActionProgressStep::Approve,
+    ));
+    assert!(public_action_step_is_final_handoff(
+        PublicActionMode::Shield,
+        PublicActionProgressStep::Shield,
+    ));
     assert_eq!(
-        public_action_progress_footer_action(true, &approve_attempt_steps),
+        public_action_progress_footer_action(true, &prerequisite_attempt_steps),
         ProgressFooterAction::Stop,
     );
     assert_eq!(

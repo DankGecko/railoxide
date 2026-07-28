@@ -46,18 +46,18 @@ pub use walletconnect::{
 };
 
 #[cfg(test)]
-use actions::public_send_transaction_request;
+use actions::{public_native_shield_transaction_request, public_send_transaction_request};
 #[cfg(test)]
 use balances::{
     plan_public_balance_calls, public_balance_assets_for_chain_with_registry,
     public_balance_snapshot_from_results,
 };
 #[cfg(test)]
-use contracts::PublicErc20;
+use contracts::{PublicErc20, PublicRelayAdapt};
 #[cfg(test)]
 use gas::{
-    PUBLIC_NATIVE_APPROVE_GAS_UNITS, PUBLIC_NATIVE_SEND_GAS_UNITS, PUBLIC_NATIVE_SHIELD_GAS_UNITS,
-    PUBLIC_NATIVE_WRAP_GAS_UNITS, public_action_tip_fallback,
+    PUBLIC_NATIVE_APPROVE_GAS_UNITS, PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS,
+    PUBLIC_NATIVE_SEND_GAS_UNITS, PUBLIC_NATIVE_SHIELD_GAS_UNITS, public_action_tip_fallback,
     public_native_action_gas_units_with_buffer,
 };
 #[cfg(test)]

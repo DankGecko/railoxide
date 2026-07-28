@@ -40,9 +40,6 @@ pub(crate) const PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR: &str =
 pub(crate) const PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR: &str =
     "public broadcaster fee-token max spendable: ";
 pub(crate) const PUBLIC_BROADCASTER_REQUIRED_FEE_ERROR: &str = "; required fee: ";
-/// WETH `deposit()` function selector - no arguments, ETH value is the deposit
-/// amount.
-pub(crate) const WETH_DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopWalletSyncStartPolicy {

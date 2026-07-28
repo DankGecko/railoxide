@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use alloy::primitives::{U256, address};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
+use alloy::uint;
 use eyre::eyre;
 use local_db::{DbConfig, DbStore};
 use zeroize::Zeroizing;
@@ -634,16 +635,11 @@ fn public_native_action_gas_reserve_uses_buffered_units() {
 
     let shield_steps = [
         PublicActionProgressStep::ShieldKey,
-        PublicActionProgressStep::Wrap,
-        PublicActionProgressStep::Approve,
         PublicActionProgressStep::Shield,
     ];
     assert_eq!(
         public_native_action_gas_units(&shield_steps),
-        PUBLIC_NATIVE_WRAP_GAS_UNITS
-            + PUBLIC_NATIVE_APPROVE_GAS_UNITS
-            + PUBLIC_NATIVE_SHIELD_GAS_UNITS
-            + (3 * GAS_LIMIT_BUFFER),
+        PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS + GAS_LIMIT_BUFFER,
     );
     assert_eq!(
         public_native_action_gas_units_with_buffer(&send_steps, 7),
@@ -699,12 +695,7 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     .expect("native shield estimate");
     assert_eq!(
         native_shield,
-        U256::from(
-            PUBLIC_NATIVE_WRAP_GAS_UNITS
-                + PUBLIC_NATIVE_APPROVE_GAS_UNITS
-                + PUBLIC_NATIVE_SHIELD_GAS_UNITS
-                + (3 * GAS_LIMIT_BUFFER),
-        )
+        U256::from(PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS + GAS_LIMIT_BUFFER)
     );
     let erc20_shield = estimate_public_action_gas_cost(
         1,
@@ -754,7 +745,7 @@ fn effective_public_chain_config_uses_settings_overrides() {
         legacy_shield_block: defaults.legacy_shield_block,
         archive_until_block: defaults.archive_until_block,
         railgun_contract: "0x0000000000000000000000000000000000000001".to_string(),
-        relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
+        relay_adapt_contract: "0x0000000000000000000000000000000000000004".to_string(),
         relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
         wrapped_native_token: Some("0x0000000000000000000000000000000000000002".to_string()),
         multicall_contract: "0x0000000000000000000000000000000000000003".to_string(),
@@ -775,6 +766,10 @@ fn effective_public_chain_config_uses_settings_overrides() {
     assert_eq!(
         config.railgun_contract,
         address!("0x0000000000000000000000000000000000000001")
+    );
+    assert_eq!(
+        config.relay_adapt_contract,
+        address!("0x0000000000000000000000000000000000000004")
     );
     assert_eq!(
         config.wrapped_native_token,
@@ -854,6 +849,33 @@ fn public_send_request_uses_native_value_or_erc20_transfer() {
         erc20.input.input().expect("transfer input").as_ref(),
         expected_transfer.as_slice()
     );
+}
+
+#[test]
+fn public_native_shield_request_wraps_and_shields_through_relay_adapt() {
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let relay_adapt = address!("0x2222222222222222222222222222222222222222");
+    let amount = uint!(5_U256);
+    let shield_data = vec![0x04, 0x4a, 0x40, 0xc3, 0xaa];
+
+    let tx =
+        public_native_shield_transaction_request(1, from, relay_adapt, amount, shield_data.clone());
+
+    assert_eq!(tx.to, Some(relay_adapt.into()));
+    assert_eq!(tx.value, Some(amount));
+    let input = tx.input.input().expect("relay adapt multicall input");
+    let multicall =
+        PublicRelayAdapt::multicallCall::abi_decode(input).expect("decode relay adapt multicall");
+    assert!(multicall._requireSuccess);
+    assert_eq!(multicall._calls.len(), 2);
+    assert_eq!(multicall._calls[0].to, relay_adapt);
+    assert_eq!(multicall._calls[0].value, U256::ZERO);
+    let wrap = PublicRelayAdapt::wrapBaseCall::abi_decode(&multicall._calls[0].data)
+        .expect("decode wrap base call");
+    assert_eq!(wrap._amount, amount);
+    assert_eq!(multicall._calls[1].to, relay_adapt);
+    assert_eq!(multicall._calls[1].value, U256::ZERO);
+    assert_eq!(multicall._calls[1].data.as_ref(), shield_data);
 }
 
 #[test]

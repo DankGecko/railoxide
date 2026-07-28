@@ -1495,14 +1495,10 @@ fn public_action_closed_active_step_ignores_inactive_steps() {
 }
 
 #[test]
-fn public_action_progress_steps_include_wrap_for_native_shield() {
+fn public_action_progress_steps_use_single_transaction_for_native_shield() {
     assert_eq!(
         public_action_progress_steps(PublicActionMode::Shield, PublicAssetId::Native),
-        vec![
-            PublicActionProgressStep::Wrap,
-            PublicActionProgressStep::Approve,
-            PublicActionProgressStep::Shield,
-        ],
+        vec![PublicActionProgressStep::Shield],
     );
 }
 
@@ -1542,8 +1538,6 @@ fn hardware_public_shield_progress_steps_start_with_shield_key_authorization() {
         ),
         vec![
             PublicActionProgressStep::ShieldKey,
-            PublicActionProgressStep::Wrap,
-            PublicActionProgressStep::Approve,
             PublicActionProgressStep::Shield,
         ],
     );
