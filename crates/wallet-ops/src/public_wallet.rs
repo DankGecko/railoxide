@@ -18,8 +18,9 @@ pub use balances::{
     public_balance_assets_for_chain, public_balance_refresh_interval_secs, refresh_public_balances,
 };
 pub use gas::{
-    estimate_public_native_action_gas_reserve, public_native_action_gas_reserve,
-    public_native_action_gas_units, quote_public_action_gas_fee,
+    estimate_public_action_gas_cost, estimate_public_native_action_gas_reserve,
+    public_native_action_gas_reserve, public_native_action_gas_units,
+    public_shield_protocol_fee_amount, quote_public_action_gas_fee,
 };
 pub(crate) use signer::{VaultedPublicSigner, vaulted_public_signer};
 pub use submission::public_action_replacement_bumped_fee;
@@ -27,11 +28,11 @@ pub use types::{
     HardwareTrezorPinMatrixProvider, PublicAccountBalance, PublicActionAttemptInfo,
     PublicActionCommand, PublicActionCommandKind, PublicActionCommandReceiver,
     PublicActionCommandSender, PublicActionGasFeeQuote, PublicActionGasFeeSelection,
-    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicActionSessionEvent, PublicActionSessionEventSender, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceAsset, PublicBalanceEntry, PublicBalanceRefreshCoordinator, PublicBalanceSnapshot,
-    PublicSendRequest, PublicSendResult, PublicShieldRequest,
-    WalletConnectHardwareTypedDataCapabilityRequest,
+    PublicActionKind, PublicActionProgressStatus, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionSessionEventSender,
+    PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
+    PublicBalanceRefreshCoordinator, PublicBalanceSnapshot, PublicSendRequest, PublicSendResult,
+    PublicShieldRequest, WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
     WalletConnectPersonalSignRequest, WalletConnectSendTransactionRequest,

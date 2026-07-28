@@ -16,6 +16,7 @@ pub(in crate::root) struct PublicSendDraft {
     pub(in crate::root) amount: U256,
     pub(in crate::root) recipient: Address,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
+    pub(in crate::root) fee_display: PublicActionFeeDisplay,
 }
 
 pub(in crate::root) struct PublicShieldDraft {
@@ -31,36 +32,70 @@ pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) amount: U256,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
+    pub(in crate::root) fee_display: PublicActionFeeDisplay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct PublicActionFeeDisplay {
+    pub(in crate::root) gas_cost: Option<String>,
+    pub(in crate::root) protocol_fee: Option<String>,
 }
 
 pub(in crate::root) fn public_send_authorization_summary(
     draft: &PublicSendDraft,
 ) -> SpendAuthorizationSummary {
+    let mut rows = vec![
+        SpendAuthorizationSummaryRow::new("Amount", public_action_amount_label(draft))
+            .with_icon(draft.asset_icon_path.clone()),
+        SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+    ];
+    rows.extend(public_action_authorization_fee_rows(
+        PublicActionMode::Send,
+        &draft.fee_display,
+    ));
     SpendAuthorizationSummary::new(
         "Public send",
         public_send_authorization_detail(draft.public_account_source),
-        vec![
-            SpendAuthorizationSummaryRow::new("Amount", public_action_amount_label(draft))
-                .with_icon(draft.asset_icon_path.clone()),
-            SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
-            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
-        ],
+        rows,
     )
 }
 
 pub(in crate::root) fn public_shield_authorization_summary(
     draft: &PublicShieldDraft,
 ) -> SpendAuthorizationSummary {
+    let mut rows = vec![
+        SpendAuthorizationSummaryRow::new("Amount", public_shield_amount_label(draft))
+            .with_icon(draft.asset_icon_path.clone()),
+        SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", "Selected private wallet"),
+    ];
+    rows.extend(public_action_authorization_fee_rows(
+        PublicActionMode::Shield,
+        &draft.fee_display,
+    ));
     SpendAuthorizationSummary::new(
         "Public shield",
         public_shield_authorization_detail(draft.public_account_source),
-        vec![
-            SpendAuthorizationSummaryRow::new("Amount", public_shield_amount_label(draft))
-                .with_icon(draft.asset_icon_path.clone()),
-            SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
-            SpendAuthorizationSummaryRow::new("Recipient", "Selected private wallet"),
-        ],
+        rows,
     )
+}
+
+fn public_action_authorization_fee_rows(
+    mode: PublicActionMode,
+    display: &PublicActionFeeDisplay,
+) -> Vec<SpendAuthorizationSummaryRow> {
+    let mut rows = vec![SpendAuthorizationSummaryRow::new(
+        "Estimated gas cost (max fee)",
+        display.gas_cost.as_deref().unwrap_or("Unavailable"),
+    )];
+    if mode == PublicActionMode::Shield {
+        rows.push(SpendAuthorizationSummaryRow::new(
+            public_action_protocol_fee_label(),
+            display.protocol_fee.as_deref().unwrap_or("Unavailable"),
+        ));
+    }
+    rows
 }
 
 pub(in crate::root) const fn public_send_authorization_detail(

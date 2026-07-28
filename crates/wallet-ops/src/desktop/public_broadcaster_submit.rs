@@ -48,7 +48,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         U256::ZERO,
         request.fee_mode,
         same_token_fee,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
     )?;
     let initial_native_top_up = request
         .native_top_up
@@ -99,7 +99,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     U256::ZERO,
                     initial_split.fee_mode,
                     same_token_fee,
-                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                    RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -114,7 +114,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         request.fee_token,
         request.amount,
         request.fee_mode,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
         min_gas_price,
         seeded_fee_amount,
         |split| {
@@ -142,7 +142,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     split.fee_amount,
                     split.fee_mode,
                     same_token_fee,
-                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                    RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -210,7 +210,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             fee_amount,
             request.fee_mode,
             same_token_fee,
-            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+            RAILGUN_PROTOCOL_FEE_BPS,
         )?;
         let native_top_up = request
             .native_top_up
@@ -269,7 +269,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                             fee_amount,
                             split.fee_mode,
                             same_token_fee,
-                            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                            RAILGUN_PROTOCOL_FEE_BPS,
                         )
                     })
                     .wrap_err("build public broadcaster composite unshield proof")?,
@@ -306,7 +306,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                             fee_amount,
                             split.fee_mode,
                             same_token_fee,
-                            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                            RAILGUN_PROTOCOL_FEE_BPS,
                         )
                     })
                     .wrap_err("build public broadcaster unshield proof")?,
@@ -360,7 +360,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 request.token,
                 request.fee_token,
                 split,
-                RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                RAILGUN_PROTOCOL_FEE_BPS,
                 native_top_up.as_ref(),
             );
             tracing::info!(
@@ -442,7 +442,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 total_private_spend: reported_amounts.total_private_spend,
                 fee_amount,
                 protocol_fee_amount: reported_amounts.protocol_fee_amount,
-                protocol_fee_bps: RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                protocol_fee_bps: RAILGUN_PROTOCOL_FEE_BPS,
                 fee_mode: split.fee_mode,
                 gas_limit,
                 min_gas_price,

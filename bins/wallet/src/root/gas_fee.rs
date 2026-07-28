@@ -151,10 +151,7 @@ impl Eip1559GasFeeEditorState {
         }
     }
 
-    pub(super) fn selection(
-        &self,
-        cx: &Context<'_, WalletRoot>,
-    ) -> Result<SelfBroadcastGasFeeSelection, String> {
+    pub(super) fn selection(&self, cx: &App) -> Result<SelfBroadcastGasFeeSelection, String> {
         match self.mode {
             Eip1559GasFeeMode::Auto => Ok(SelfBroadcastGasFeeSelection::Auto),
             Eip1559GasFeeMode::Custom => {

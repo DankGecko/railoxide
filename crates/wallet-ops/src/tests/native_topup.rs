@@ -55,10 +55,7 @@ fn native_top_up_composite_request_adds_adapter_leg_for_non_wrapped_asset() {
     assert_eq!(request.legs[1].amount, top_up.wrapped_native_amount);
     assert_eq!(
         request.legs[1].amount
-            - crate::railgun_protocol_fee_amount(
-                request.legs[1].amount,
-                RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-            ),
+            - crate::railgun_protocol_fee_amount(request.legs[1].amount, RAILGUN_PROTOCOL_FEE_BPS,),
         top_up.native_amount
     );
     assert_eq!(
@@ -100,13 +97,11 @@ fn native_top_up_composite_request_combines_wrapped_output_and_native_top_up() {
     };
     let selected_amount = uint!(25_U256);
     let selected_net = selected_amount
-        - crate::railgun_protocol_fee_amount(selected_amount, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS);
+        - crate::railgun_protocol_fee_amount(selected_amount, RAILGUN_PROTOCOL_FEE_BPS);
     let combined_net = selected_net + top_up.native_amount;
-    let combined_wrapped_native_amount = crate::railgun_protocol_gross_amount_for_recipient(
-        combined_net,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-    )
-    .expect("combined gross wrapped-native amount");
+    let combined_wrapped_native_amount =
+        crate::railgun_protocol_gross_amount_for_recipient(combined_net, RAILGUN_PROTOCOL_FEE_BPS)
+            .expect("combined gross wrapped-native amount");
 
     let request = native_top_up_composite_unshield_request(
         wrapped_native,
@@ -123,10 +118,7 @@ fn native_top_up_composite_request_combines_wrapped_output_and_native_top_up() {
     assert_eq!(request.legs[0].amount, combined_wrapped_native_amount);
     assert_eq!(
         request.legs[0].amount
-            - crate::railgun_protocol_fee_amount(
-                request.legs[0].amount,
-                RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-            ),
+            - crate::railgun_protocol_fee_amount(request.legs[0].amount, RAILGUN_PROTOCOL_FEE_BPS,),
         combined_net
     );
     assert_eq!(
@@ -300,7 +292,7 @@ fn wrapped_native_top_up_report_amounts_match_combined_private_spend() {
         uint!(400_U256),
         FeeHandlingMode::AddToAmount,
         true,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
     )
     .expect("wrapped-native split");
 
@@ -308,7 +300,7 @@ fn wrapped_native_top_up_report_amounts_match_combined_private_spend() {
         wrapped_native,
         wrapped_native,
         split,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
         Some(&top_up),
     );
     let combined_wrapped_native_amount = native_top_up_required_wrapped_native_amount(
@@ -319,7 +311,7 @@ fn wrapped_native_top_up_report_amounts_match_combined_private_spend() {
     );
     let expected_protocol_fee = crate::railgun_protocol_fee_amount(
         combined_wrapped_native_amount,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
     );
 
     assert!(reported.total_private_spend > split.total_private_spend);

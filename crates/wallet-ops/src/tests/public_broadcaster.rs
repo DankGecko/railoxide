@@ -567,7 +567,7 @@ fn railgun_protocol_fee_uses_hardcoded_unshield_bps() {
     let amount = uint!(1_000_000_U256);
 
     assert_eq!(
-        crate::railgun_protocol_fee_amount(amount, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS),
+        crate::railgun_protocol_fee_amount(amount, RAILGUN_PROTOCOL_FEE_BPS),
         uint!(2_500_U256)
     );
     assert_eq!(
@@ -580,12 +580,10 @@ fn railgun_protocol_fee_uses_hardcoded_unshield_bps() {
 fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens() {
     let entered = uint!(1_000_000_U256);
     let broadcaster_fee = uint!(400_U256);
-    let gross = crate::railgun_protocol_gross_amount_for_recipient(
-        entered,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-    )
-    .expect("gross protocol amount");
-    let protocol_fee = crate::railgun_protocol_fee_amount(gross, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS);
+    let gross =
+        crate::railgun_protocol_gross_amount_for_recipient(entered, RAILGUN_PROTOCOL_FEE_BPS)
+            .expect("gross protocol amount");
+    let protocol_fee = crate::railgun_protocol_fee_amount(gross, RAILGUN_PROTOCOL_FEE_BPS);
 
     assert_eq!(gross, uint!(1_002_506_U256));
     assert_eq!(gross - protocol_fee, entered);
@@ -605,7 +603,7 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
         broadcaster_fee,
         FeeHandlingMode::AddToAmount,
         true,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
     )
     .expect("same-token add split");
     assert_eq!(same_token_add.receiver_amount, gross);
@@ -617,7 +615,7 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
         broadcaster_fee,
         FeeHandlingMode::DeductFromAmount,
         true,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
     )
     .expect("same-token deduct split");
     assert_eq!(same_token_deduct.receiver_amount, entered - broadcaster_fee);
@@ -632,7 +630,7 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
         broadcaster_fee,
         FeeHandlingMode::AddToAmount,
         false,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
     )
     .expect("different-token add split");
     assert_eq!(different_token_add.receiver_amount, gross);
@@ -644,7 +642,7 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
         broadcaster_fee,
         FeeHandlingMode::DeductFromAmount,
         false,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
     )
     .expect("different-token deduct split");
     assert_eq!(different_token_deduct.receiver_amount, entered);
@@ -661,7 +659,7 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
             broadcaster_fee,
             FeeHandlingMode::AddToAmount,
             true,
-            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+            RAILGUN_PROTOCOL_FEE_BPS,
         ),
         uint!(1_995_000_U256)
     );
@@ -671,7 +669,7 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
             broadcaster_fee,
             FeeHandlingMode::DeductFromAmount,
             true,
-            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+            RAILGUN_PROTOCOL_FEE_BPS,
         ),
         max_receiver + broadcaster_fee
     );
@@ -681,7 +679,7 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
             broadcaster_fee,
             FeeHandlingMode::DeductFromAmount,
             false,
-            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+            RAILGUN_PROTOCOL_FEE_BPS,
         ),
         max_receiver
     );
@@ -982,7 +980,7 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
         token,
         entered,
         FeeHandlingMode::AddToAmount,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
         100,
         U256::ZERO,
         |_split| {
@@ -997,7 +995,7 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
     .expect("unshield estimate");
 
     let expected_fee = estimate.receiver_amount * uint!(25_U256) / uint!(10_000_U256);
-    assert_eq!(estimate.protocol_fee_bps, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS);
+    assert_eq!(estimate.protocol_fee_bps, RAILGUN_PROTOCOL_FEE_BPS);
     assert_eq!(estimate.receiver_amount, uint!(1_002_506_U256));
     assert_eq!(estimate.protocol_fee_amount, expected_fee);
     assert_eq!(estimate.recipient_amount, entered);

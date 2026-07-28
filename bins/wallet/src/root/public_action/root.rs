@@ -11,6 +11,7 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         self.set_public_selected_balance(public_account_uuid, asset, window, cx);
         self.public_form.action_mode = PublicActionMode::Shield;
+        self.reset_public_action_gas_fee_quotes();
         self.clear_public_action_dialog_inputs(window, cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
@@ -44,9 +45,11 @@ impl WalletRoot {
                 })
                 .child(scrollable_dialog_content(
                     content_max_height,
-                    content_root
-                        .read(cx)
-                        .render_public_action_dialog_content(content_root.clone(), content_width),
+                    content_root.read(cx).render_public_action_dialog_content(
+                        content_root.clone(),
+                        content_width,
+                        cx,
+                    ),
                 ))
         });
         self.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
@@ -80,6 +83,7 @@ impl WalletRoot {
         &self,
         root: Entity<Self>,
         content_width: Pixels,
+        cx: &App,
     ) -> gpui::Div {
         let mode = self.public_form.action_mode;
         let account = self.selected_public_account();
@@ -105,6 +109,26 @@ impl WalletRoot {
         let show_form_errors = !self.public_action_has_active_progress();
         let max_label = balance_entry.as_ref().and_then(public_action_max_label);
         let amount_hint = format!("{asset_label} amount");
+        let fee_amount = selected_asset.and_then(|asset| {
+            let input = match mode {
+                PublicActionMode::Shield => &self.public_form.shield_amount_input,
+                PublicActionMode::Send => &self.public_form.send_amount_input,
+            };
+            let decimals = public_asset_decimals(
+                self.selected_chain,
+                asset,
+                Some(&self.effective_token_registry),
+            );
+            parse_send_amount(input.read(cx).value().as_ref(), decimals)
+                .ok()
+                .filter(|amount| !amount.is_zero())
+        });
+        let fee_display = self.public_action_fee_display(mode, fee_amount, cx);
+        let gas_pending = match mode {
+            PublicActionMode::Shield => self.public_form.shield_gas_fee.refreshing,
+            PublicActionMode::Send => self.public_form.send_gas_fee.refreshing,
+        };
+        let fee_ready = fee_display.gas_cost.is_some() && !gas_pending;
         let mut content = div()
             .w(content_width)
             .flex()
@@ -165,6 +189,11 @@ impl WalletRoot {
                         &self.public_form.shield_gas_fee,
                         disabled || self.public_form.shielding,
                     ))
+                    .child(render_public_action_fee_estimate(
+                        PublicActionMode::Shield,
+                        &fee_display,
+                        gas_pending,
+                    ))
                     .child(
                         app_button(
                             "wallet-public-shield",
@@ -177,7 +206,7 @@ impl WalletRoot {
                         .primary()
                         .small()
                         .loading(self.public_form.shielding)
-                        .disabled(disabled || self.public_form.shielding)
+                        .disabled(disabled || self.public_form.shielding || !fee_ready)
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
                                 root.submit_public_shield_from_form(window, cx);
@@ -212,6 +241,11 @@ impl WalletRoot {
                         &self.public_form.send_gas_fee,
                         disabled || self.public_form.sending,
                     ))
+                    .child(render_public_action_fee_estimate(
+                        PublicActionMode::Send,
+                        &fee_display,
+                        gas_pending,
+                    ))
                     .child(
                         app_button(
                             "wallet-public-send",
@@ -224,7 +258,7 @@ impl WalletRoot {
                         .primary()
                         .small()
                         .loading(self.public_form.sending)
-                        .disabled(disabled || self.public_form.sending)
+                        .disabled(disabled || self.public_form.sending || !fee_ready)
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
                                 root.submit_public_send_from_form(window, cx);
@@ -272,6 +306,18 @@ impl WalletRoot {
         self.public_form.shield_error = None;
         if !self.public_form.sending && !self.public_form.shielding {
             self.clear_public_action_progress_state();
+        }
+    }
+
+    fn reset_public_action_gas_fee_quotes(&mut self) {
+        for gas_fee in [
+            &mut self.public_form.send_gas_fee,
+            &mut self.public_form.shield_gas_fee,
+        ] {
+            gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
+            gas_fee.quote = None;
+            gas_fee.refreshing = false;
+            gas_fee.error = None;
         }
     }
 
@@ -404,6 +450,7 @@ impl WalletRoot {
                     Ok(quote) => {
                         gas_fee.quote = Some(quote);
                         gas_fee.error = None;
+                        root.set_public_action_error(action_mode, None);
                     }
                     Err(error) => {
                         gas_fee.error = Some(Arc::from(format_report_chain(&error)));
@@ -1102,6 +1149,109 @@ impl WalletRoot {
         }
     }
 
+    fn public_action_authorized_gas_fee_selection(
+        &self,
+        mode: PublicActionMode,
+        cx: &App,
+    ) -> Result<PublicActionGasFeeSelection, String> {
+        let (selection, quote) = match mode {
+            PublicActionMode::Shield => (
+                self.public_form.shield_gas_fee.selection(cx)?,
+                self.public_form.shield_gas_fee.quote,
+            ),
+            PublicActionMode::Send => (
+                self.public_form.send_gas_fee.selection(cx)?,
+                self.public_form.send_gas_fee.quote,
+            ),
+        };
+        match selection {
+            PublicActionGasFeeSelection::Auto => {
+                let quote = quote.ok_or_else(|| "Wait for the gas fee quote".to_string())?;
+                Ok(PublicActionGasFeeSelection::Custom {
+                    max_fee_per_gas: quote.suggested_max_fee_per_gas,
+                    max_priority_fee_per_gas: quote.suggested_max_priority_fee_per_gas,
+                })
+            }
+            custom => Ok(custom),
+        }
+    }
+
+    pub(in crate::root) fn public_action_fee_display(
+        &self,
+        mode: PublicActionMode,
+        amount: Option<U256>,
+        cx: &App,
+    ) -> PublicActionFeeDisplay {
+        let Some(asset) = self.public_form.selected_asset else {
+            return PublicActionFeeDisplay {
+                gas_cost: None,
+                protocol_fee: None,
+            };
+        };
+        let (kind, gas_fee) = match mode {
+            PublicActionMode::Shield => {
+                (PublicActionKind::Shield, &self.public_form.shield_gas_fee)
+            }
+            PublicActionMode::Send => (PublicActionKind::Send, &self.public_form.send_gas_fee),
+        };
+        let gas_cost = gas_fee.selection(cx).ok().and_then(|selection| {
+            estimate_public_action_gas_cost(
+                self.selected_chain,
+                self.effective_chain_configs.get(&self.selected_chain),
+                kind,
+                asset,
+                selection,
+                gas_fee.quote,
+            )
+            .ok()
+            .map(|max_native_gas_cost| {
+                let token_value = format_native_token_amount_for_display(
+                    self.selected_chain,
+                    max_native_gas_cost,
+                );
+                let usd_value = self
+                    .public_broadcaster_anchor_cache
+                    .cached_native_usd_micro_value(self.selected_chain, max_native_gas_cost)
+                    .map(format_usd_micro_value);
+                public_action_fee_value_label(token_value, usd_value)
+            })
+        });
+        let protocol_fee = if mode == PublicActionMode::Shield {
+            amount.map(|amount| {
+                let fee_amount = public_shield_protocol_fee_amount(amount);
+                let token_value = match asset {
+                    PublicAssetId::Native => {
+                        format_native_token_amount_for_display(self.selected_chain, fee_amount)
+                    }
+                    PublicAssetId::Erc20(token) => format_token_amount_for_display(
+                        self.selected_chain,
+                        token,
+                        fee_amount,
+                        Some(&self.effective_token_registry),
+                    ),
+                };
+                let usd_micro_value = match asset {
+                    PublicAssetId::Native => self
+                        .public_broadcaster_anchor_cache
+                        .cached_native_usd_micro_value(self.selected_chain, fee_amount),
+                    PublicAssetId::Erc20(token) => self
+                        .public_broadcaster_anchor_cache
+                        .cached_token_usd_micro_value(self.selected_chain, token, fee_amount),
+                };
+                public_action_fee_value_label(
+                    token_value,
+                    usd_micro_value.map(format_usd_micro_value),
+                )
+            })
+        } else {
+            None
+        };
+        PublicActionFeeDisplay {
+            gas_cost,
+            protocol_fee,
+        }
+    }
+
     pub(in crate::root) fn public_action_initial_gas_values(
         &self,
         mode: PublicActionMode,
@@ -1225,14 +1375,23 @@ impl WalletRoot {
             cx.notify();
             return None;
         };
-        let gas_fee = match self.public_action_gas_fee_selection(PublicActionMode::Send, cx) {
-            Ok(selection) => selection,
-            Err(error) => {
-                self.public_form.send_error = Some(Arc::from(error));
-                cx.notify();
-                return None;
-            }
-        };
+        let gas_fee =
+            match self.public_action_authorized_gas_fee_selection(PublicActionMode::Send, cx) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.public_form.send_error = Some(Arc::from(error));
+                    cx.notify();
+                    return None;
+                }
+            };
+        let fee_display = self.public_action_fee_display(PublicActionMode::Send, Some(amount), cx);
+        if fee_display.gas_cost.is_none() {
+            self.public_form.send_error = Some(Arc::from(
+                "Wait for an estimated gas cost before authorizing the send",
+            ));
+            cx.notify();
+            return None;
+        }
         Some(PublicSendDraft {
             chain_id,
             asset,
@@ -1247,6 +1406,7 @@ impl WalletRoot {
             amount,
             recipient,
             gas_fee,
+            fee_display,
         })
     }
 
@@ -1493,14 +1653,24 @@ impl WalletRoot {
                 return None;
             }
         };
-        let gas_fee = match self.public_action_gas_fee_selection(PublicActionMode::Shield, cx) {
-            Ok(selection) => selection,
-            Err(error) => {
-                self.public_form.shield_error = Some(Arc::from(error));
-                cx.notify();
-                return None;
-            }
-        };
+        let gas_fee =
+            match self.public_action_authorized_gas_fee_selection(PublicActionMode::Shield, cx) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.public_form.shield_error = Some(Arc::from(error));
+                    cx.notify();
+                    return None;
+                }
+            };
+        let fee_display =
+            self.public_action_fee_display(PublicActionMode::Shield, Some(amount), cx);
+        if fee_display.gas_cost.is_none() || fee_display.protocol_fee.is_none() {
+            self.public_form.shield_error = Some(Arc::from(
+                "Wait for fee estimates before authorizing the shield",
+            ));
+            cx.notify();
+            return None;
+        }
         Some(PublicShieldDraft {
             chain_id,
             asset,
@@ -1514,6 +1684,7 @@ impl WalletRoot {
             vault_store,
             amount,
             gas_fee,
+            fee_display,
         })
     }
 

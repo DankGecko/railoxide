@@ -1,18 +1,21 @@
 use alloy::primitives::U256;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 
 use super::runtime::public_chain_runtime_config;
 use super::types::{
-    PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicActionProgressStep,
+    PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicActionKind,
+    PublicActionProgressStep, PublicAssetId,
 };
 use crate::settings::EffectiveChainConfig;
 use crate::{
-    GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback, query_rpc_pool_with_http_client,
-    resolve_self_broadcast_gas_fee, self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback,
+    GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS, SelfBroadcastTipFallback,
+    query_rpc_pool_with_http_client, railgun_protocol_fee_amount, resolve_self_broadcast_gas_fee,
+    self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback,
 };
 
 pub(super) const PUBLIC_NATIVE_SEND_GAS_UNITS: u64 = 21_000;
+const PUBLIC_ERC20_SEND_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_WRAP_GAS_UNITS: u64 = 50_000;
 pub(super) const PUBLIC_NATIVE_APPROVE_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_SHIELD_GAS_UNITS: u64 = 650_000;
@@ -44,6 +47,74 @@ pub fn public_native_action_gas_reserve(
     steps: &[PublicActionProgressStep],
 ) -> U256 {
     public_native_action_gas_reserve_with_buffer(max_fee_per_gas, steps, GAS_LIMIT_BUFFER)
+}
+
+pub fn estimate_public_action_gas_cost(
+    chain_id: u64,
+    effective_chain: Option<&EffectiveChainConfig>,
+    kind: PublicActionKind,
+    asset: PublicAssetId,
+    gas_fee: PublicActionGasFeeSelection,
+    quote: Option<PublicActionGasFeeQuote>,
+) -> Result<U256> {
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let max_fee_per_gas = match gas_fee {
+        PublicActionGasFeeSelection::Auto => {
+            quote
+                .ok_or_else(|| eyre!("public action gas fee quote is not ready"))?
+                .suggested_max_fee_per_gas
+        }
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => {
+            if max_fee_per_gas == 0 {
+                return Err(eyre!("max fee per gas must be greater than zero"));
+            }
+            if max_priority_fee_per_gas > max_fee_per_gas {
+                return Err(eyre!(
+                    "max priority fee per gas cannot exceed max fee per gas"
+                ));
+            }
+            max_fee_per_gas
+        }
+    };
+    let gas_units =
+        public_action_estimated_gas_units_with_buffer(kind, asset, chain.gas.gas_limit_buffer);
+    Ok(U256::from(gas_units) * U256::from(max_fee_per_gas))
+}
+
+#[must_use]
+pub fn public_shield_protocol_fee_amount(amount: U256) -> U256 {
+    railgun_protocol_fee_amount(amount, RAILGUN_PROTOCOL_FEE_BPS)
+}
+
+const fn public_action_estimated_gas_units_with_buffer(
+    kind: PublicActionKind,
+    asset: PublicAssetId,
+    gas_limit_buffer: u64,
+) -> u64 {
+    match kind {
+        PublicActionKind::Send => {
+            let gas_units = match asset {
+                PublicAssetId::Native => PUBLIC_NATIVE_SEND_GAS_UNITS,
+                PublicAssetId::Erc20(_) => PUBLIC_ERC20_SEND_GAS_UNITS,
+            };
+            gas_units.saturating_add(gas_limit_buffer)
+        }
+        PublicActionKind::Shield => {
+            let wrap_gas = if matches!(asset, PublicAssetId::Native) {
+                PUBLIC_NATIVE_WRAP_GAS_UNITS.saturating_add(gas_limit_buffer)
+            } else {
+                0
+            };
+            wrap_gas
+                .saturating_add(PUBLIC_NATIVE_APPROVE_GAS_UNITS)
+                .saturating_add(gas_limit_buffer)
+                .saturating_add(PUBLIC_NATIVE_SHIELD_GAS_UNITS)
+                .saturating_add(gas_limit_buffer)
+        }
+    }
 }
 
 #[must_use]

@@ -1383,10 +1383,6 @@ pub(crate) fn public_broadcaster_max_entered_amount_for_tokens_and_protocol(
     }
 }
 
-pub(crate) fn railgun_protocol_fee_amount(amount: U256, fee_bps: U256) -> U256 {
-    amount * fee_bps / FEE_BASIS_POINTS_DENOMINATOR
-}
-
 pub(crate) fn railgun_protocol_gross_amount_for_recipient(
     recipient_amount: U256,
     fee_bps: U256,
@@ -1411,10 +1407,9 @@ pub(crate) fn unshield_receiver_amount_for_fee_mode(
 ) -> Result<U256> {
     match fee_mode {
         FeeHandlingMode::DeductFromAmount => Ok(entered_amount),
-        FeeHandlingMode::AddToAmount => railgun_protocol_gross_amount_for_recipient(
-            entered_amount,
-            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-        ),
+        FeeHandlingMode::AddToAmount => {
+            railgun_protocol_gross_amount_for_recipient(entered_amount, RAILGUN_PROTOCOL_FEE_BPS)
+        }
     }
 }
 

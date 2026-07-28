@@ -142,13 +142,13 @@ pub(crate) fn native_top_up_wrapped_native_amount_for_net(net_amount: U256) -> U
         return U256::ZERO;
     }
 
-    let net_bps = FEE_BASIS_POINTS_DENOMINATOR - RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS;
+    let net_bps = FEE_BASIS_POINTS_DENOMINATOR - RAILGUN_PROTOCOL_FEE_BPS;
     ((net_amount - U256::from(1)) * FEE_BASIS_POINTS_DENOMINATOR / net_bps) + U256::from(1)
 }
 
 #[must_use]
 pub(crate) fn native_top_up_net_after_protocol_fee(wrapped_native_amount: U256) -> U256 {
     wrapped_native_amount.saturating_sub(
-        wrapped_native_amount * RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS / FEE_BASIS_POINTS_DENOMINATOR,
+        wrapped_native_amount * RAILGUN_PROTOCOL_FEE_BPS / FEE_BASIS_POINTS_DENOMINATOR,
     )
 }

@@ -98,6 +98,7 @@ mod hardware_typed_data;
 mod http;
 mod native_topup;
 mod poi_contexts;
+mod protocol_fee;
 mod public_wallet;
 mod signer;
 mod utxos;
@@ -135,26 +136,29 @@ pub use native_topup::{
 pub(crate) use native_topup::{
     native_top_up_net_after_protocol_fee, native_top_up_wrapped_native_amount_for_net,
 };
+pub(crate) use protocol_fee::{FEE_BASIS_POINTS_DENOMINATOR, railgun_protocol_fee_amount};
+pub use protocol_fee::{RAILGUN_PROTOCOL_FEE_BPS, format_protocol_fee_percentage};
 pub use public_wallet::{
     HardwareTrezorPinMatrixProvider, PublicAccountBalance, PublicActionAttemptInfo,
     PublicActionCommand, PublicActionCommandKind, PublicActionCommandReceiver,
     PublicActionCommandSender, PublicActionGasFeeQuote, PublicActionGasFeeSelection,
-    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicActionSessionEvent, PublicActionSessionEventSender, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceAsset, PublicBalanceEntry, PublicBalanceRefreshCoordinator, PublicBalanceSnapshot,
-    PublicSendRequest, PublicSendResult, PublicShieldRequest,
-    WalletConnectHardwareTypedDataCapabilityRequest,
+    PublicActionKind, PublicActionProgressStatus, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionSessionEventSender,
+    PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
+    PublicBalanceRefreshCoordinator, PublicBalanceSnapshot, PublicSendRequest, PublicSendResult,
+    PublicShieldRequest, WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
     WalletConnectPersonalSignRequest, WalletConnectSendTransactionRequest,
     WalletConnectSendTransactionResult, WalletConnectTypedDataSignRequest,
-    estimate_public_native_action_gas_reserve,
+    estimate_public_action_gas_cost, estimate_public_native_action_gas_reserve,
     is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required,
     public_action_replacement_bumped_fee, public_balance_assets_for_chain,
     public_balance_refresh_interval_secs, public_native_action_gas_reserve,
-    public_native_action_gas_units, quote_public_action_gas_fee, refresh_public_balances,
-    submit_public_send, submit_public_send_with_progress, submit_public_shield,
-    submit_public_shield_with_progress, submit_walletconnect_send_transaction,
+    public_native_action_gas_units, public_shield_protocol_fee_amount, quote_public_action_gas_fee,
+    refresh_public_balances, submit_public_send, submit_public_send_with_progress,
+    submit_public_shield, submit_public_shield_with_progress,
+    submit_walletconnect_send_transaction,
     walletconnect_hardware_typed_data_hash_fallback_confirmation_session,
     walletconnect_probe_hardware_typed_data_signing_mode, walletconnect_sign_personal_message,
     walletconnect_sign_typed_data_v4,

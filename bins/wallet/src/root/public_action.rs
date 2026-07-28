@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
 use gpui::{
-    AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
-    rgb,
+    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
@@ -15,17 +15,19 @@ use gpui_component::{
     input::InputState,
     spinner::Spinner,
 };
-use railgun_ui::short_address;
+use railgun_ui::{format_usd_micro_value, short_address};
 use tokio::sync::mpsc;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     PublicActionCommand, PublicActionCommandKind, PublicActionCommandSender,
-    PublicActionGasFeeSelection, PublicActionProgressStatus, PublicActionProgressStep,
-    PublicActionProgressUpdate, PublicActionSessionEvent, PublicAssetId, PublicBalanceEntry,
-    PublicSendRequest, PublicShieldRequest, estimate_public_native_action_gas_reserve,
-    parse_send_amount, public_action_replacement_bumped_fee, quote_public_action_gas_fee,
+    PublicActionGasFeeSelection, PublicActionKind, PublicActionProgressStatus,
+    PublicActionProgressStep, PublicActionProgressUpdate, PublicActionSessionEvent, PublicAssetId,
+    PublicBalanceEntry, PublicSendRequest, PublicShieldRequest, RAILGUN_PROTOCOL_FEE_BPS,
+    estimate_public_action_gas_cost, estimate_public_native_action_gas_reserve,
+    format_protocol_fee_percentage, parse_send_amount, public_action_replacement_bumped_fee,
+    public_shield_protocol_fee_amount, quote_public_action_gas_fee,
     submit_public_send_with_progress, submit_public_shield_with_progress,
     vault::{DesktopVaultStore, DesktopViewSession, PublicAccountSource, PublicAccountStatus},
 };
@@ -44,7 +46,8 @@ use super::spend_authorization::{
 use super::utxo::short_hash;
 use super::{
     PUBLIC_ACTION_DIALOG_WIDTH, WalletRoot, app_step_row, app_stepper_container,
-    dialog_content_max_height, dialog_max_height, format_report_chain, format_send_amount_input,
+    dialog_content_max_height, dialog_max_height, format_native_token_amount_for_display,
+    format_report_chain, format_send_amount_input, format_token_amount_for_display,
     native_token_display_label, parse_address, public_asset_decimals, public_asset_label,
     public_balance_amount_label, scrollable_dialog_content, secondary_dialog_content_width,
     token_label_row,
@@ -62,3 +65,10 @@ pub(super) use controls::*;
 pub(super) use progress::*;
 pub(super) use stepper::*;
 pub(super) use types::*;
+
+fn public_action_protocol_fee_label() -> String {
+    format!(
+        "RAILGUN protocol fee ({})",
+        format_protocol_fee_percentage(RAILGUN_PROTOCOL_FEE_BPS)
+    )
+}

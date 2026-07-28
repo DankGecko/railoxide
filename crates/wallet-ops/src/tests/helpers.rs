@@ -43,7 +43,7 @@ pub(super) use crate::{
     DesktopNativeTopUpPlan, DesktopWalletChainStart, DesktopWalletSyncStartPolicy, FeeHandlingMode,
     ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
     PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
-    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
+    RAILGUN_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
     SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput, UtxoPpoiState,
     WalletPendingOverlay, WalletPendingSpent, WalletPendingSpentMarkOutcome,
     apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,

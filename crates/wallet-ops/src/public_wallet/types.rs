@@ -45,6 +45,12 @@ impl PublicAssetId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicActionKind {
+    Shield,
+    Send,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicBalanceAsset {
     pub id: PublicAssetId,

@@ -6,7 +6,7 @@ use gpui::Context;
 use wallet_ops::{
     BroadcasterFeePolicy, BroadcasterFeePolicyStatus, FeeHandlingMode, ListUtxosOutput,
     PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterTrustFilter,
-    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, eligible_public_broadcasters_for_asset,
+    RAILGUN_PROTOCOL_FEE_BPS, eligible_public_broadcasters_for_asset,
     fee_policy_eligible_public_broadcasters, filter_public_broadcasters_by_trust,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     public_broadcaster_candidates_for_asset,
@@ -206,7 +206,7 @@ pub(super) fn unshield_max_entered_amount_for_mode(
         max_receiver_amount,
         U256::ZERO,
         false,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
         fee_mode,
     )
 }

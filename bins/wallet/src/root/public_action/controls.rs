@@ -88,6 +88,68 @@ pub(in crate::root) fn public_action_context_row(label: &'static str, value: Str
         )
 }
 
+pub(in crate::root) fn render_public_action_fee_estimate(
+    mode: PublicActionMode,
+    display: &PublicActionFeeDisplay,
+    gas_pending: bool,
+) -> gpui::Div {
+    let gas_cost = display.gas_cost.clone().unwrap_or_else(|| {
+        if gas_pending {
+            "Estimating...".to_string()
+        } else {
+            "Unavailable".to_string()
+        }
+    });
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(app_strong_text("Estimated fees"))
+        .child(public_action_fee_row("Gas cost (max fee)", gas_cost))
+        .when(mode == PublicActionMode::Shield, |this| {
+            this.child(public_action_fee_row(
+                public_action_protocol_fee_label(),
+                display
+                    .protocol_fee
+                    .clone()
+                    .unwrap_or_else(|| "Enter an amount".to_string()),
+            ))
+        })
+}
+
+fn public_action_fee_row(label: impl Into<SharedString>, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(app_muted_text(label).flex_none())
+        .child(
+            app_strong_text(value)
+                .min_w(px(0.0))
+                .text_size(px(13.0))
+                .font_family(APP_MONO_FONT_FAMILY)
+                .whitespace_normal(),
+        )
+}
+
+pub(in crate::root) fn public_action_fee_value_label(
+    token_value: String,
+    usd_value: Option<String>,
+) -> String {
+    format!(
+        "{token_value} · {}",
+        usd_value.unwrap_or_else(|| "USD unavailable".to_string())
+    )
+}
+
 pub(in crate::root) fn render_public_action_active_status_notice(
     root: Entity<WalletRoot>,
     mode: PublicActionMode,

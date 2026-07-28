@@ -652,6 +652,91 @@ fn public_native_action_gas_reserve_uses_buffered_units() {
 }
 
 #[test]
+fn public_action_gas_cost_uses_asset_specific_buffered_units() {
+    let token = address!("0x3333333333333333333333333333333333333333");
+    let quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 2,
+        suggested_max_fee_per_gas: 3,
+        suggested_max_priority_fee_per_gas: 1,
+    };
+
+    let native_send = estimate_public_action_gas_cost(
+        1,
+        None,
+        PublicActionKind::Send,
+        PublicAssetId::Native,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("native send estimate");
+    assert_eq!(
+        native_send,
+        U256::from((PUBLIC_NATIVE_SEND_GAS_UNITS + GAS_LIMIT_BUFFER) * 3)
+    );
+
+    let erc20_send = estimate_public_action_gas_cost(
+        1,
+        None,
+        PublicActionKind::Send,
+        PublicAssetId::Erc20(token),
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("erc20 send estimate");
+    assert_eq!(erc20_send, U256::from((65_000 + GAS_LIMIT_BUFFER) * 3));
+
+    let native_shield = estimate_public_action_gas_cost(
+        1,
+        None,
+        PublicActionKind::Shield,
+        PublicAssetId::Native,
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+        },
+        None,
+    )
+    .expect("native shield estimate");
+    assert_eq!(
+        native_shield,
+        U256::from(
+            PUBLIC_NATIVE_WRAP_GAS_UNITS
+                + PUBLIC_NATIVE_APPROVE_GAS_UNITS
+                + PUBLIC_NATIVE_SHIELD_GAS_UNITS
+                + (3 * GAS_LIMIT_BUFFER),
+        )
+    );
+    let erc20_shield = estimate_public_action_gas_cost(
+        1,
+        None,
+        PublicActionKind::Shield,
+        PublicAssetId::Erc20(token),
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+        },
+        None,
+    )
+    .expect("erc20 shield estimate");
+    assert_eq!(
+        erc20_shield,
+        U256::from(
+            PUBLIC_NATIVE_APPROVE_GAS_UNITS
+                + PUBLIC_NATIVE_SHIELD_GAS_UNITS
+                + (2 * GAS_LIMIT_BUFFER),
+        )
+    );
+}
+
+#[test]
+fn public_shield_protocol_fee_amount_uses_floor_rounding() {
+    assert_eq!(
+        public_shield_protocol_fee_amount(U256::from(12_345_u64)),
+        U256::from(30_u64)
+    );
+}
+
+#[test]
 fn effective_public_chain_config_uses_settings_overrides() {
     let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
     let effective = EffectiveChainConfig {

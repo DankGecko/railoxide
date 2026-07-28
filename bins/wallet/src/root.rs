@@ -124,9 +124,9 @@ use startup::WalletStartupRoot;
 use tokens::{
     format_exact_token_amount_for_display, format_native_token_amount_for_display,
     format_native_top_up_recipient_suffix, format_recipient_amount_with_native_top_up,
-    format_send_amount_input, format_unshield_amount_input, is_effective_wrapped_native_token,
-    native_token_display_label, native_wrapped_output_labels, parse_address, token_display_label,
-    token_display_metadata,
+    format_send_amount_input, format_token_amount_for_display, format_unshield_amount_input,
+    is_effective_wrapped_native_token, native_token_display_label, native_wrapped_output_labels,
+    parse_address, token_display_label, token_display_metadata,
 };
 use ui_helpers::{
     app_panel, app_refresh_button, app_status_tag, app_step_row, app_stepper_container,
@@ -1280,6 +1280,24 @@ impl WalletRoot {
             },
         )
         .detach();
+        for input in [
+            root.public_form.send_amount_input.clone(),
+            root.public_form.shield_amount_input.clone(),
+            root.public_form.send_gas_fee.max_fee_input.clone(),
+            root.public_form.send_gas_fee.max_priority_fee_input.clone(),
+            root.public_form.shield_gas_fee.max_fee_input.clone(),
+            root.public_form
+                .shield_gas_fee
+                .max_priority_fee_input
+                .clone(),
+        ] {
+            cx.subscribe(&input, |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         cx.subscribe(
             &root.address_book.search_input,
             |this, input, event: &InputEvent, cx| {

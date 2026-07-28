@@ -962,7 +962,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                 U256::ZERO,
                 request.fee_mode,
                 same_token_fee,
-                RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                RAILGUN_PROTOCOL_FEE_BPS,
             )?;
             if let Some(native_top_up) = &native_top_up {
                 return native_top_up_approximate_shape(
@@ -987,7 +987,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     U256::ZERO,
                     seed_split.fee_mode,
                     same_token_fee,
-                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                    RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -1003,7 +1003,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         request.fee_token,
         request.amount,
         request.fee_mode,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
         min_gas_price,
         initial_fee_amount,
         |split| {
@@ -1031,7 +1031,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     split.fee_amount,
                     split.fee_mode,
                     same_token_fee,
-                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                    RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -1051,7 +1051,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             fee_amount: estimate.fee_amount,
             fee_mode: estimate.fee_mode,
         },
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        RAILGUN_PROTOCOL_FEE_BPS,
         native_top_up.as_ref(),
     );
     estimate.recipient_amount = reported_amounts.recipient_amount;
