@@ -53,16 +53,13 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     let initial_native_top_up = request
         .native_top_up
         .as_ref()
-        .map(|top_up| {
+        .map(|_| {
             desktop_native_top_up_plan_from_unshield_fields(
                 request.chain_id,
                 &chain,
-                request.view_session.as_ref(),
-                request.vault_store.as_ref(),
                 request.token,
                 request.recipient,
                 request.unwrap,
-                top_up,
                 initial_split.receiver_amount,
                 Some(request.fee_token),
                 U256::ZERO,
@@ -215,16 +212,13 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         let native_top_up = request
             .native_top_up
             .as_ref()
-            .map(|top_up| {
+            .map(|_| {
                 desktop_native_top_up_plan_from_unshield_fields(
                     request.chain_id,
                     &chain,
-                    request.view_session.as_ref(),
-                    request.vault_store.as_ref(),
                     request.token,
                     request.recipient,
                     request.unwrap,
-                    top_up,
                     split.receiver_amount,
                     Some(request.fee_token),
                     fee_amount,

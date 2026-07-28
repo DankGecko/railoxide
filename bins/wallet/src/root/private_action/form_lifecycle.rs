@@ -1382,7 +1382,6 @@ impl WalletRoot {
                     }
                     this.clear_unshield_form_text_edit_state(key, cx);
                     this.refresh_unshield_native_top_up_state(key, cx);
-                    this.maybe_schedule_unshield_native_top_up_balance_refresh(key, cx);
                     this.update_recipient_suggestions_for_input_change(
                         DeliveryFormKind::Unshield,
                         key,

@@ -1,53 +1,39 @@
 use super::*;
 
-pub const NATIVE_TOP_UP_ETHEREUM_THRESHOLD: U256 = uint!(1_000_000_000_000_000_U256);
 pub const NATIVE_TOP_UP_ETHEREUM_AMOUNT: U256 = uint!(3_000_000_000_000_000_U256);
-pub const NATIVE_TOP_UP_ARBITRUM_THRESHOLD: U256 = uint!(100_000_000_000_000_U256);
 pub const NATIVE_TOP_UP_ARBITRUM_AMOUNT: U256 = uint!(500_000_000_000_000_U256);
-pub const NATIVE_TOP_UP_POLYGON_THRESHOLD: U256 = uint!(200_000_000_000_000_000_U256);
 pub const NATIVE_TOP_UP_POLYGON_AMOUNT: U256 = uint!(1_000_000_000_000_000_000_U256);
-pub const NATIVE_TOP_UP_BSC_THRESHOLD: U256 = uint!(1_000_000_000_000_000_U256);
 pub const NATIVE_TOP_UP_BSC_AMOUNT: U256 = uint!(5_000_000_000_000_000_U256);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeTopUpPolicy {
-    pub offer_threshold: U256,
     pub top_up_amount: U256,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DesktopNativeTopUpRequest {
-    pub public_account_uuid: String,
-    pub native_balance: U256,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopNativeTopUpRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopNativeTopUpPlan {
-    pub public_account_uuid: String,
     pub recipient: Address,
     pub wrapped_native_token: Address,
     pub native_amount: U256,
     pub wrapped_native_amount: U256,
-    pub native_balance_before: U256,
 }
 
 #[must_use]
 pub const fn native_top_up_policy_for_chain(chain_id: u64) -> Option<NativeTopUpPolicy> {
     match chain_id {
         1 => Some(NativeTopUpPolicy {
-            offer_threshold: NATIVE_TOP_UP_ETHEREUM_THRESHOLD,
             top_up_amount: NATIVE_TOP_UP_ETHEREUM_AMOUNT,
         }),
         42161 => Some(NativeTopUpPolicy {
-            offer_threshold: NATIVE_TOP_UP_ARBITRUM_THRESHOLD,
             top_up_amount: NATIVE_TOP_UP_ARBITRUM_AMOUNT,
         }),
         137 => Some(NativeTopUpPolicy {
-            offer_threshold: NATIVE_TOP_UP_POLYGON_THRESHOLD,
             top_up_amount: NATIVE_TOP_UP_POLYGON_AMOUNT,
         }),
         56 => Some(NativeTopUpPolicy {
-            offer_threshold: NATIVE_TOP_UP_BSC_THRESHOLD,
             top_up_amount: NATIVE_TOP_UP_BSC_AMOUNT,
         }),
         _ => None,

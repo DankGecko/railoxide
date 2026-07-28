@@ -3,16 +3,12 @@ use super::helpers::*;
 #[test]
 fn native_top_up_policy_constants_are_fixed() {
     let ethereum = native_top_up_policy_for_chain(1).expect("ethereum policy");
-    assert_eq!(ethereum.offer_threshold, uint!(1_000_000_000_000_000_U256));
     assert_eq!(ethereum.top_up_amount, uint!(3_000_000_000_000_000_U256));
     let arbitrum = native_top_up_policy_for_chain(42161).expect("arbitrum policy");
-    assert_eq!(arbitrum.offer_threshold, uint!(100_000_000_000_000_U256));
     assert_eq!(arbitrum.top_up_amount, uint!(500_000_000_000_000_U256));
     let polygon = native_top_up_policy_for_chain(137).expect("polygon policy");
-    assert_eq!(polygon.offer_threshold, uint!(200_000_000_000_000_000_U256));
     assert_eq!(polygon.top_up_amount, uint!(1_000_000_000_000_000_000_U256));
     let bsc = native_top_up_policy_for_chain(56).expect("bsc policy");
-    assert_eq!(bsc.offer_threshold, uint!(1_000_000_000_000_000_U256));
     assert_eq!(bsc.top_up_amount, uint!(5_000_000_000_000_000_U256));
     assert_eq!(native_top_up_policy_for_chain(10), None);
 }
@@ -23,14 +19,12 @@ fn native_top_up_composite_request_adds_adapter_leg_for_non_wrapped_asset() {
     let wrapped_native = wrapped_native_token_for_chain(1).expect("weth");
     let recipient = address(0x42);
     let top_up = DesktopNativeTopUpPlan {
-        public_account_uuid: "pub-1".to_string(),
         recipient,
         wrapped_native_token: wrapped_native,
         native_amount: uint!(3_000_000_000_000_000_U256),
         wrapped_native_amount: native_top_up_wrapped_native_amount(uint!(
             3_000_000_000_000_000_U256
         )),
-        native_balance_before: U256::ZERO,
     };
 
     let request = native_top_up_composite_unshield_request(
@@ -86,14 +80,12 @@ fn native_top_up_composite_request_combines_wrapped_output_and_native_top_up() {
     let wrapped_native = wrapped_native_token_for_chain(1).expect("weth");
     let recipient = address(0x43);
     let top_up = DesktopNativeTopUpPlan {
-        public_account_uuid: "pub-1".to_string(),
         recipient,
         wrapped_native_token: wrapped_native,
         native_amount: uint!(3_000_000_000_000_000_U256),
         wrapped_native_amount: native_top_up_wrapped_native_amount(uint!(
             3_000_000_000_000_000_U256
         )),
-        native_balance_before: U256::ZERO,
     };
     let selected_amount = uint!(25_U256);
     let selected_net = selected_amount
@@ -161,14 +153,12 @@ fn native_top_up_public_broadcaster_shape_accounts_for_fee_token_spend() {
     let wrapped_native = wrapped_native_token_for_chain(1).expect("weth");
     let recipient = address(0x52);
     let top_up = DesktopNativeTopUpPlan {
-        public_account_uuid: "pub-1".to_string(),
         recipient,
         wrapped_native_token: wrapped_native,
         native_amount: uint!(3_000_000_000_000_000_U256),
         wrapped_native_amount: native_top_up_wrapped_native_amount(uint!(
             3_000_000_000_000_000_U256
         )),
-        native_balance_before: U256::ZERO,
     };
     let utxos = vec![
         utxo(token, 25, 0, 0).utxo,
@@ -209,14 +199,12 @@ fn native_top_up_public_broadcaster_shape_seeds_third_fee_token_without_fee_amou
     let wrapped_native = wrapped_native_token_for_chain(1).expect("weth");
     let recipient = address(0x56);
     let top_up = DesktopNativeTopUpPlan {
-        public_account_uuid: "pub-1".to_string(),
         recipient,
         wrapped_native_token: wrapped_native,
         native_amount: uint!(3_000_000_000_000_000_U256),
         wrapped_native_amount: native_top_up_wrapped_native_amount(uint!(
             3_000_000_000_000_000_U256
         )),
-        native_balance_before: U256::ZERO,
     };
     let amount = uint!(25_U256);
     let non_wrapped_utxos = vec![
@@ -278,14 +266,12 @@ fn wrapped_native_top_up_report_amounts_match_combined_private_spend() {
     let wrapped_native = wrapped_native_token_for_chain(1).expect("weth");
     let recipient = address(0x53);
     let top_up = DesktopNativeTopUpPlan {
-        public_account_uuid: "pub-1".to_string(),
         recipient,
         wrapped_native_token: wrapped_native,
         native_amount: uint!(3_000_000_000_000_000_U256),
         wrapped_native_amount: native_top_up_wrapped_native_amount(uint!(
             3_000_000_000_000_000_U256
         )),
-        native_balance_before: U256::ZERO,
     };
     let split = public_broadcaster_amount_split_for_tokens_and_protocol(
         uint!(1_000_000_U256),
@@ -371,14 +357,12 @@ fn native_top_up_public_broadcaster_shape_rejects_composite_batch_overflow() {
     let wrapped_native = wrapped_native_token_for_chain(1).expect("weth");
     let recipient = address(0x62);
     let top_up = DesktopNativeTopUpPlan {
-        public_account_uuid: "pub-1".to_string(),
         recipient,
         wrapped_native_token: wrapped_native,
         native_amount: uint!(3_000_000_000_000_000_U256),
         wrapped_native_amount: native_top_up_wrapped_native_amount(uint!(
             3_000_000_000_000_000_U256
         )),
-        native_balance_before: U256::ZERO,
     };
     let mut utxos = (0..8)
         .map(|tree| utxo(token, 10, tree, 0).utxo)

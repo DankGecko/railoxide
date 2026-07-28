@@ -55,15 +55,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     let native_top_up = request
         .native_top_up
         .as_ref()
-        .map(|top_up| {
-            desktop_native_top_up_plan_from_request(
-                &request,
-                &chain,
-                top_up,
-                receiver_amount,
-                &utxos,
-            )
-        })
+        .map(|_| desktop_native_top_up_plan_from_request(&request, &chain, receiver_amount, &utxos))
         .transpose()?;
 
     let signer = request.spend_authorization.into_signer(
@@ -135,19 +127,15 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
 fn desktop_native_top_up_plan_from_request(
     request: &DesktopUnshieldPlanRequest<'_>,
     chain: &EffectiveDesktopChainConfig,
-    top_up: &DesktopNativeTopUpRequest,
     receiver_amount: U256,
     utxos: &[Utxo],
 ) -> Result<DesktopNativeTopUpPlan> {
     desktop_native_top_up_plan_from_unshield_fields(
         request.chain_id,
         chain,
-        request.view_session,
-        request.vault_store,
         request.token,
         request.recipient,
         request.unwrap,
-        top_up,
         receiver_amount,
         None,
         U256::ZERO,
@@ -158,12 +146,9 @@ fn desktop_native_top_up_plan_from_request(
 pub(super) fn desktop_native_top_up_plan_from_unshield_fields(
     chain_id: u64,
     chain: &EffectiveDesktopChainConfig,
-    view_session: &vault::DesktopViewSession,
-    vault_store: &vault::DesktopVaultStore,
     token: Address,
     recipient: Address,
     unwrap: bool,
-    top_up: &DesktopNativeTopUpRequest,
     receiver_amount: U256,
     broadcaster_fee_token: Option<Address>,
     broadcaster_fee_amount: U256,
@@ -174,23 +159,6 @@ pub(super) fn desktop_native_top_up_plan_from_unshield_fields(
     let wrapped_native_token = chain
         .wrapped_native_token
         .ok_or_else(|| eyre!("selected chain has no wrapped native token for native top-up"))?;
-    let accounts = vault_store
-        .list_active_public_accounts_for_session(view_session)
-        .wrap_err("load active public accounts for native top-up")?;
-    let account = accounts
-        .iter()
-        .find(|account| account.public_account_uuid == top_up.public_account_uuid)
-        .ok_or_else(|| eyre!("native top-up Public account is not visible"))?;
-    if account.address != recipient {
-        return Err(eyre!(
-            "native top-up Public account does not match unshield recipient"
-        ));
-    }
-    if top_up.native_balance >= policy.offer_threshold {
-        return Err(eyre!(
-            "native top-up recipient already has enough native gas"
-        ));
-    }
     if unwrap {
         return Err(eyre!(
             "native top-up cannot be combined with unwrap-to-native output"
@@ -214,12 +182,10 @@ pub(super) fn desktop_native_top_up_plan_from_unshield_fields(
     }
 
     Ok(DesktopNativeTopUpPlan {
-        public_account_uuid: account.public_account_uuid.clone(),
         recipient,
         wrapped_native_token,
         native_amount: policy.top_up_amount,
         wrapped_native_amount,
-        native_balance_before: top_up.native_balance,
     })
 }
 
@@ -229,7 +195,6 @@ pub(super) fn desktop_native_top_up_plan_for_estimate(
     _token: Address,
     recipient: Address,
     unwrap: bool,
-    top_up: &DesktopNativeTopUpRequest,
     _receiver_amount: U256,
 ) -> Result<DesktopNativeTopUpPlan> {
     let policy = native_top_up_policy_for_chain(chain_id)
@@ -237,11 +202,6 @@ pub(super) fn desktop_native_top_up_plan_for_estimate(
     let wrapped_native_token = chain
         .wrapped_native_token
         .ok_or_else(|| eyre!("selected chain has no wrapped native token for native top-up"))?;
-    if top_up.native_balance >= policy.offer_threshold {
-        return Err(eyre!(
-            "native top-up recipient already has enough native gas"
-        ));
-    }
     if unwrap {
         return Err(eyre!(
             "native top-up cannot be combined with unwrap-to-native output"
@@ -250,12 +210,10 @@ pub(super) fn desktop_native_top_up_plan_for_estimate(
     let wrapped_native_amount = native_top_up_wrapped_native_amount(policy.top_up_amount);
 
     Ok(DesktopNativeTopUpPlan {
-        public_account_uuid: top_up.public_account_uuid.clone(),
         recipient,
         wrapped_native_token,
         native_amount: policy.top_up_amount,
         wrapped_native_amount,
-        native_balance_before: top_up.native_balance,
     })
 }
 
@@ -943,14 +901,13 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     let native_top_up = request
         .native_top_up
         .as_ref()
-        .map(|top_up| {
+        .map(|_| {
             desktop_native_top_up_plan_for_estimate(
                 request.chain_id,
                 &chain,
                 request.token,
                 request.recipient,
                 request.unwrap,
-                top_up,
                 request.amount,
             )
         })
@@ -1444,22 +1401,6 @@ pub async fn submit_desktop_send_self_broadcast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf};
-
-    use local_db::{DbConfig, DbStore};
-
-    const TEST_PASSWORD: &str = "correct horse battery staple";
-    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-
-    fn temp_db_root() -> PathBuf {
-        let dir = std::env::temp_dir().join("railoxide-wallet-ops-private-tx-tests");
-        fs::create_dir_all(&dir).expect("create temp db parent");
-        let pid = std::process::id();
-        let nanos = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        dir.join(format!("db-{pid}-{nanos}"))
-    }
 
     fn test_utxo(token: Address, value: U256) -> Utxo {
         Utxo::new(
@@ -1493,20 +1434,13 @@ mod tests {
     fn native_top_up_estimate_rejects_unwrap_as_unsupported() {
         let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let chain = test_chain_config(wrapped_native);
-        let top_up = DesktopNativeTopUpRequest {
-            public_account_uuid: "pub-1".to_string(),
-            native_balance: U256::ZERO,
-        };
-        let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
-
         let error = desktop_native_top_up_plan_for_estimate(
             1,
             &chain,
             wrapped_native,
             Address::from([0x52; 20]),
             true,
-            &top_up,
-            policy.offer_threshold,
+            U256::ONE,
         )
         .expect_err("unwrap-to-native cannot be combined with native top-up");
         assert_eq!(
@@ -1517,56 +1451,10 @@ mod tests {
 
     #[test]
     fn native_top_up_plan_validation_counts_wrapped_native_broadcaster_fee() {
-        let root_dir = temp_db_root();
-        let db = Arc::new(
-            DbStore::open(DbConfig {
-                root_dir: root_dir.clone(),
-            })
-            .expect("open db"),
-        );
-        let store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
-        store
-            .create_vault_with_params(TEST_PASSWORD, vault::KdfParams::new(1024, 1, 1))
-            .expect("create vault");
-        let wallet_id = "wallet-1";
-        let metadata = store
-            .new_wallet_metadata(
-                TEST_PASSWORD,
-                wallet_id,
-                0,
-                vault::WalletSource::Generated,
-                "Wallet",
-            )
-            .expect("wallet metadata");
-        store
-            .import_wallet_mnemonic_with_metadata(
-                TEST_PASSWORD,
-                wallet_id,
-                0,
-                "english",
-                TEST_MNEMONIC,
-                &metadata,
-            )
-            .expect("store wallet");
-        let view_session = store
-            .load_view_session(TEST_PASSWORD, wallet_id)
-            .expect("load view session");
-        let account = store
-            .import_public_account(
-                TEST_PASSWORD,
-                &view_session,
-                "0x0101010101010101010101010101010101010101010101010101010101010101",
-                Some("Recipient"),
-                true,
-            )
-            .expect("import public account");
         let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
         let token = Address::from([0x51; 20]);
+        let recipient = Address::from([0x52; 20]);
         let receiver_amount = U256::from(25_u64);
-        let top_up = DesktopNativeTopUpRequest {
-            public_account_uuid: account.public_account_uuid.clone(),
-            native_balance: U256::ZERO,
-        };
         let chain = test_chain_config(wrapped_native);
         let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
         let required_without_fee = native_top_up_required_wrapped_native_amount(
@@ -1577,35 +1465,12 @@ mod tests {
         );
         let utxos = vec![test_utxo(wrapped_native, required_without_fee)];
 
-        let unwrap_error = desktop_native_top_up_plan_from_unshield_fields(
-            1,
-            &chain,
-            &view_session,
-            &store,
-            wrapped_native,
-            account.address,
-            true,
-            &top_up,
-            policy.offer_threshold,
-            None,
-            U256::ZERO,
-            &utxos,
-        )
-        .expect_err("unwrap-to-native cannot be combined with native top-up");
-        assert_eq!(
-            unwrap_error.to_string(),
-            "native top-up cannot be combined with unwrap-to-native output"
-        );
-
         desktop_native_top_up_plan_from_unshield_fields(
             1,
             &chain,
-            &view_session,
-            &store,
             token,
-            account.address,
+            recipient,
             false,
-            &top_up,
             receiver_amount,
             Some(wrapped_native),
             U256::ZERO,
@@ -1617,12 +1482,9 @@ mod tests {
         let error = desktop_native_top_up_plan_from_unshield_fields(
             1,
             &chain,
-            &view_session,
-            &store,
             token,
-            account.address,
+            recipient,
             false,
-            &top_up,
             receiver_amount,
             Some(wrapped_native),
             fee_amount,
@@ -1633,9 +1495,5 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("native top-up wrapped-native max spendable"));
         assert!(message.contains(&format!("required: {expected_required}")));
-
-        drop(store);
-        drop(db);
-        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 }

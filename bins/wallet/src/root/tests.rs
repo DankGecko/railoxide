@@ -1,8 +1,7 @@
 use super::chain_load::{SyncStatusContext, SyncStatusLabels, sync_status_labels};
 use super::private_action::{
     enabled_native_top_up_plan, native_top_up_privacy_warning,
-    native_top_up_refresh_invalidates_estimate,
-    unshield_native_top_up_needs_public_balance_refresh, unshield_native_top_up_state_from_inputs,
+    native_top_up_refresh_invalidates_estimate, unshield_native_top_up_state_from_inputs,
 };
 use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,

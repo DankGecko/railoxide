@@ -189,10 +189,7 @@ pub(in crate::root) struct UnshieldNativeTopUpState {
 pub(in crate::root) fn native_top_up_request_from_plan(
     plan: Option<&DesktopNativeTopUpPlan>,
 ) -> Option<DesktopNativeTopUpRequest> {
-    plan.map(|plan| DesktopNativeTopUpRequest {
-        public_account_uuid: plan.public_account_uuid.clone(),
-        native_balance: plan.native_balance_before,
-    })
+    plan.map(|_| DesktopNativeTopUpRequest)
 }
 
 pub(in crate::root) fn enabled_native_top_up_plan(
@@ -513,42 +510,6 @@ impl WalletRoot {
         }
     }
 
-    pub(in crate::root) fn maybe_schedule_unshield_native_top_up_balance_refresh(
-        &mut self,
-        key: UnshieldAssetKey,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self.public_balance_refreshing {
-            return;
-        }
-        let Some((chain_id, recipient, generating)) = self.unshield_forms.get(&key).map(|form| {
-            (
-                form.asset.chain_id,
-                parse_address(form.recipient_value.trim()),
-                form.generating,
-            )
-        }) else {
-            return;
-        };
-        let Some(recipient) = recipient else {
-            return;
-        };
-        if generating
-            || native_top_up_policy_for_chain(chain_id).is_none()
-            || self.effective_wrapped_native_token(chain_id).is_none()
-        {
-            return;
-        }
-        if unshield_native_top_up_needs_public_balance_refresh(
-            chain_id,
-            recipient,
-            &self.public_accounts,
-            self.public_balance_snapshot.as_deref(),
-        ) {
-            self.schedule_public_balance_refresh(cx);
-        }
-    }
-
     fn unshield_native_top_up_state(
         &self,
         chain_id: u64,
@@ -565,8 +526,6 @@ impl WalletRoot {
             recipient,
             amount,
             fee_mode,
-            &self.public_accounts,
-            self.public_balance_snapshot.as_deref(),
             self.private_action_snapshot(chain_id),
             self.effective_wrapped_native_token(chain_id),
         )
@@ -606,21 +565,6 @@ impl WalletRoot {
         cx.notify();
         if delivery_mode == DeliveryMode::PublicBroadcaster {
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
-        }
-    }
-
-    pub(in crate::root) fn refresh_unshield_native_top_up_states_for_chain(
-        &mut self,
-        chain_id: u64,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let keys = self
-            .unshield_forms
-            .iter()
-            .filter_map(|(key, form)| (form.asset.chain_id == chain_id).then_some(*key))
-            .collect::<Vec<_>>();
-        for key in keys {
-            self.refresh_unshield_native_top_up_state(key, cx);
         }
     }
 
@@ -707,8 +651,6 @@ pub(in crate::root) fn unshield_native_top_up_state_from_inputs(
     recipient: Address,
     amount: U256,
     fee_mode: FeeHandlingMode,
-    public_accounts: &[PublicAccountMetadata],
-    public_balance_snapshot: Option<&PublicBalanceSnapshot>,
     private_action_snapshot: Option<&ListUtxosOutput>,
     wrapped_native_token: Option<Address>,
 ) -> UnshieldNativeTopUpState {
@@ -718,33 +660,6 @@ pub(in crate::root) fn unshield_native_top_up_state_from_inputs(
     let Some(wrapped_native_token) = wrapped_native_token else {
         return UnshieldNativeTopUpState::default();
     };
-    let Some(account) = public_accounts.iter().find(|account| {
-        account.status == PublicAccountStatus::Active && account.address == recipient
-    }) else {
-        return UnshieldNativeTopUpState::default();
-    };
-    let Some(snapshot) = public_balance_snapshot else {
-        return UnshieldNativeTopUpState::default();
-    };
-    if snapshot.chain_id != chain_id {
-        return UnshieldNativeTopUpState::default();
-    }
-    let Some(native_balance) = snapshot.accounts.iter().find_map(|entry| {
-        (entry.account.public_account_uuid == account.public_account_uuid).then(|| {
-            entry
-                .balances
-                .iter()
-                .find(|balance| balance.asset.id == PublicAssetId::Native)
-        })?
-    }) else {
-        return UnshieldNativeTopUpState::default();
-    };
-    let PublicBalanceAmount::Available(native_balance) = native_balance.amount else {
-        return UnshieldNativeTopUpState::default();
-    };
-    if native_balance >= policy.offer_threshold {
-        return UnshieldNativeTopUpState::default();
-    }
     if unwrap {
         return UnshieldNativeTopUpState::default();
     }
@@ -765,47 +680,12 @@ pub(in crate::root) fn unshield_native_top_up_state_from_inputs(
 
     UnshieldNativeTopUpState {
         plan: Some(DesktopNativeTopUpPlan {
-            public_account_uuid: account.public_account_uuid.clone(),
             recipient,
             wrapped_native_token,
             native_amount: policy.top_up_amount,
             wrapped_native_amount,
-            native_balance_before: native_balance,
         }),
     }
-}
-
-pub(in crate::root) fn unshield_native_top_up_needs_public_balance_refresh(
-    chain_id: u64,
-    recipient: Address,
-    public_accounts: &[PublicAccountMetadata],
-    public_balance_snapshot: Option<&PublicBalanceSnapshot>,
-) -> bool {
-    if native_top_up_policy_for_chain(chain_id).is_none() {
-        return false;
-    }
-    let Some(account) = public_accounts.iter().find(|account| {
-        account.status == PublicAccountStatus::Active && account.address == recipient
-    }) else {
-        return false;
-    };
-    let Some(snapshot) = public_balance_snapshot else {
-        return true;
-    };
-    if snapshot.chain_id != chain_id {
-        return true;
-    }
-    let Some(account_balances) = snapshot
-        .accounts
-        .iter()
-        .find(|entry| entry.account.public_account_uuid == account.public_account_uuid)
-    else {
-        return true;
-    };
-    !account_balances
-        .balances
-        .iter()
-        .any(|balance| balance.asset.id == PublicAssetId::Native)
 }
 
 pub(in crate::root) fn adjusted_amount_for_max_change(

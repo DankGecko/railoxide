@@ -371,7 +371,6 @@ impl WalletRoot {
                 if let Some(window) = sync_window {
                     self.sync_self_broadcast_gas_payer_selects(window, cx);
                 }
-                self.refresh_unshield_native_top_up_states_for_chain(chain_id, cx);
             }
             Ok(Err(error)) => {
                 self.public_balance_error = Some(Arc::from(format_report_chain(&error)));

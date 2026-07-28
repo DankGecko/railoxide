@@ -790,14 +790,12 @@ fn self_broadcast_composite_output_rows_show_primary_and_top_up_outputs() {
     progress.recipient_output = Some(Arc::from("100 USDC"));
     let mut result = test_self_broadcast_result(true);
     result.native_top_up = Some(DesktopNativeTopUpPlan {
-        public_account_uuid: "public-account".to_string(),
         recipient: Address::from([0x42; 20]),
         wrapped_native_token: Address::from([0x43; 20]),
         native_amount: uint!(3_000_000_000_000_000_U256),
         wrapped_native_amount: wallet_ops::native_top_up_wrapped_native_amount(uint!(
             3_000_000_000_000_000_U256
         )),
-        native_balance_before: U256::ZERO,
     });
 
     assert_eq!(

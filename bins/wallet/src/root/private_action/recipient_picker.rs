@@ -671,7 +671,6 @@ impl WalletRoot {
         if changed {
             if kind == DeliveryFormKind::Unshield {
                 self.refresh_unshield_native_top_up_state(key, cx);
-                self.maybe_schedule_unshield_native_top_up_balance_refresh(key, cx);
             }
             self.debounce_public_broadcaster_cost_estimate(kind, key, cx);
             cx.notify();
