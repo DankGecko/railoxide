@@ -1781,7 +1781,7 @@ impl WalletRoot {
                         async move {
                             Ok::<Arc<WalletSessionStore>, eyre::Report>(Arc::new(match vault_db {
                                 Some(db) => {
-                                    WalletSessionStore::from_db(db, poi_read_source.clone())
+                                    WalletSessionStore::from_db(db, poi_read_source.clone())?
                                 }
                                 None => WalletSessionStore::open(db_path, poi_read_source.clone())?,
                             }))

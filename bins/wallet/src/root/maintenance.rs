@@ -195,7 +195,15 @@ impl WalletMaintenanceController {
                 None => None,
             };
             let result = if let Some(store) = store {
-                let report = store.reset_public_sync_caches().await;
+                let report = match store.reset_public_sync_caches().await {
+                    Ok(report) => report,
+                    Err(error) => {
+                        return (
+                            Err(format!("public cache reset admission failed: {error}")),
+                            PublicSyncResetCompletion::ResetAttempted,
+                        );
+                    }
+                };
                 if let Err(error) = report.persisted.as_ref() {
                     Err(format!("persisted public cache reset failed: {error}"))
                 } else if report.failed_chain_count() > 0 {

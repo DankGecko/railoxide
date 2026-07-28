@@ -64,15 +64,15 @@ arti-client = "0.43"
 tor-rtcompat = "0.43"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
-waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "697a654554719432653854054e0c5d68d8e3dac5" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
+waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "cf6716cfb73773e8f87bcc2a2cb205753af9481c" }
 
 [profile.release]
 opt-level = 3
@@ -83,14 +83,28 @@ panic = "unwind"
 codegen-units = 8
 
 [profile.dev]
-incremental = true
-codegen-units = 16
+opt-level = 0
 debug = "line-tables-only"
-panic = "abort"
-strip = "none"
+debug-assertions = true
+overflow-checks = true
+panic = "unwind"
+incremental = true
 
 [profile.dev.build-override]
 opt-level = 3
+debug = 0
+
+[profile.dev.package.rust-embed]
+debug-assertions = true
+
+[profile.dev.package.gpui-component-assets]
+debug-assertions = true
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+debug-assertions = false
+overflow-checks = false
 
 [workspace.lints]
 rust.unreachable_pub = "warn"

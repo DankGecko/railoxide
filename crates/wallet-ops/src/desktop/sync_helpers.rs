@@ -803,7 +803,8 @@ mod tests {
                     PoiReadSource::PoiProxy {
                         rpc_url: rpc_url.clone().into(),
                     },
-                );
+                )
+                .expect("acquire test sync manager ownership");
                 sync_manager
                     .add_chain(ChainConfig {
                         chain_id: chain_key.chain_id,

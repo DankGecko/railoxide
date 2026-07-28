@@ -381,10 +381,10 @@ async fn wallet_sync_lifecycle_reset_inventory_survives_loading_and_error_withou
     let poi_policy = wallet_ops::PoiReadSource::PoiProxy {
         rpc_url: poi_rpc_url.clone().into(),
     };
-    let store = Arc::new(WalletSessionStore::from_db(
-        vault_store.db(),
-        poi_policy.clone(),
-    ));
+    let store = Arc::new(
+        WalletSessionStore::from_db(vault_store.db(), poi_policy.clone())
+            .expect("acquire test sync manager ownership"),
+    );
     let http = wallet_ops::build_wallet_network_context(wallet_ops::WalletNetworkConfig {
         network_mode: Some(WalletNetworkMode::Direct),
         proxy: None,
@@ -437,7 +437,10 @@ async fn wallet_sync_lifecycle_reset_inventory_survives_loading_and_error_withou
         .get()
         .cloned()
         .expect("manager reset inventory remains available while loading");
-    let loading_report = reset_store.reset_public_sync_caches().await;
+    let loading_report = reset_store
+        .reset_public_sync_caches()
+        .await
+        .expect("loading-state reset admitted");
     assert_eq!(loading_report.chains.len(), 1);
     assert_eq!(loading_report.failed_chain_count(), 0);
     assert_eq!(loading_report.chains[0].chain.chain_id, 1);
@@ -457,7 +460,10 @@ async fn wallet_sync_lifecycle_reset_inventory_survives_loading_and_error_withou
         ppoi_workflow_status: WalletPpoiWorkflowStatus::default(),
     };
     assert!(error.poi_refresh_session().is_none());
-    let error_report = reset_store.reset_public_sync_caches().await;
+    let error_report = reset_store
+        .reset_public_sync_caches()
+        .await
+        .expect("error-state reset admitted");
     assert_eq!(error_report.chains.len(), 1);
     assert_eq!(error_report.failed_chain_count(), 0);
     assert_eq!(
@@ -826,7 +832,10 @@ async fn wallet_sync_lifecycle_cleanup_detects_late_initialized_store() {
         .expect("default POI policy");
     let vault_store = DesktopVaultStore::open(root_dir.clone()).expect("open wallet DB");
     let db = vault_store.db();
-    let store = Arc::new(WalletSessionStore::from_db(Arc::clone(&db), poi_policy));
+    let store = Arc::new(
+        WalletSessionStore::from_db(Arc::clone(&db), poi_policy)
+            .expect("acquire test sync manager ownership"),
+    );
 
     assert!(old_session_store.set(Arc::clone(&store)).is_ok());
     let report = cleanup.shutdown().await.expect("shutdown lifecycle");

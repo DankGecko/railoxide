@@ -109,18 +109,20 @@ impl ActiveWalletScope {
 impl WalletSessionStore {
     pub fn open(db_path: PathBuf, poi_policy: PoiReadSource) -> Result<Self> {
         let db = Arc::new(DbStore::open(DbConfig { root_dir: db_path }).wrap_err("open local db")?);
-        Ok(Self::from_db(db, poi_policy))
+        Self::from_db(db, poi_policy)
     }
 
-    #[must_use]
-    pub fn from_db(db: Arc<DbStore>, poi_policy: PoiReadSource) -> Self {
-        let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db), poi_policy));
+    pub fn from_db(db: Arc<DbStore>, poi_policy: PoiReadSource) -> Result<Self> {
+        let sync_manager = Arc::new(
+            SyncManager::new(Arc::clone(&db), poi_policy)
+                .wrap_err("acquire sync manager database ownership")?,
+        );
 
-        Self {
+        Ok(Self {
             db,
             sync_manager,
             active_wallet_scope: AsyncMutex::new(ActiveWalletScope::default()),
-        }
+        })
     }
 
     pub async fn start_view_wallet_session(
@@ -143,8 +145,11 @@ impl WalletSessionStore {
             .await
     }
 
-    pub async fn reset_public_sync_caches(&self) -> PublicSyncCachesResetReport {
-        self.sync_manager.reset_public_sync_caches().await
+    pub async fn reset_public_sync_caches(&self) -> Result<PublicSyncCachesResetReport> {
+        self.sync_manager
+            .reset_public_sync_caches()
+            .await
+            .wrap_err("reset public sync caches")
     }
 
     async fn start_view_wallet_session_with_wait(
