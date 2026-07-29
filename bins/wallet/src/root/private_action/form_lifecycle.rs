@@ -323,10 +323,19 @@ impl WalletRoot {
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
         Self::open_private_action_dialog(DeliveryFormKind::Send, key, "Send", window, cx);
-        focus_recipient_input
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window);
+        cx.defer_in(window, move |root, window, cx| {
+            if root
+                .private_action_form
+                .as_ref()
+                .is_some_and(|form| form.kind == DeliveryFormKind::Send && form.key == key)
+                && window.has_active_dialog(cx)
+            {
+                focus_recipient_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window);
+            }
+        });
         cx.notify();
     }
 
@@ -1517,10 +1526,19 @@ impl WalletRoot {
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         Self::open_private_action_dialog(DeliveryFormKind::Unshield, key, "Unshield", window, cx);
-        focus_recipient_input
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window);
+        cx.defer_in(window, move |root, window, cx| {
+            if root
+                .private_action_form
+                .as_ref()
+                .is_some_and(|form| form.kind == DeliveryFormKind::Unshield && form.key == key)
+                && window.has_active_dialog(cx)
+            {
+                focus_recipient_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window);
+            }
+        });
         cx.notify();
     }
 

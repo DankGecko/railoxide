@@ -128,6 +128,21 @@ pub(in crate::root) const fn effective_trezor_passphrase_mode(
 }
 
 #[cfg(any(feature = "hardware", test))]
+pub(in crate::root) const fn next_trezor_passphrase_mode(
+    mode: TrezorPassphraseMode,
+    passphrase_always_on_device: bool,
+) -> TrezorPassphraseMode {
+    match mode {
+        TrezorPassphraseMode::NoPassphrase => TrezorPassphraseMode::EnterOnTrezor,
+        TrezorPassphraseMode::EnterOnTrezor if passphrase_always_on_device => {
+            TrezorPassphraseMode::NoPassphrase
+        }
+        TrezorPassphraseMode::EnterOnTrezor => TrezorPassphraseMode::EnterInApp,
+        TrezorPassphraseMode::EnterInApp => TrezorPassphraseMode::NoPassphrase,
+    }
+}
+
+#[cfg(any(feature = "hardware", test))]
 pub(in crate::root) fn parse_hardware_recovery_range(
     start_value: &str,
     count_value: &str,

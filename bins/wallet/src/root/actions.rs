@@ -5,6 +5,14 @@ use gpui::{App, Entity, Global, KeyBinding, WeakEntity, Window, WindowId};
 use super::TABLE_KEY_CONTEXT;
 use super::startup::WalletStartupRoot;
 
+#[cfg(feature = "hardware")]
+pub(super) const TREZOR_PASSPHRASE_MODE_KEY_CONTEXT: &str = "TrezorPassphraseMode";
+
+#[cfg(feature = "hardware")]
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(super) struct CycleTrezorPassphraseMode;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub(crate) struct UtxoPageUp;
@@ -53,6 +61,12 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
     app.on_action(|_: &LockVault, cx| {
         dispatch_wallet_shortcut(WalletShortcutAction::LockVault, cx);
     });
+    #[cfg(feature = "hardware")]
+    app.bind_keys([KeyBinding::new(
+        "tab",
+        CycleTrezorPassphraseMode,
+        Some(TREZOR_PASSPHRASE_MODE_KEY_CONTEXT),
+    )]);
 }
 
 pub(super) fn register_wallet_shortcut_root(
@@ -96,4 +110,100 @@ pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
         KeyBinding::new("home", UtxoHome, Some(TABLE_KEY_CONTEXT)),
         KeyBinding::new("end", UtxoEnd, Some(TABLE_KEY_CONTEXT)),
     ]);
+}
+
+#[cfg(all(test, feature = "hardware"))]
+mod tests {
+    use gpui::{
+        AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, Keystroke,
+        ParentElement as _, Render, TestAppContext, Window, div,
+    };
+
+    use super::*;
+
+    const PROBE_INPUT_CONTEXT: &str = "TrezorPassphraseInputProbe";
+    const PROBE_ROOT_CONTEXT: &str = "TrezorPassphraseRootProbe";
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+    #[action(no_json)]
+    struct ProbeInputTab;
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+    #[action(no_json)]
+    struct ProbeRootTab;
+
+    struct TrezorPassphraseTabProbe {
+        input_focus: FocusHandle,
+        cycle_count: usize,
+        root_tab_count: usize,
+    }
+
+    impl Render for TrezorPassphraseTabProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            div()
+                .key_context(PROBE_ROOT_CONTEXT)
+                .on_action(cx.listener(|probe, _: &ProbeRootTab, _, _| {
+                    probe.root_tab_count += 1;
+                }))
+                .child(
+                    div()
+                        .key_context(TREZOR_PASSPHRASE_MODE_KEY_CONTEXT)
+                        .on_action(cx.listener(|probe, _: &CycleTrezorPassphraseMode, _, _| {
+                            probe.cycle_count += 1;
+                        }))
+                        .child(
+                            div()
+                                .key_context(PROBE_INPUT_CONTEXT)
+                                .track_focus(&self.input_focus),
+                        ),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn trezor_passphrase_tab_action_precedes_input_and_root_tab_actions(cx: &mut TestAppContext) {
+        cx.update(|app| {
+            app.bind_keys([
+                KeyBinding::new("tab", ProbeRootTab, Some(PROBE_ROOT_CONTEXT)),
+                KeyBinding::new("tab", ProbeInputTab, Some(PROBE_INPUT_CONTEXT)),
+            ]);
+            install_wallet_action_bindings(app);
+        });
+        let window = cx.update(|app| {
+            app.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| TrezorPassphraseTabProbe {
+                    input_focus: cx.focus_handle(),
+                    cycle_count: 0,
+                    root_tab_count: 0,
+                })
+            })
+            .expect("open probe window")
+        });
+        window
+            .update(cx, |probe, window, cx| {
+                let input_focus = probe.input_focus.clone();
+                cx.defer_in(window, move |_probe, window, _cx| {
+                    input_focus.focus(window);
+                });
+            })
+            .expect("schedule probe input focus");
+        cx.run_until_parked();
+        window
+            .update(cx, |probe, window, _cx| {
+                assert!(probe.input_focus.is_focused(window));
+            })
+            .expect("verify deferred probe focus");
+
+        cx.dispatch_keystroke(
+            *window,
+            Keystroke::parse("tab").expect("valid Tab keystroke"),
+        );
+
+        window
+            .update(cx, |probe, _, _| {
+                assert_eq!(probe.cycle_count, 1);
+                assert_eq!(probe.root_tab_count, 0);
+            })
+            .expect("inspect probe state");
+    }
 }

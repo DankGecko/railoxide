@@ -6,6 +6,12 @@ use crate::root::manage_wallets::{
 use crate::root::vault::vault_lock_is_allowed;
 
 #[test]
+fn active_dialog_blocks_background_focus_changes() {
+    assert!(should_apply_background_focus(false));
+    assert!(!should_apply_background_focus(true));
+}
+
+#[test]
 fn selected_wallet_deletion_restarts_sync_after_every_failure() {
     assert!(restart_selected_wallet_sync_after_deletion(true, false));
     assert!(!restart_selected_wallet_sync_after_deletion(true, true));
@@ -765,6 +771,8 @@ fn hardware_profile_recovery_inputs_are_bounded() {
 
 #[test]
 fn hardware_profile_copy_warns_about_non_secret_labels_and_trezor_modes() {
+    use wallet_ops::vault::TrezorPassphraseMode;
+
     assert!(hardware_profile_label_warning().contains("non-secret metadata"));
     assert!(hardware_profile_label_warning().contains("Do not put your hardware passphrase"));
     assert!(
@@ -781,17 +789,33 @@ fn hardware_profile_copy_warns_about_non_secret_labels_and_trezor_modes() {
     );
     assert_eq!(
         crate::root::vault::effective_trezor_passphrase_mode(
-            wallet_ops::vault::TrezorPassphraseMode::EnterInApp,
+            TrezorPassphraseMode::EnterInApp,
             true,
         ),
-        wallet_ops::vault::TrezorPassphraseMode::NoPassphrase,
+        TrezorPassphraseMode::NoPassphrase,
     );
     assert_eq!(
         crate::root::vault::effective_trezor_passphrase_mode(
-            wallet_ops::vault::TrezorPassphraseMode::EnterInApp,
+            TrezorPassphraseMode::EnterInApp,
             false,
         ),
-        wallet_ops::vault::TrezorPassphraseMode::EnterInApp,
+        TrezorPassphraseMode::EnterInApp,
+    );
+    assert_eq!(
+        crate::root::vault::next_trezor_passphrase_mode(TrezorPassphraseMode::NoPassphrase, false),
+        TrezorPassphraseMode::EnterOnTrezor,
+    );
+    assert_eq!(
+        crate::root::vault::next_trezor_passphrase_mode(TrezorPassphraseMode::EnterOnTrezor, false),
+        TrezorPassphraseMode::EnterInApp,
+    );
+    assert_eq!(
+        crate::root::vault::next_trezor_passphrase_mode(TrezorPassphraseMode::EnterInApp, false),
+        TrezorPassphraseMode::NoPassphrase,
+    );
+    assert_eq!(
+        crate::root::vault::next_trezor_passphrase_mode(TrezorPassphraseMode::EnterOnTrezor, true),
+        TrezorPassphraseMode::NoPassphrase,
     );
 }
 

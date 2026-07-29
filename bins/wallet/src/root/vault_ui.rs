@@ -27,6 +27,8 @@ use wallet_ops::hardware::{HardwareDeviceKind, HardwareWalletSyncIntent};
 #[cfg(feature = "hardware")]
 use wallet_ops::vault::TrezorPassphraseMode;
 
+#[cfg(feature = "hardware")]
+use super::actions::{CycleTrezorPassphraseMode, TREZOR_PASSPHRASE_MODE_KEY_CONTEXT};
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
 use super::vault::hardware_device_label;
@@ -721,6 +723,8 @@ impl WalletRoot {
             })
             .when(device_kind == HardwareDeviceKind::Trezor, |this| {
                 let mode = self.hardware_profile_unlock.trezor_passphrase_mode;
+                let passphrase_mode_focus = self.trezor_passphrase_mode_focus.clone();
+                let passphrase_mode_keyboard_root = trezor_mode_root.clone();
                 let enter_in_app_disabled = self.hardware_profile_unlock.in_progress
                     || self
                         .hardware_profile_unlock
@@ -746,6 +750,16 @@ impl WalletRoot {
                         .border_1()
                         .border_color(rgb(theme::BORDER))
                         .bg(rgb_with_alpha(theme::SURFACE, 0.72))
+                        .key_context(TREZOR_PASSPHRASE_MODE_KEY_CONTEXT)
+                        .track_focus(
+                            &passphrase_mode_focus
+                                .tab_stop(!self.hardware_profile_unlock.in_progress),
+                        )
+                        .on_action(move |_: &CycleTrezorPassphraseMode, window, cx| {
+                            passphrase_mode_keyboard_root.update(cx, |root, cx| {
+                                root.cycle_trezor_profile_passphrase_mode(window, cx);
+                            });
+                        })
                         .child(app_strong_text("Passphrase"))
                         .child(app_muted_text(passphrase_copy).whitespace_normal())
                         .child(
@@ -1912,6 +1926,7 @@ fn trezor_passphrase_mode_segment_button(
     disabled: bool,
 ) -> Button {
     let button = app_button_base(id)
+        .tab_stop(false)
         .flex_1()
         .min_w(px(0.0))
         .selected(selected)

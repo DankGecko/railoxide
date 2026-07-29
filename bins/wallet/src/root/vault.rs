@@ -74,9 +74,9 @@ pub(in crate::root) use hardware::{
     HARDWARE_PROFILE_ADD_SUBACCOUNT_BUTTON_ID, HARDWARE_PROFILE_RECOVER_EXACT_BUTTON_ID,
     HARDWARE_PROFILE_RECOVER_RANGE_BUTTON_ID, effective_trezor_passphrase_mode,
     hardware_profile_label_warning, hardware_session_needs_trezor_app_passphrase,
-    hardware_wallet_creation_result_is_current, parse_hardware_exact_recovery_index,
-    parse_hardware_recovery_range, parse_hardware_wallet_restore_account_index,
-    trezor_passphrase_mode_copy,
+    hardware_wallet_creation_result_is_current, next_trezor_passphrase_mode,
+    parse_hardware_exact_recovery_index, parse_hardware_recovery_range,
+    parse_hardware_wallet_restore_account_index, trezor_passphrase_mode_copy,
 };
 #[cfg(feature = "hardware")]
 #[allow(unused_imports)]

@@ -58,7 +58,7 @@ use super::{
     HERO_WIDE_BREAKPOINT, LOGS_DRAWER_HEIGHT, LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT,
     SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState,
     WalletRoot, WalletStartupRoot, app_status_tag, chain_load_overrides, count_label,
-    rgb_with_alpha,
+    rgb_with_alpha, should_apply_background_focus,
 };
 
 pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
@@ -292,9 +292,11 @@ impl Render for WalletRoot {
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.sync_walletconnect_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);
-        self.focus_vault_input_if_requested(window, cx);
-        self.focus_utxo_table_if_requested(window, cx);
-        self.focus_public_account_search_if_requested(window, cx);
+        if should_apply_background_focus(window.has_active_dialog(cx)) {
+            self.focus_vault_input_if_requested(window, cx);
+            self.focus_utxo_table_if_requested(window, cx);
+            self.focus_public_account_search_if_requested(window, cx);
+        }
 
         let root = cx.entity();
         if !matches!(self.vault_state, VaultState::ViewUnlocked) {

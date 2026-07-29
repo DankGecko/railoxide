@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, EventTx, Shared, publish_revision};
 use broadcaster_monitor_waku::{RelayNetworkMode, WakuMonitorConfig, spawn_workers_until_shutdown};
+#[cfg(feature = "hardware")]
+use gpui::FocusHandle;
 use gpui::{AppContext, Context, Entity, Focusable, Pixels, SharedString, Window, px};
 use gpui_component::{
-    IndexPath,
+    IndexPath, WindowExt,
     input::{InputEvent, InputState},
     resizable::ResizableState,
     select::{SearchableVec, SelectEvent, SelectState},
@@ -328,6 +330,11 @@ const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
 const PROVER_CACHE_BUILD_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(super) const fn should_apply_background_focus(has_active_dialog: bool) -> bool {
+    !has_active_dialog
+}
+
 pub(crate) struct WalletRoot {
     options: WalletAppOptions,
     vault_store: Option<Arc<DesktopVaultStore>>,
@@ -374,6 +381,8 @@ pub(crate) struct WalletRoot {
     hardware_profile_exact_index_input: Entity<InputState>,
     #[cfg(feature = "hardware")]
     trezor_app_passphrase_input: Entity<InputState>,
+    #[cfg(feature = "hardware")]
+    trezor_passphrase_mode_focus: FocusHandle,
     http: HttpContext,
     network_health: WalletNetworkHealth,
     root_shutdown: watch::Sender<bool>,
@@ -965,6 +974,8 @@ impl WalletRoot {
         let hardware_profile_exact_index_input = new_text_input(window, cx, "account index");
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase_input = new_masked_input(window, cx, "Trezor passphrase");
+        #[cfg(feature = "hardware")]
+        let trezor_passphrase_mode_focus = cx.focus_handle();
         let import_mnemonic_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(3, 6)
@@ -1146,6 +1157,8 @@ impl WalletRoot {
             hardware_profile_exact_index_input,
             #[cfg(feature = "hardware")]
             trezor_app_passphrase_input,
+            #[cfg(feature = "hardware")]
+            trezor_passphrase_mode_focus,
             http,
             network_health,
             root_shutdown,
@@ -1356,8 +1369,10 @@ impl WalletRoot {
                     return;
                 };
                 this.select_chain(*chain_id, window, cx);
-                cx.defer_in(window, |_this, window, _cx| {
-                    window.blur();
+                cx.defer_in(window, |_this, window, cx| {
+                    if should_apply_background_focus(window.has_active_dialog(cx)) {
+                        window.blur();
+                    }
                 });
             },
         )
@@ -1389,8 +1404,10 @@ impl WalletRoot {
                     return;
                 };
                 this.set_walletconnect_selected_account(public_account_uuid.clone(), cx);
-                cx.defer_in(window, |_this, window, _cx| {
-                    window.blur();
+                cx.defer_in(window, |_this, window, cx| {
+                    if should_apply_background_focus(window.has_active_dialog(cx)) {
+                        window.blur();
+                    }
                 });
             },
         )
@@ -1403,8 +1420,10 @@ impl WalletRoot {
                     return;
                 };
                 this.select_wallet(value.as_ref(), window, cx);
-                cx.defer_in(window, |_this, window, _cx| {
-                    window.blur();
+                cx.defer_in(window, |_this, window, cx| {
+                    if should_apply_background_focus(window.has_active_dialog(cx)) {
+                        window.blur();
+                    }
                 });
             },
         )

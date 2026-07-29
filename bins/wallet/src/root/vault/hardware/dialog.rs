@@ -9,8 +9,9 @@ use super::{
     dismiss_hardware_profile_unlock_state, div, hardware_device_kind_from_source,
     hardware_device_label, hardware_profile_hardware_error_message,
     hardware_profile_should_reconnect_after_error, hardware_session_needs_trezor_app_passphrase,
-    hardware_wallet_creation_result_is_current, mpsc, px, secondary_dialog_content_width,
-    trezor_pin_matrix_provider, trezor_session_stale_error_message, vault_error_message,
+    hardware_wallet_creation_result_is_current, mpsc, next_trezor_passphrase_mode, px,
+    secondary_dialog_content_width, trezor_pin_matrix_provider, trezor_session_stale_error_message,
+    vault_error_message,
 };
 #[cfg(not(feature = "hardware"))]
 use super::{Context, WalletRoot};
@@ -620,10 +621,18 @@ impl WalletRoot {
                 )
         });
         if self.hardware_profile_unlock_requires_password() {
-            self.hardware_profile_password_input
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window);
+            cx.defer_in(window, move |root, window, cx| {
+                if root.hardware_profile_unlock.device_kind == Some(device_kind)
+                    && root.hardware_profile_unlock.session.is_none()
+                    && !root.hardware_profile_unlock.in_progress
+                    && root.hardware_profile_unlock_requires_password()
+                {
+                    root.hardware_profile_password_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .focus(window);
+                }
+            });
         } else if self.hardware_profile_unlock_auto_starts() {
             cx.defer_in(window, move |root, window, cx| {
                 if root.hardware_profile_unlock_auto_starts()
@@ -632,6 +641,15 @@ impl WalletRoot {
                     && !root.hardware_profile_unlock.in_progress
                 {
                     root.unlock_hardware_profile_from_dialog(window, cx);
+                }
+            });
+        } else if device_kind == HardwareDeviceKind::Trezor {
+            cx.defer_in(window, move |root, window, _cx| {
+                if root.hardware_profile_unlock.device_kind == Some(device_kind)
+                    && root.hardware_profile_unlock.session.is_none()
+                    && !root.hardware_profile_unlock.in_progress
+                {
+                    root.trezor_passphrase_mode_focus.focus(window);
                 }
             });
         }
@@ -671,6 +689,7 @@ impl WalletRoot {
         if mode != TrezorPassphraseMode::EnterInApp {
             self.trezor_app_passphrase_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
+            self.trezor_passphrase_mode_focus.focus(window);
         }
         cx.notify();
         if mode == TrezorPassphraseMode::EnterInApp {
@@ -688,6 +707,27 @@ impl WalletRoot {
                 }
             });
         }
+    }
+
+    #[cfg(feature = "hardware")]
+    pub(in crate::root) fn cycle_trezor_profile_passphrase_mode(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.hardware_profile_unlock.device_kind != Some(HardwareDeviceKind::Trezor)
+            || self.hardware_profile_unlock.session.is_some()
+            || self.hardware_profile_unlock.in_progress
+        {
+            return;
+        }
+        let next_mode = next_trezor_passphrase_mode(
+            self.hardware_profile_unlock.trezor_passphrase_mode,
+            self.hardware_profile_unlock
+                .trezor_passphrase_always_on_device
+                .unwrap_or(false),
+        );
+        self.set_trezor_profile_passphrase_mode(next_mode, window, cx);
     }
 
     #[cfg(feature = "hardware")]
