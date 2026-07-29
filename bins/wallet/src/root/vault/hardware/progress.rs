@@ -41,34 +41,34 @@ pub(in crate::root) fn hardware_profile_hardware_error_message(
                     .into();
             }
             HardwareDerivationError::LedgerStatus { status: 0x6985, .. } => {
-                return "Ledger did not approve the request. If it locked or timed out, unlock your Ledger, open the Ethereum app, then try again."
+                return "Ledger did not approve the request. If it locked or timed out, enter your PIN, then open the Ethereum app and try again."
                     .into();
             }
             HardwareDerivationError::LedgerStatus {
                 status: 0x6804 | 0x6b0c,
                 ..
             } => {
-                return "Ledger locked before the request was approved. Unlock your Ledger, open the Ethereum app, then try again."
+                return "Ledger locked before the request was approved. Enter your PIN, then open the Ethereum app and try again."
                     .into();
             }
             HardwareDerivationError::LedgerStatus {
                 status: 0x6511 | 0x6a15 | 0x6d00 | 0x6e00,
                 ..
             } => {
-                return "The Ethereum app closed before the request was approved. Unlock your Ledger, open the Ethereum app, then try again."
+                return "The Ethereum app closed before the request was approved. Enter your PIN, then open the Ethereum app and try again."
                     .into();
             }
             HardwareDerivationError::LedgerUnavailable(_) | HardwareDerivationError::Ledger(_) => {
-                return "Ledger locked or disconnected before the request was approved. Unlock your Ledger, open the Ethereum app, then try again."
+                return "Ledger locked or disconnected before the request was approved. Plug it in and enter your PIN, then open the Ethereum app and try again."
                     .into();
             }
             HardwareDerivationError::TrezorLocked
             | HardwareDerivationError::UnsupportedTrezorPinMatrix => {
-                return "Trezor locked before the request was approved. Unlock your Trezor, then try again."
+                return "Trezor locked before the request was approved. Enter your PIN, then try again."
                     .into();
             }
             HardwareDerivationError::TrezorBridge(_) | HardwareDerivationError::Trezor(_) => {
-                return "Trezor locked or disconnected before the request was approved. Unlock your Trezor, then try again."
+                return "Trezor locked or disconnected before the request was approved. Plug it in and enter your PIN, then try again."
                     .into();
             }
             _ => {}
@@ -77,7 +77,7 @@ pub(in crate::root) fn hardware_profile_hardware_error_message(
 
     match error {
         HardwareDerivationError::LedgerUnavailable(_) => {
-            "Connect and unlock your Ledger, open the Ethereum app, then try again.".into()
+            "Plug it in and enter your PIN, then open the Ethereum app and try again.".into()
         }
         HardwareDerivationError::LedgerStatus { message, .. } => (*message).into(),
         HardwareDerivationError::Ledger(_) => {
@@ -85,11 +85,11 @@ pub(in crate::root) fn hardware_profile_hardware_error_message(
                 .into()
         }
         HardwareDerivationError::TrezorBridge(_) | HardwareDerivationError::Trezor(_) => {
-            "Connect and unlock your Trezor, then try again.".into()
+            "Plug it in and enter your PIN, then try again.".into()
         }
         HardwareDerivationError::TrezorLocked
         | HardwareDerivationError::UnsupportedTrezorPinMatrix => {
-            "Unlock your Trezor, then try again.".into()
+            "Enter your PIN, then try again.".into()
         }
         _ => format!("{operation}: {error}").into(),
     }
@@ -263,7 +263,7 @@ pub(super) fn trezor_pin_matrix_provider(
             &progress_tx,
             HardwareProfileStep::OpenEthereumApp,
             HardwareProfileStepStatus::Pending,
-            Some("Confirm the active Trezor wallet context."),
+            Some("Confirm the wallet on your Trezor."),
         );
         Ok(pin)
     })
@@ -316,7 +316,7 @@ pub(super) fn send_hardware_profile_readiness_progress(
                     progress_tx,
                     HardwareProfileStep::UnlockDevice,
                     HardwareProfileStepStatus::Pending,
-                    Some("Unlock your Ledger."),
+                    Some("Enter your PIN."),
                 ) && send_hardware_profile_progress(
                     progress_tx,
                     HardwareProfileStep::OpenEthereumApp,
@@ -344,7 +344,7 @@ pub(super) fn send_hardware_profile_readiness_progress(
                     progress_tx,
                     HardwareProfileStep::UnlockDevice,
                     HardwareProfileStepStatus::Pending,
-                    Some("Connect and unlock your Ledger."),
+                    Some("Plug it in and enter your PIN."),
                 ) && send_hardware_profile_progress(
                     progress_tx,
                     HardwareProfileStep::OpenEthereumApp,
@@ -362,7 +362,7 @@ pub(super) fn send_hardware_profile_readiness_progress(
                     progress_tx,
                     HardwareProfileStep::UnlockDevice,
                     HardwareProfileStepStatus::Pending,
-                    Some("Unlock your Ledger, then open the Ethereum app."),
+                    Some("Enter your PIN, then open the Ethereum app."),
                 ) && send_hardware_profile_progress(
                     progress_tx,
                     HardwareProfileStep::OpenEthereumApp,
@@ -377,9 +377,9 @@ pub(super) fn send_hardware_profile_readiness_progress(
                 HardwareDerivationError::TrezorLocked
                     | HardwareDerivationError::UnsupportedTrezorPinMatrix
             ) {
-                "Unlock your Trezor."
+                "Enter your PIN."
             } else {
-                "Connect and unlock your Trezor."
+                "Plug it in and enter your PIN."
             };
             send_hardware_profile_progress(
                 progress_tx,
@@ -435,7 +435,7 @@ mod hardware_profile_detection_tests {
         assert_eq!(unlock.status, HardwareProfileStepStatus::Pending);
         assert_eq!(
             unlock.message.as_deref(),
-            Some("Unlock your Ledger, then open the Ethereum app.")
+            Some("Enter your PIN, then open the Ethereum app.")
         );
 
         let ethereum = progress_rx
@@ -507,6 +507,10 @@ mod hardware_profile_detection_tests {
         let unlock = progress_rx.try_recv().expect("unlock pending update");
         assert_eq!(unlock.step, HardwareProfileStep::UnlockDevice);
         assert_eq!(unlock.status, HardwareProfileStepStatus::Pending);
+        assert_eq!(
+            unlock.message.as_deref(),
+            Some("Plug it in and enter your PIN.")
+        );
 
         let ethereum = progress_rx.try_recv().expect("ethereum app reset update");
         assert_eq!(ethereum.step, HardwareProfileStep::OpenEthereumApp);
@@ -534,7 +538,7 @@ mod hardware_profile_detection_tests {
         let unlock = progress_rx.try_recv().expect("unlock pending update");
         assert_eq!(unlock.step, HardwareProfileStep::UnlockDevice);
         assert_eq!(unlock.status, HardwareProfileStepStatus::Pending);
-        assert_eq!(unlock.message.as_deref(), Some("Unlock your Trezor."));
+        assert_eq!(unlock.message.as_deref(), Some("Enter your PIN."));
 
         let context = progress_rx.try_recv().expect("context reset update");
         assert_eq!(context.step, HardwareProfileStep::OpenEthereumApp);

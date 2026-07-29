@@ -125,22 +125,13 @@ impl WalletRoot {
     }
 
     #[cfg(feature = "hardware")]
-    pub(in crate::root::vault) fn begin_hardware_profile_detection_progress(
-        &mut self,
-        device_kind: HardwareDeviceKind,
-    ) {
+    pub(in crate::root::vault) fn begin_hardware_profile_detection_progress(&mut self) {
         self.hardware_profile_unlock.progress_steps = default_hardware_profile_steps();
         let message = self
             .hardware_profile_unlock
             .reconnect_notice
             .take()
-            .unwrap_or_else(|| {
-                format!(
-                    "Connect and unlock your {}.",
-                    hardware_device_label(device_kind)
-                )
-                .into()
-            });
+            .unwrap_or_else(|| "Plug it in and enter your PIN.".into());
         self.hardware_profile_unlock.set_progress_step(
             HardwareProfileStep::UnlockDevice,
             HardwareProfileStepStatus::Pending,
@@ -385,7 +376,7 @@ impl WalletRoot {
             && response_tx.send(Zeroizing::new(positions)).is_err()
         {
             self.hardware_profile_unlock.error = Some(Arc::from(
-                "Trezor PIN request expired. Unlock your Trezor, then try again.",
+                "Trezor PIN request expired. Enter your PIN, then try again.",
             ));
         }
         prompt.clear_sensitive();
@@ -488,7 +479,7 @@ impl WalletRoot {
         self.hardware_profile_unlock.error = None;
         self.hardware_profile_unlock.progress_steps = default_hardware_profile_steps();
         self.hardware_profile_unlock.reconnect_notice = Some(Arc::from(
-            "Ledger connection was interrupted. Unlock your Ledger and open the Ethereum app to reconnect.",
+            "Ledger connection was interrupted. Plug it in and enter your PIN, then open the Ethereum app to reconnect.",
         ));
 
         cx.defer_in(window, move |root, window, cx| {

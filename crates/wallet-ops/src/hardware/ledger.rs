@@ -31,7 +31,7 @@ pub const LEDGER_ETHEREUM_EIP712_CLEAR_MIN_APP_VERSION: HardwareAppVersion =
     HardwareAppVersion::new(1, 10, 0);
 
 const LEDGER_READY_MESSAGE: &str =
-    "Connect and unlock your Ledger, open the Ethereum app, then retry.";
+    "Plug it in and enter your PIN, then open the Ethereum app and retry.";
 const LEDGER_VID: u16 = 0x2c97;
 #[cfg(not(target_os = "linux"))]
 const LEDGER_USAGE_PAGE: u16 = 0xffa0;
@@ -1174,7 +1174,7 @@ const fn ledger_status_error(operation: &'static str, status: u16) -> HardwareDe
 const fn ledger_status_message(status: u16) -> &'static str {
     match status {
         0x6511 | 0x6a15 | 0x6d00 | 0x6e00 => "Open the Ethereum app on your Ledger, then retry.",
-        0x6804 | 0x6b0c => "Unlock your Ledger, then retry.",
+        0x6804 | 0x6b0c => "Enter your PIN, then retry.",
         0x6982 => "The request was rejected on your Ledger.",
         0x6985 => {
             "The request was rejected or the Ledger is not ready. Approve on device or retry."
@@ -1291,7 +1291,7 @@ mod tests {
             error,
             HardwareDerivationError::LedgerUnavailable(LEDGER_READY_MESSAGE)
         ));
-        assert!(error.to_string().contains("unlock your Ledger"));
+        assert!(error.to_string().contains("enter your PIN"));
         assert!(error.to_string().contains("open the Ethereum app"));
     }
 
@@ -1336,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_locked_status_points_to_unlock() {
+    fn ledger_locked_status_points_to_pin_entry() {
         let error = ledger_response_data(&answer_with_status(0x6b0c), "get Ethereum address")
             .expect_err("locked status should fail");
 
@@ -1344,7 +1344,7 @@ mod tests {
             error,
             HardwareDerivationError::LedgerStatus { status: 0x6b0c, .. }
         ));
-        assert!(error.to_string().contains("Unlock your Ledger"));
+        assert!(error.to_string().contains("Enter your PIN"));
     }
 
     #[test]

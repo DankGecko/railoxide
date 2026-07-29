@@ -308,7 +308,7 @@ async fn detect_hardware_profile_once(
                     progress_tx,
                     HardwareProfileStep::UnlockDevice,
                     HardwareProfileStepStatus::Pending,
-                    Some("Connect and unlock your Ledger."),
+                    Some("Plug it in and enter your PIN."),
                 );
             }
             let client = LedgerHardwareDerivationClient::connect().await?;
@@ -333,7 +333,7 @@ async fn detect_hardware_profile_once(
                     progress_tx,
                     HardwareProfileStep::UnlockDevice,
                     HardwareProfileStepStatus::Pending,
-                    Some("Connect and unlock your Trezor."),
+                    Some("Plug it in and enter your PIN."),
                 );
             }
             let mut client = TrezorHardwareDerivationClient::connect()?;
@@ -362,7 +362,7 @@ async fn detect_hardware_profile_once(
                     progress_tx,
                     HardwareProfileStep::OpenEthereumApp,
                     HardwareProfileStepStatus::Pending,
-                    Some("Confirm the active Trezor wallet context."),
+                    Some("Confirm the wallet on your Trezor."),
                 );
             }
             let fingerprint = client.profile_fingerprint(path)?;

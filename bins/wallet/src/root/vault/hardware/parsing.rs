@@ -104,13 +104,13 @@ pub(in crate::root) const fn trezor_passphrase_mode_copy(
 ) -> &'static str {
     match mode {
         wallet_ops::vault::TrezorPassphraseMode::NoPassphrase => {
-            "Use the standard Trezor wallet. If your Trezor asks on-device, leave the passphrase blank."
+            "Standard wallet. If your Trezor asks, leave it blank."
         }
         wallet_ops::vault::TrezorPassphraseMode::EnterOnTrezor => {
-            "Use a hidden wallet passphrase entered on your Trezor. The app stores only the live Trezor session id."
+            "Hidden wallet. You type the passphrase on the device — the app never sees it."
         }
         wallet_ops::vault::TrezorPassphraseMode::EnterInApp => {
-            "Enter in app sends the passphrase to this Trezor request once, then clears it immediately. It is never saved."
+            "Hidden wallet. Used once for this connection, then discarded. Never saved."
         }
     }
 }

@@ -304,7 +304,7 @@ impl WalletRoot {
             None
         };
 
-        self.begin_hardware_profile_detection_progress(device_kind);
+        self.begin_hardware_profile_detection_progress();
         self.hardware_profile_unlock
             .clear_trezor_pin_matrix_prompt();
         self.hardware_profile_unlock.in_progress = true;

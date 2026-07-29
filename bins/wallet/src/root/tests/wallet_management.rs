@@ -769,15 +769,15 @@ fn hardware_profile_copy_warns_about_non_secret_labels_and_trezor_modes() {
     assert!(hardware_profile_label_warning().contains("Do not put your hardware passphrase"));
     assert!(
         trezor_passphrase_mode_copy(wallet_ops::vault::TrezorPassphraseMode::NoPassphrase)
-            .contains("standard Trezor wallet")
+            .contains("Standard wallet")
     );
     assert!(
         trezor_passphrase_mode_copy(wallet_ops::vault::TrezorPassphraseMode::EnterOnTrezor)
-            .contains("entered on your Trezor")
+            .contains("never sees it")
     );
     assert!(
         trezor_passphrase_mode_copy(wallet_ops::vault::TrezorPassphraseMode::EnterInApp)
-            .contains("clears it immediately")
+            .contains("Never saved")
     );
     assert_eq!(
         crate::root::vault::effective_trezor_passphrase_mode(
@@ -1191,7 +1191,7 @@ fn hardware_profile_approval_errors_are_user_friendly() {
     );
     assert_eq!(
         locked.as_ref(),
-        "Ledger locked or disconnected before the request was approved. Unlock your Ledger, open the Ethereum app, then try again."
+        "Ledger locked or disconnected before the request was approved. Plug it in and enter your PIN, then open the Ethereum app and try again."
     );
     assert!(!locked.contains("hidapi"));
 
@@ -1204,7 +1204,7 @@ fn hardware_profile_approval_errors_are_user_friendly() {
     );
     assert_eq!(
         before_approval.as_ref(),
-        "Connect and unlock your Ledger, open the Ethereum app, then try again."
+        "Plug it in and enter your PIN, then open the Ethereum app and try again."
     );
     assert!(!before_approval.contains("hidapi"));
 
@@ -1227,10 +1227,7 @@ fn hardware_profile_approval_errors_are_user_friendly() {
         &HardwareDerivationError::TrezorLocked,
         false,
     );
-    assert_eq!(
-        trezor_locked.as_ref(),
-        "Unlock your Trezor, then try again."
-    );
+    assert_eq!(trezor_locked.as_ref(), "Enter your PIN, then try again.");
 }
 
 #[cfg(feature = "hardware")]
@@ -1268,7 +1265,7 @@ fn hardware_profile_detection_retries_generic_ledger_readiness_status() {
     let locked_status = HardwareDerivationError::LedgerStatus {
         operation: "get Ethereum address",
         status: 0x6b0c,
-        message: "Unlock your Ledger, then retry.",
+        message: "Enter your PIN, then retry.",
     };
     assert!(crate::root::vault::hardware_profile_detection_should_retry(
         &locked_status,

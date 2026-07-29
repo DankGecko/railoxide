@@ -663,14 +663,8 @@ impl WalletRoot {
         let can_retry_auto_wait = auto_waits
             && !self.hardware_profile_unlock.in_progress
             && self.hardware_profile_unlock.error.is_some();
-        let readiness_copy = match device_kind {
-            HardwareDeviceKind::Ledger => format!(
-                "Connect and unlock your {device_label}, then open the Ethereum app. We will detect which {device_label} wallet is active and show accounts you can open, create, or recover."
-            ),
-            HardwareDeviceKind::Trezor => format!(
-                "Connect and unlock your {device_label}. We will detect which {device_label} wallet is active and show accounts you can open, create, or recover."
-            ),
-        };
+        let readiness_copy =
+            "We'll detect the active wallet and show accounts you can open, create, or recover.";
 
         if self.hardware_profile_unlock.session.is_some() {
             return div()
@@ -693,13 +687,20 @@ impl WalletRoot {
             .flex_col()
             .gap_3()
             .child(app_muted_text(readiness_copy).whitespace_normal())
+            .when(device_kind == HardwareDeviceKind::Ledger, |this| {
+                this.child(
+                    app_muted_text(
+                        "If you use a Ledger passphrase wallet, activate it on the Ledger first. This app never asks for it.",
+                    )
+                    .whitespace_normal(),
+                )
+            })
             .children(
                 self.hardware_profile_unlock
                     .error
                     .as_ref()
                     .map(|message| hardware_profile_error(message.as_ref()).into_any_element()),
             )
-            .child(hardware_profile_unlock_notice(device_kind))
             .child(render_hardware_profile_stepper(
                 device_kind,
                 &self.hardware_profile_unlock.progress_steps,
@@ -725,6 +726,15 @@ impl WalletRoot {
                         .hardware_profile_unlock
                         .trezor_passphrase_always_on_device
                         .unwrap_or(false);
+                let passphrase_copy = if self
+                    .hardware_profile_unlock
+                    .trezor_passphrase_always_on_device
+                    .unwrap_or(false)
+                {
+                    "Your Trezor always asks for the passphrase on-device, so in-app entry is unavailable."
+                } else {
+                    crate::root::vault::trezor_passphrase_mode_copy(mode)
+                };
                 this.child(
                     div()
                         .w_full()
@@ -736,11 +746,8 @@ impl WalletRoot {
                         .border_1()
                         .border_color(rgb(theme::BORDER))
                         .bg(rgb_with_alpha(theme::SURFACE, 0.72))
-                        .child(app_strong_text("Trezor passphrase mode"))
-                        .child(
-                            app_muted_text(crate::root::vault::trezor_passphrase_mode_copy(mode))
-                                .whitespace_normal(),
-                        )
+                        .child(app_strong_text("Passphrase"))
+                        .child(app_muted_text(passphrase_copy).whitespace_normal())
                         .child(
                             ButtonGroup::new("trezor-passphrase-mode-toggle")
                                 .w_full()
@@ -780,16 +787,6 @@ impl WalletRoot {
                                         root.set_trezor_profile_passphrase_mode(mode, window, cx);
                                     });
                                 }),
-                        )
-                        .when(
-                            self.hardware_profile_unlock
-                                .trezor_passphrase_always_on_device
-                                .unwrap_or(false),
-                            |this| {
-                                this.child(app_muted_text(
-                                    "This Trezor is set to enter passphrases on-device. Leave it blank on the Trezor for the standard wallet.",
-                                ).whitespace_normal())
-                            },
                         )
                         .when(mode == TrezorPassphraseMode::EnterInApp, |this| {
                             this.child(
@@ -1422,44 +1419,6 @@ pub(in crate::root) fn hardware_setup_notice_lines(device_kind: HardwareDeviceKi
 }
 
 #[cfg(feature = "hardware")]
-fn hardware_profile_unlock_notice(device_kind: HardwareDeviceKind) -> gpui::Div {
-    let device_label = hardware_device_label(device_kind);
-    let ready = match device_kind {
-        HardwareDeviceKind::Ledger => "Connect your Ledger, unlock it, and open the Ethereum app.",
-        HardwareDeviceKind::Trezor => "Connect and unlock your Trezor.",
-    };
-    let passphrase = match device_kind {
-        HardwareDeviceKind::Ledger => {
-            "If you use a Ledger passphrase wallet, activate it on the Ledger first. This app never asks for a Ledger passphrase."
-        }
-        HardwareDeviceKind::Trezor => {
-            "For Trezor, choose whether the passphrase is entered on the device or entered once in the app for this request. The passphrase is never saved."
-        }
-    };
-    div()
-        .w_full()
-        .p(px(12.0))
-        .flex()
-        .flex_col()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb_with_alpha(theme::SURFACE, 0.72))
-        .child(app_strong_text(format!(
-            "Before continuing with {device_label}"
-        )))
-        .child(app_muted_text(ready))
-        .child(app_muted_text(passphrase).whitespace_normal())
-        .child(
-            app_muted_text(
-                "After detection, choose a Railgun account to open, create, or recover.",
-            )
-            .whitespace_normal(),
-        )
-}
-
-#[cfg(feature = "hardware")]
 fn render_hardware_profile_stepper(
     device_kind: HardwareDeviceKind,
     steps: &[HardwareProfileStepState],
@@ -1649,11 +1608,14 @@ fn render_hardware_profile_step(
                 .text_color(rgb(color))
                 .line_height(gpui::relative(1.0)),
         )
-        .child(
-            app_muted_text(hardware_profile_step_detail(device_kind, step))
-                .text_color(rgb(color))
-                .line_height(gpui::relative(1.0))
-                .whitespace_normal(),
+        .children(
+            hardware_profile_step_detail(device_kind, step).map(|detail| {
+                app_muted_text(detail)
+                    .text_color(rgb(color))
+                    .line_height(gpui::relative(1.0))
+                    .whitespace_normal()
+                    .into_any_element()
+            }),
         );
 
     super::app_step_row(
@@ -1718,7 +1680,7 @@ fn hardware_profile_step_label(
         HardwareProfileStep::UnlockDevice => format!("Unlock {device_label}"),
         HardwareProfileStep::OpenEthereumApp => match device_kind {
             HardwareDeviceKind::Ledger => "Open Ethereum app".to_owned(),
-            HardwareDeviceKind::Trezor => "Confirm Trezor context".to_owned(),
+            HardwareDeviceKind::Trezor => "Confirm active wallet".to_owned(),
         },
         HardwareProfileStep::ApproveRailgunRequest => "Approve Railgun request".to_owned(),
     }
@@ -1728,62 +1690,32 @@ fn hardware_profile_step_label(
 fn hardware_profile_step_detail(
     device_kind: HardwareDeviceKind,
     step: &HardwareProfileStepState,
-) -> String {
+) -> Option<String> {
+    if matches!(
+        step.status,
+        HardwareProfileStepStatus::NotStarted | HardwareProfileStepStatus::Done
+    ) {
+        return None;
+    }
     if let Some(message) = step.message.as_ref() {
-        return message.to_string();
+        return Some(message.to_string());
+    }
+    if step.status == HardwareProfileStepStatus::Error {
+        return Some("Needs attention.".to_owned());
     }
     let device_label = hardware_device_label(device_kind);
-    match (step.step, step.status, device_kind) {
-        (HardwareProfileStep::UnlockDevice, HardwareProfileStepStatus::NotStarted, _) => {
-            format!("Waiting to connect to your {device_label}.")
+    Some(match (step.step, device_kind) {
+        (HardwareProfileStep::UnlockDevice, _) => "Plug it in and enter your PIN.".to_owned(),
+        (HardwareProfileStep::OpenEthereumApp, HardwareDeviceKind::Ledger) => {
+            "Open the Ethereum app on your Ledger.".to_owned()
         }
-        (HardwareProfileStep::UnlockDevice, HardwareProfileStepStatus::Pending, _) => {
-            format!("Connect and unlock your {device_label}.")
+        (HardwareProfileStep::OpenEthereumApp, HardwareDeviceKind::Trezor) => {
+            "Confirm the wallet on your Trezor.".to_owned()
         }
-        (HardwareProfileStep::UnlockDevice, HardwareProfileStepStatus::Done, _) => {
-            format!("{device_label} is connected and unlocked.")
-        }
-        (
-            HardwareProfileStep::OpenEthereumApp,
-            HardwareProfileStepStatus::NotStarted,
-            HardwareDeviceKind::Ledger,
-        ) => "Next, open the Ethereum app on your Ledger.".to_owned(),
-        (
-            HardwareProfileStep::OpenEthereumApp,
-            HardwareProfileStepStatus::Pending,
-            HardwareDeviceKind::Ledger,
-        ) => "Open the Ethereum app on your Ledger.".to_owned(),
-        (
-            HardwareProfileStep::OpenEthereumApp,
-            HardwareProfileStepStatus::Done,
-            HardwareDeviceKind::Ledger,
-        ) => "Ethereum app is ready.".to_owned(),
-        (
-            HardwareProfileStep::OpenEthereumApp,
-            HardwareProfileStepStatus::NotStarted,
-            HardwareDeviceKind::Trezor,
-        ) => "Next, confirm the active Trezor wallet context.".to_owned(),
-        (
-            HardwareProfileStep::OpenEthereumApp,
-            HardwareProfileStepStatus::Pending,
-            HardwareDeviceKind::Trezor,
-        ) => "Confirm the active Trezor wallet context.".to_owned(),
-        (
-            HardwareProfileStep::OpenEthereumApp,
-            HardwareProfileStepStatus::Done,
-            HardwareDeviceKind::Trezor,
-        ) => "Trezor wallet context is ready.".to_owned(),
-        (HardwareProfileStep::ApproveRailgunRequest, HardwareProfileStepStatus::NotStarted, _) => {
-            "After choosing an account, approve the Railgun request on your device.".to_owned()
-        }
-        (HardwareProfileStep::ApproveRailgunRequest, HardwareProfileStepStatus::Pending, _) => {
+        (HardwareProfileStep::ApproveRailgunRequest, _) => {
             format!("Approve the Railgun request on your {device_label}.")
         }
-        (HardwareProfileStep::ApproveRailgunRequest, HardwareProfileStepStatus::Done, _) => {
-            "Railgun request approved.".to_owned()
-        }
-        (_, HardwareProfileStepStatus::Error, _) => "Needs attention.".to_owned(),
-    }
+    })
 }
 
 #[cfg(feature = "hardware")]
