@@ -437,7 +437,7 @@ impl WalletStartupRoot {
         let cleanup = self
             .wallet_root
             .as_ref()
-            .map(|root| root.update(cx, |root, _cx| root.begin_root_replacement_sync_shutdown()));
+            .map(|root| root.update(cx, WalletRoot::begin_root_replacement_sync_shutdown));
         self.startup_generation = self.startup_generation.saturating_add(1);
         self.maintenance_controller.update(cx, |controller, _cx| {
             controller.clear_active_root();

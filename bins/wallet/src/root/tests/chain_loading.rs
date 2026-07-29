@@ -852,6 +852,113 @@ async fn wallet_sync_lifecycle_cleanup_detects_late_initialized_store() {
     let _ = fs::remove_dir_all(root_dir);
 }
 
+#[tokio::test]
+async fn installed_chain_state_must_be_released_before_sync_manager_replacement() {
+    const PASSWORD: &str = "sync replacement test password";
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    let root_dir = temp_wallet_db_root("wallet-sync-replacement-ownership");
+    let vault_store = DesktopVaultStore::open(root_dir.clone()).expect("open wallet DB");
+    vault_store
+        .create_vault_with_params(PASSWORD, wallet_ops::vault::KdfParams::new(1024, 1, 1))
+        .expect("create vault");
+    let wallet_id = "sync-replacement-wallet";
+    let metadata = vault_store
+        .new_wallet_metadata(
+            PASSWORD,
+            wallet_id,
+            0,
+            wallet_ops::vault::WalletSource::Imported,
+            "Sync replacement wallet",
+        )
+        .expect("wallet metadata");
+    vault_store
+        .import_wallet_mnemonic_with_metadata(
+            PASSWORD, wallet_id, 0, "english", MNEMONIC, &metadata,
+        )
+        .expect("import wallet");
+    let view_session = Arc::new(
+        vault_store
+            .load_view_session(PASSWORD, wallet_id)
+            .expect("load view session"),
+    );
+    let poi_policy = wallet_ops::settings::WalletSettings::default()
+        .poi_read_source()
+        .expect("default POI policy");
+    let db = vault_store.db();
+    let store = Arc::new(
+        WalletSessionStore::from_db(Arc::clone(&db), poi_policy.clone())
+            .expect("acquire initial sync manager ownership"),
+    );
+    let http = wallet_ops::build_wallet_network_context(wallet_ops::WalletNetworkConfig {
+        network_mode: Some(WalletNetworkMode::Direct),
+        proxy: None,
+        data_dir: &root_dir,
+    })
+    .await
+    .expect("build direct HTTP context");
+    let mut lifecycle = WalletSyncLifecycle::new();
+    let registration = lifecycle.prepare_startup(1);
+    assert!(registration.session_store.set(Arc::clone(&store)).is_ok());
+    let session = Arc::new(
+        store
+            .start_view_wallet_session_immediate(
+                wallet_ops::ViewWalletChainSessionRequest {
+                    view_session,
+                    wallet_scope_generation: registration.generation,
+                    chain_id: 1,
+                    effective_chain: None,
+                    sync_start_policy:
+                        wallet_ops::DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+                    init_block_number: Some(0),
+                    sync_to_block: Some(0),
+                    use_indexed_wallet_catch_up: false,
+                    poi_read_source: poi_policy.clone(),
+                    rewind_wallet_cache: false,
+                    progress_tx: None,
+                },
+                Some(reqwest::Url::parse("http://127.0.0.1:1").expect("RPC URL")),
+                &http,
+            )
+            .await
+            .expect("start wallet session"),
+    );
+    let observation = session.observation_rx.borrow().clone();
+    let mut chain_state = ChainUtxoState::Ready {
+        snapshot: observation.snapshot,
+        session,
+        observer_token: registration.observer_token.clone(),
+        sync_tip: WalletSyncTip::default(),
+        poi_refreshing: false,
+        ppoi_workflow_status: observation.ppoi_workflow_status,
+    };
+    assert!(matches!(chain_state, ChainUtxoState::Ready { .. }));
+
+    lifecycle
+        .invalidate()
+        .shutdown()
+        .await
+        .expect("shutdown original lifecycle");
+    let ownership_error = WalletSessionStore::from_db(Arc::clone(&db), poi_policy.clone())
+        .err()
+        .expect("installed chain state retains database ownership");
+    let ownership_error = format!("{ownership_error:#}");
+    assert!(ownership_error.contains("database is already owned by an active runtime operation"));
+
+    chain_state = ChainUtxoState::Idle;
+    assert!(matches!(chain_state, ChainUtxoState::Idle));
+    let replacement = WalletSessionStore::from_db(Arc::clone(&db), poi_policy)
+        .expect("acquire replacement sync manager ownership");
+    replacement.shutdown().await;
+
+    drop(replacement);
+    drop(store);
+    drop(registration);
+    drop(db);
+    drop(vault_store);
+    let _ = fs::remove_dir_all(root_dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
     let mut lifecycle = WalletSyncLifecycle::new();

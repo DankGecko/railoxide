@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -76,6 +76,15 @@ pub(super) struct PoiArtifactCacheRetryAttempts {
 struct PoiArtifactCacheRetryAttempt {
     request_token: Option<u64>,
     attempt_id: Option<PoiArtifactCacheAttemptId>,
+}
+
+enum PoiArtifactCacheRetryTaskEvent {
+    AdmissionFailed(String),
+    Admitted(PoiArtifactCacheAttemptId),
+    Finished {
+        attempt_id: PoiArtifactCacheAttemptId,
+        result: Result<(), String>,
+    },
 }
 
 impl PoiArtifactCacheRetryAttempts {
@@ -803,75 +812,112 @@ impl WalletRoot {
             return;
         };
         let retry_wallet_generation = self.active_wallet_generation;
-        let retry_session = session.clone();
-        cx.spawn(async move |root, cx| {
+        let retry_session = Arc::downgrade(&session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = self.runtime.spawn(async move {
             let retry = match session.retry_poi_artifact_cache().await {
                 Ok(retry) => retry,
                 Err(error) => {
-                    let _ = root.update(cx, |root, cx| {
-                        let attempt_released = root
-                            .poi_artifact_cache_retry_attempts
-                            .cancel_pending(chain_id, request_token);
-                        if attempt_released {
-                            cx.notify();
-                        }
-                        let session_is_current = root
-                            .chain_states
-                            .get(&chain_id)
-                            .and_then(ChainUtxoState::poi_refresh_session)
-                            .is_some_and(|current| Arc::ptr_eq(&current, &retry_session));
-                        if attempt_released
-                            && ppoi_retry_completion_is_current(
-                                root.active_wallet_generation,
-                                retry_wallet_generation,
-                                session_is_current,
-                            )
-                        {
-                            tracing::warn!(
-                                chain_id,
-                                %error,
-                                "failed to admit PPOI corpus refresh retry"
-                            );
-                        }
-                    });
+                    let _ = event_tx.send(PoiArtifactCacheRetryTaskEvent::AdmissionFailed(
+                        format!("{error:#}"),
+                    ));
                     return;
                 }
             };
             let attempt_id = retry.attempt_id();
-            let _ = root.update(cx, |root, cx| {
-                if root
-                    .poi_artifact_cache_retry_attempts
-                    .bind(chain_id, request_token, attempt_id)
-                {
-                    cx.notify();
+            if event_tx
+                .send(PoiArtifactCacheRetryTaskEvent::Admitted(attempt_id))
+                .is_err()
+            {
+                return;
+            }
+            let result = retry
+                .wait()
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+            let _ = event_tx.send(PoiArtifactCacheRetryTaskEvent::Finished { attempt_id, result });
+        });
+        self.wallet_sync_lifecycle.track_wallet_task(task);
+        cx.spawn(async move |root, cx| {
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    PoiArtifactCacheRetryTaskEvent::AdmissionFailed(error) => {
+                        let _ = root.update(cx, |root, cx| {
+                            let attempt_released = root
+                                .poi_artifact_cache_retry_attempts
+                                .cancel_pending(chain_id, request_token);
+                            if attempt_released {
+                                cx.notify();
+                            }
+                            let session_is_current = root
+                                .chain_states
+                                .get(&chain_id)
+                                .and_then(ChainUtxoState::poi_refresh_session)
+                                .is_some_and(|current| {
+                                    Weak::ptr_eq(&Arc::downgrade(&current), &retry_session)
+                                });
+                            if attempt_released
+                                && ppoi_retry_completion_is_current(
+                                    root.active_wallet_generation,
+                                    retry_wallet_generation,
+                                    session_is_current,
+                                )
+                            {
+                                tracing::warn!(
+                                    chain_id,
+                                    %error,
+                                    "failed to admit PPOI corpus refresh retry"
+                                );
+                            }
+                        });
+                    }
+                    PoiArtifactCacheRetryTaskEvent::Admitted(attempt_id) => {
+                        let _ = root.update(cx, |root, cx| {
+                            if root.poi_artifact_cache_retry_attempts.bind(
+                                chain_id,
+                                request_token,
+                                attempt_id,
+                            ) {
+                                cx.notify();
+                            }
+                        });
+                    }
+                    PoiArtifactCacheRetryTaskEvent::Finished { attempt_id, result } => {
+                        let _ = root.update(cx, |root, cx| {
+                            let attempt_released = root
+                                .poi_artifact_cache_retry_attempts
+                                .finish(chain_id, attempt_id);
+                            if attempt_released {
+                                cx.notify();
+                            }
+                            let session_is_current = root
+                                .chain_states
+                                .get(&chain_id)
+                                .and_then(ChainUtxoState::poi_refresh_session)
+                                .is_some_and(|current| {
+                                    Weak::ptr_eq(&Arc::downgrade(&current), &retry_session)
+                                });
+                            if !attempt_released
+                                || !ppoi_retry_completion_is_current(
+                                    root.active_wallet_generation,
+                                    retry_wallet_generation,
+                                    session_is_current,
+                                )
+                            {
+                                return;
+                            }
+                            if let Err(error) = result {
+                                tracing::warn!(
+                                    chain_id,
+                                    %error,
+                                    "failed to retry PPOI corpus refresh"
+                                );
+                            }
+                        });
+                    }
                 }
-            });
-            let result = retry.wait().await;
-            let _ = root.update(cx, |root, cx| {
-                let attempt_released = root
-                    .poi_artifact_cache_retry_attempts
-                    .finish(chain_id, attempt_id);
-                if attempt_released {
-                    cx.notify();
-                }
-                let session_is_current = root
-                    .chain_states
-                    .get(&chain_id)
-                    .and_then(ChainUtxoState::poi_refresh_session)
-                    .is_some_and(|current| Arc::ptr_eq(&current, &retry_session));
-                if !attempt_released
-                    || !ppoi_retry_completion_is_current(
-                        root.active_wallet_generation,
-                        retry_wallet_generation,
-                        session_is_current,
-                    )
-                {
-                    return;
-                }
-                if let Err(error) = result {
-                    tracing::warn!(chain_id, %error, "failed to retry PPOI corpus refresh");
-                }
-            });
+            }
         })
         .detach();
     }

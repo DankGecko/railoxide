@@ -1442,10 +1442,12 @@ impl WalletRoot {
 
     pub(super) fn begin_root_replacement_sync_shutdown(
         &mut self,
+        cx: &mut Context<'_, Self>,
     ) -> WalletSyncLifecycleCleanupWaitGroup {
         self.advance_active_wallet_generation();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.start_wallet_sync_cleanup(cleanup);
+        self.reset_wallet_scoped_state(cx);
         self.wallet_sync_lifecycle_shutdown_started = true;
         self.wallet_sync_cleanup_wait_group()
     }
