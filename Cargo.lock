@@ -15059,7 +15059,7 @@ dependencies = [
 
 [[package]]
 name = "wallet"
-version = "0.1.0-alpha.9"
+version = "0.1.0-alpha.10"
 dependencies = [
  "alloy",
  "broadcaster-monitor",
