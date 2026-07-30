@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::TransactionRequest;
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -33,6 +33,20 @@ pub type HardwareTrezorPinMatrixProvider = ();
 pub enum PublicAssetId {
     Native,
     Erc20(Address),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicTransactionIntent {
+    Transfer {
+        asset: PublicAssetId,
+        amount: U256,
+        recipient: Address,
+    },
+    Raw {
+        to: Option<Address>,
+        value: U256,
+        data: Bytes,
+    },
 }
 
 impl PublicAssetId {
@@ -153,12 +167,34 @@ pub struct PublicSendRequest {
     pub trezor_app_passphrase: Option<Zeroizing<String>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
-    pub asset: PublicAssetId,
-    pub amount: U256,
-    pub recipient: Address,
+    pub intent: PublicTransactionIntent,
+    pub advanced_authorization: Option<PublicAdvancedTransactionAuthorization>,
     pub gas_fee: PublicActionGasFeeSelection,
     pub command_rx: Option<PublicActionCommandReceiver>,
     pub event_tx: Option<PublicActionSessionEventSender>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicAdvancedTransactionAuthorization {
+    pub payload_fingerprint: B256,
+    pub gas_limit: u64,
+}
+
+pub struct PublicAdvancedTransactionEstimateRequest {
+    pub chain_id: u64,
+    pub effective_chain: Option<EffectiveChainConfig>,
+    pub from: Address,
+    pub intent: PublicTransactionIntent,
+    pub gas_fee: PublicActionGasFeeSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicAdvancedTransactionEstimate {
+    pub payload_fingerprint: B256,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub max_gas_cost: U256,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

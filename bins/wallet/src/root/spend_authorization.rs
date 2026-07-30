@@ -2,14 +2,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, AppContext, Axis, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, App, AppContext, Axis, ClickEvent, Context, Entity, Focusable, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Selectable, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
+    collapsible::Collapsible,
     description_list::{DescriptionItem, DescriptionList},
     dialog::DialogButtonProps,
     input::{InputEvent, InputState},
@@ -182,6 +183,9 @@ pub(super) struct SpendAuthorizationSummary {
     title: Arc<str>,
     detail: Arc<str>,
     rows: Vec<SpendAuthorizationSummaryRow>,
+    warnings: Vec<Arc<str>>,
+    payload: Option<SpendAuthorizationPayload>,
+    requires_explicit_review: bool,
 }
 
 impl SpendAuthorizationSummary {
@@ -194,7 +198,32 @@ impl SpendAuthorizationSummary {
             title: title.into(),
             detail: detail.into(),
             rows,
+            warnings: Vec::new(),
+            payload: None,
+            requires_explicit_review: false,
         }
+    }
+
+    pub(super) fn with_warnings(mut self, warnings: Vec<Arc<str>>) -> Self {
+        self.warnings = warnings;
+        self
+    }
+
+    pub(super) fn with_payload(
+        mut self,
+        label: impl Into<Arc<str>>,
+        value: impl Into<Arc<str>>,
+    ) -> Self {
+        self.payload = Some(SpendAuthorizationPayload {
+            label: label.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    pub(super) const fn requiring_explicit_review(mut self) -> Self {
+        self.requires_explicit_review = true;
+        self
     }
 
     #[cfg(test)]
@@ -213,6 +242,46 @@ impl SpendAuthorizationSummary {
             .iter()
             .map(|row| (row.label.to_string(), row.value.to_string()))
             .collect()
+    }
+}
+
+pub(in crate::root) const fn spend_authorization_can_use_cached_password(
+    summary: &SpendAuthorizationSummary,
+) -> bool {
+    !summary.requires_explicit_review
+}
+
+#[derive(Clone)]
+struct SpendAuthorizationPayload {
+    label: Arc<str>,
+    value: Arc<str>,
+}
+
+struct SpendAuthorizationPayloadDisclosure {
+    payload: SpendAuthorizationPayload,
+    open: bool,
+}
+
+impl SpendAuthorizationPayloadDisclosure {
+    const fn new(payload: SpendAuthorizationPayload) -> Self {
+        Self {
+            payload,
+            open: false,
+        }
+    }
+
+    fn toggle(&mut self, cx: &mut Context<'_, Self>) {
+        self.open = !self.open;
+        cx.notify();
+    }
+}
+
+impl gpui::Render for SpendAuthorizationPayloadDisclosure {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let disclosure = cx.entity();
+        render_spend_authorization_payload(&self.payload, self.open, move |_, _, cx| {
+            disclosure.update(cx, Self::toggle);
+        })
     }
 }
 
@@ -244,6 +313,7 @@ struct SpendAuthorizationDialogContent {
     summary: SpendAuthorizationSummary,
     password_input: Entity<InputState>,
     lifetime: SpendAuthorizationLifetime,
+    payload_open: bool,
     error: Option<Arc<str>>,
 }
 
@@ -255,6 +325,7 @@ struct HardwareSpendAuthorizationDialogContent {
     device_label: &'static str,
     pending: bool,
     cancelled: bool,
+    payload_open: bool,
     error: Option<Arc<str>>,
 }
 
@@ -273,12 +344,18 @@ impl HardwareSpendAuthorizationDialogContent {
             device_label,
             pending: false,
             cancelled: false,
+            payload_open: false,
             error: None,
         }
     }
 
     fn cancel(&mut self, cx: &mut Context<'_, Self>) {
         self.cancelled = true;
+        cx.notify();
+    }
+
+    fn toggle_payload(&mut self, cx: &mut Context<'_, Self>) {
+        self.payload_open = !self.payload_open;
         cx.notify();
     }
 
@@ -435,6 +512,7 @@ impl SpendAuthorizationDialogContent {
             summary,
             password_input,
             lifetime: initial_lifetime,
+            payload_open: false,
             error: None,
         }
     }
@@ -469,11 +547,22 @@ impl SpendAuthorizationDialogContent {
             cx.notify();
         }
     }
+
+    fn toggle_payload(&mut self, cx: &mut Context<'_, Self>) {
+        self.payload_open = !self.payload_open;
+        cx.notify();
+    }
 }
 
 impl gpui::Render for SpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
+        let payload_dialog = dialog.clone();
+        let payload = self.summary.payload.as_ref().map(|payload| {
+            render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
+                payload_dialog.update(cx, Self::toggle_payload);
+            })
+        });
         div()
             .w_full()
             .flex()
@@ -482,6 +571,20 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             .child(app_strong_text(self.summary.title.to_string()))
             .child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             .child(render_spend_authorization_summary(&self.summary))
+            .children(
+                self.summary
+                    .warnings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, warning)| {
+                        Alert::warning(
+                            SharedString::from(format!("wallet-spend-auth-warning-{index}")),
+                            warning.to_string(),
+                        )
+                        .small()
+                    }),
+            )
+            .children(payload)
             .child(app_input(&self.password_input))
             .child(app_muted_text("Remember authorization"))
             .child(render_spend_authorization_lifetime_buttons(
@@ -532,6 +635,12 @@ impl gpui::Render for SpendAuthorizationDialogContent {
 impl gpui::Render for HardwareSpendAuthorizationDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dialog = cx.entity();
+        let payload_dialog = dialog.clone();
+        let payload = self.summary.payload.as_ref().map(|payload| {
+            render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
+                payload_dialog.update(cx, Self::toggle_payload);
+            })
+        });
         let pending = self.pending;
         let submit_label = if pending {
             "Waiting for device..."
@@ -568,6 +677,14 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .child(app_strong_text(self.summary.title.to_string()))
             .child(app_muted_text(hardware_spend_authorization_detail()).whitespace_normal())
             .child(render_spend_authorization_summary(&self.summary))
+            .children(self.summary.warnings.iter().enumerate().map(|(index, warning)| {
+                Alert::warning(
+                    SharedString::from(format!("wallet-hardware-spend-auth-warning-{index}")),
+                    warning.to_string(),
+                )
+                .small()
+            }))
+            .children(payload)
             .child(Alert::warning(
                 "wallet-hardware-spend-custody-warning",
                 "This is hardware-derived software custody, not true hardware signing. The device derives a temporary seed, and the desktop app signs this Railgun spend in memory.",
@@ -653,6 +770,63 @@ fn render_spend_authorization_summary(summary: &SpendAuthorizationSummary) -> De
         .bordered(false)
         .columns(1)
         .children(summary.rows.iter().map(spend_authorization_summary_item))
+}
+
+fn render_spend_authorization_payload(
+    payload: &SpendAuthorizationPayload,
+    open: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Collapsible {
+    let label = payload.label.to_string();
+    let value = payload.value.to_string();
+    Collapsible::new()
+        .open(open)
+        .w_full()
+        .child(
+            div()
+                .id("wallet-spend-auth-payload-toggle")
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .cursor_pointer()
+                .on_click(on_toggle)
+                .child(app_strong_text(if open {
+                    format!("Hide full {label}")
+                } else {
+                    format!("Show full {label}")
+                }))
+                .child(
+                    gpui_component::Icon::new(if open {
+                        gpui_component::IconName::ChevronUp
+                    } else {
+                        gpui_component::IconName::ChevronDown
+                    })
+                    .xsmall(),
+                ),
+        )
+        .content(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_start()
+                .gap_2()
+                .pt(px(6.0))
+                .child(
+                    app_text(value.clone())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .font_family(APP_MONO_FONT_FAMILY)
+                        .text_size(px(12.0))
+                        .whitespace_normal(),
+                )
+                .child(clipboard_with_toast(
+                    "wallet-spend-auth-payload-copy",
+                    value,
+                )),
+        )
 }
 
 fn spend_authorization_summary_item(row: &SpendAuthorizationSummaryRow) -> DescriptionItem {
@@ -806,7 +980,9 @@ impl WalletRoot {
             );
             return;
         }
-        if let Some(password) = self.valid_spend_authorization_password(cx) {
+        if spend_authorization_can_use_cached_password(&summary)
+            && let Some(password) = self.valid_spend_authorization_password(cx)
+        {
             self.continue_authorized_spend(
                 intent,
                 DesktopPrivateSpendAuthorization::VaultPassword(password),
@@ -871,6 +1047,10 @@ impl WalletRoot {
         let dialog_max_height = dialog_max_height(window);
         let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
+        let payload_disclosure = summary
+            .payload
+            .clone()
+            .map(|payload| cx.new(|_cx| SpendAuthorizationPayloadDisclosure::new(payload)));
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let submit_root = root.clone();
@@ -917,6 +1097,16 @@ impl WalletRoot {
                         .child(app_strong_text(summary.title.to_string()))
                         .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
                         .child(render_spend_authorization_summary(&summary))
+                        .children(summary.warnings.iter().enumerate().map(|(index, warning)| {
+                            Alert::warning(
+                                SharedString::from(format!(
+                                    "wallet-hardware-public-action-warning-{index}"
+                                )),
+                                warning.to_string(),
+                            )
+                            .small()
+                        }))
+                        .children(payload_disclosure.clone())
                         .when(show_trezor_app_passphrase, |this| {
                             #[cfg(feature = "hardware")]
                             {

@@ -8,6 +8,7 @@ pub(in crate::root) fn render_public_action_stepper(
     requires_device_approval: bool,
     command_available: bool,
     current_gas_fee: Option<(u128, u128)>,
+    fees_authorized: bool,
     action_error: Option<&str>,
     generation: u64,
 ) -> gpui::Div {
@@ -23,6 +24,7 @@ pub(in crate::root) fn render_public_action_stepper(
             requires_device_approval,
             command_available,
             current_gas_fee,
+            fees_authorized,
             action_error,
             generation,
         ));
@@ -39,6 +41,7 @@ pub(in crate::root) fn render_public_action_step(
     requires_device_approval: bool,
     command_available: bool,
     current_gas_fee: Option<(u128, u128)>,
+    fees_authorized: bool,
     action_error: Option<&str>,
     generation: u64,
 ) -> gpui::Div {
@@ -86,6 +89,7 @@ pub(in crate::root) fn render_public_action_step(
         step,
         command_available,
         current_gas_fee,
+        fees_authorized,
         action_error,
         generation,
     ) {
@@ -107,6 +111,7 @@ pub(in crate::root) fn render_public_action_step_action(
     step: &PublicActionStepState,
     command_available: bool,
     current_gas_fee: Option<(u128, u128)>,
+    fees_authorized: bool,
     action_error: Option<&str>,
     generation: u64,
 ) -> Option<gpui::AnyElement> {
@@ -120,6 +125,9 @@ pub(in crate::root) fn render_public_action_step_action(
         }
         _ => return None,
     };
+    if fees_authorized && retry_kind != PublicActionGasRetryKind::RetryStep {
+        return None;
+    }
     let label = match retry_kind {
         PublicActionGasRetryKind::RetryStep => "Retry step",
         PublicActionGasRetryKind::RetryEstimate => "Retry with custom gas",

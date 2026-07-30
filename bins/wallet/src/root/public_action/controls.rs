@@ -63,6 +63,16 @@ pub(in crate::root) fn public_action_segment_button(
     if selected { button.primary() } else { button }
 }
 
+pub(in crate::root) fn public_send_kind_segment_button(
+    id: SharedString,
+    label: &'static str,
+    selected: bool,
+) -> Button {
+    Button::new(id)
+        .selected(selected)
+        .child(div().text_size(APP_TEXT_SIZE).child(label))
+}
+
 pub(in crate::root) fn public_action_title_row(
     label: String,
     icon_path: Option<WalletIconSource>,
@@ -123,6 +133,35 @@ pub(in crate::root) fn render_public_action_fee_estimate(
         })
 }
 
+pub(in crate::root) fn render_public_advanced_transaction_estimate(
+    chain_id: u64,
+    estimate: &PublicAdvancedTransactionEstimate,
+    usd_value: Option<String>,
+) -> AnyElement {
+    let token_value = format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(app_strong_text("Estimated fees"))
+        .child(public_action_fee_row(
+            "Gas limit",
+            format_gas_limit(estimate.gas_limit),
+        ))
+        .child(public_action_fee_row(
+            "Maximum gas cost",
+            public_action_fee_value_label(&token_value, usd_value),
+        ))
+        .into_any_element()
+}
+
 fn public_action_fee_row(label: impl Into<SharedString>, value: String) -> gpui::Div {
     div()
         .flex()
@@ -141,7 +180,7 @@ fn public_action_fee_row(label: impl Into<SharedString>, value: String) -> gpui:
 }
 
 pub(in crate::root) fn public_action_fee_value_label(
-    token_value: String,
+    token_value: &str,
     usd_value: Option<String>,
 ) -> String {
     format!(
@@ -289,12 +328,19 @@ pub(in crate::root) const fn public_action_mode_verb(mode: PublicActionMode) -> 
     }
 }
 
-pub(in crate::root) fn public_action_max_label(entry: &PublicBalanceEntry) -> Option<String> {
+pub(in crate::root) fn public_action_max_label(
+    entry: &PublicBalanceEntry,
+    native_gas_reserve: Option<U256>,
+) -> Option<String> {
     if entry.asset.id == PublicAssetId::Native {
-        return entry
-            .amount
-            .amount()
-            .map(|_| format!("{} after est. gas", entry.asset.symbol));
+        let max_amount =
+            public_action_max_amount_after_reserve(entry.amount.amount()?, native_gas_reserve?)?;
+        let max_amount = PublicBalanceAmount::Available(max_amount);
+        return Some(format!(
+            "{} {} after est. gas",
+            public_balance_amount_label(&max_amount, entry.asset.decimals),
+            entry.asset.symbol,
+        ));
     }
     entry.amount.amount().map(|_| {
         format!(

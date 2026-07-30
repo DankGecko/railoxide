@@ -1209,6 +1209,9 @@ pub(crate) fn tx_receipt_output(
         status,
         block_number,
         gas_used,
+        contract_address: receipt
+            .contract_address
+            .map(|address| address.to_checksum(None)),
     }
 }
 

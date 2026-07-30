@@ -222,7 +222,10 @@ pub(in crate::root) fn public_action_error_retry_kind(
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if message.contains("estimate gas") || message.contains("insufficient native gas") {
+    if message.contains("estimate gas")
+        || message.contains("insufficient native gas")
+        || message.contains("insufficient native balance")
+    {
         PublicActionGasRetryKind::RetryEstimate
     } else {
         PublicActionGasRetryKind::RetryStep

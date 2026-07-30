@@ -1,11 +1,15 @@
-use alloy::primitives::U256;
+use alloy::network::TransactionBuilder as _;
+use alloy::primitives::{B256, U256, keccak256};
+use alloy::providers::Provider;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 
+use super::actions::{public_send_transaction_request, validate_public_transaction_intent};
 use super::runtime::public_chain_runtime_config;
 use super::types::{
     PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicActionKind,
-    PublicActionProgressStep, PublicAssetId,
+    PublicActionProgressStep, PublicAdvancedTransactionEstimate,
+    PublicAdvancedTransactionEstimateRequest, PublicAssetId, PublicTransactionIntent,
 };
 use crate::settings::EffectiveChainConfig;
 use crate::{
@@ -135,6 +139,115 @@ pub async fn quote_public_action_gas_fee(
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
     public_action_gas_fee_quote_from_rpc_pool(&query_rpc_pool, http.network_mode(), chain_id).await
+}
+
+pub async fn estimate_public_advanced_transaction(
+    request: PublicAdvancedTransactionEstimateRequest,
+    http: &HttpContext,
+) -> Result<PublicAdvancedTransactionEstimate> {
+    validate_public_transaction_intent(&request.intent)?;
+    if !matches!(request.intent, PublicTransactionIntent::Raw { .. }) {
+        return Err(eyre!(
+            "advanced gas estimation requires a raw transaction intent"
+        ));
+    }
+    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let quote = public_action_gas_fee_quote_from_rpc_pool(
+        &query_rpc_pool,
+        http.network_mode(),
+        request.chain_id,
+    )
+    .await
+    .wrap_err("fetch advanced public transaction gas price")?;
+    let resolved = resolve_self_broadcast_gas_fee(request.gas_fee, quote)?;
+    let tx_req = public_send_transaction_request(request.chain_id, request.from, &request.intent)?
+        .with_max_fee_per_gas(resolved.max_fee_per_gas)
+        .with_max_priority_fee_per_gas(resolved.max_priority_fee_per_gas);
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match provider_handle.provider.estimate_gas(tx_req.clone()).await {
+            Ok(estimated_gas) => {
+                let gas_limit =
+                    buffered_advanced_gas_limit(estimated_gas, chain.gas.gas_limit_buffer);
+                return Ok(PublicAdvancedTransactionEstimate {
+                    payload_fingerprint: public_advanced_transaction_payload_fingerprint(
+                        request.chain_id,
+                        request.from,
+                        &request.intent,
+                        resolved.max_fee_per_gas,
+                        resolved.max_priority_fee_per_gas,
+                    ),
+                    gas_limit,
+                    max_fee_per_gas: resolved.max_fee_per_gas,
+                    max_priority_fee_per_gas: resolved.max_priority_fee_per_gas,
+                    max_gas_cost: U256::from(gas_limit) * U256::from(resolved.max_fee_per_gas),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "advanced public transaction gas estimate failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        Err(eyre!(error)).wrap_err("all advanced public transaction query RPC attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+pub(super) const fn buffered_advanced_gas_limit(estimated_gas: u64, buffer: u64) -> u64 {
+    estimated_gas.saturating_add(buffer)
+}
+
+pub(super) fn public_advanced_transaction_payload_fingerprint(
+    chain_id: u64,
+    from: alloy::primitives::Address,
+    intent: &PublicTransactionIntent,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> B256 {
+    let mut encoded = b"railoxide:public-advanced-transaction:v1".to_vec();
+    encoded.extend_from_slice(&chain_id.to_be_bytes());
+    encoded.extend_from_slice(from.as_slice());
+    match intent {
+        PublicTransactionIntent::Transfer {
+            asset,
+            amount,
+            recipient,
+        } => {
+            encoded.push(0);
+            match asset {
+                PublicAssetId::Native => encoded.push(0),
+                PublicAssetId::Erc20(token) => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(token.as_slice());
+                }
+            }
+            encoded.extend_from_slice(&amount.to_be_bytes::<32>());
+            encoded.extend_from_slice(recipient.as_slice());
+        }
+        PublicTransactionIntent::Raw { to, value, data } => {
+            encoded.push(1);
+            match to {
+                Some(to) => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(to.as_slice());
+                }
+                None => encoded.push(0),
+            }
+            encoded.extend_from_slice(&value.to_be_bytes::<32>());
+            encoded.extend_from_slice(&(data.len() as u64).to_be_bytes());
+            encoded.extend_from_slice(data);
+        }
+    }
+    encoded.extend_from_slice(&max_fee_per_gas.to_be_bytes());
+    encoded.extend_from_slice(&max_priority_fee_per_gas.to_be_bytes());
+    keccak256(encoded)
 }
 
 pub async fn estimate_public_native_action_gas_reserve(

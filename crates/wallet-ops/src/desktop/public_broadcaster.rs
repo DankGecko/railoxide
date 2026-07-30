@@ -580,6 +580,8 @@ pub struct TxReceiptOutput {
     pub status: bool,
     pub block_number: u64,
     pub gas_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

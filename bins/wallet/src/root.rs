@@ -104,7 +104,7 @@ use private_action::{
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
 use public_account::{HardwarePublicAccountDerivationStatus, PublicAccountFormState};
-use public_action::PublicActionMode;
+use public_action::{PublicActionMode, PublicSendKind};
 use public_balances::{
     public_account_visible_balances_for_chain, public_asset_decimals, public_asset_label,
     public_balance_amount_label,
@@ -215,8 +215,10 @@ use public_account::{
 };
 #[cfg(test)]
 use public_action::{
-    ProgressFooterAction, PublicActionStepState, PublicActionStepStatus,
-    mark_public_action_active_step_stopped, progress_footer_action, public_action_accepts_update,
+    AdvancedPublicSendField, ProgressFooterAction, PublicActionStepState, PublicActionStepStatus,
+    advanced_public_send_review_metadata, advanced_public_send_warnings,
+    format_advanced_data_length, format_gas_limit, mark_public_action_active_step_stopped,
+    parse_advanced_public_send_intent, progress_footer_action, public_action_accepts_update,
     public_action_closed_active_step, public_action_error_copy_value, public_action_error_details,
     public_action_error_summary, public_action_max_amount_after_reserve,
     public_action_progress_footer_action, public_action_progress_steps, public_action_step_color,
@@ -261,7 +263,8 @@ use settings::{
 use sidebar::sidebar_primary_activity_order;
 #[cfg(test)]
 use spend_authorization::{
-    is_spend_authorization_failure_error, remembered_spend_authorization_valid_for_test,
+    SpendAuthorizationSummary, is_spend_authorization_failure_error,
+    remembered_spend_authorization_valid_for_test, spend_authorization_can_use_cached_password,
 };
 #[cfg(test)]
 use startup::{load_validated_startup_settings, resolve_initial_chain_id};
@@ -1008,6 +1011,13 @@ impl WalletRoot {
             search_input: public_account_search_input.clone(),
             send_recipient_input: new_text_input(window, cx, "0x recipient"),
             send_amount_input: new_text_input(window, cx, "amount"),
+            advanced_send_to_input: new_text_input(window, cx, "0x…"),
+            advanced_send_value_input: new_text_input(window, cx, "0"),
+            advanced_send_data_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .auto_grow(4, 12)
+                    .placeholder("0x…")
+            }),
             shield_amount_input: new_text_input(window, cx, "amount"),
             send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
@@ -1017,6 +1027,14 @@ impl WalletRoot {
             search_query: Arc::from(""),
             selected_asset: None,
             action_mode: PublicActionMode::Shield,
+            public_send_kind: PublicSendKind::Transfer,
+            advanced_send_estimate: None,
+            advanced_send_estimate_invalidated: false,
+            advanced_send_estimate_pending: false,
+            advanced_send_estimate_generation: 0,
+            advanced_send_to_error: None,
+            advanced_send_value_error: None,
+            advanced_send_data_error: None,
             action_generation: 0,
             action_progress: Vec::new(),
             expanded_action_error_steps: BTreeSet::new(),
@@ -1030,7 +1048,9 @@ impl WalletRoot {
             action_command_tx: None,
             action_attempts: Vec::new(),
             action_current_gas_fee: None,
+            action_fees_authorized: false,
             action_action_error: None,
+            action_contract_address: None,
             next_derived_index: None,
             next_account_label_number: 1,
             error: None,
@@ -1306,6 +1326,21 @@ impl WalletRoot {
         ] {
             cx.subscribe(&input, |_this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+        for input in [
+            root.public_form.advanced_send_to_input.clone(),
+            root.public_form.advanced_send_value_input.clone(),
+            root.public_form.advanced_send_data_input.clone(),
+            root.public_form.send_gas_fee.max_fee_input.clone(),
+            root.public_form.send_gas_fee.max_priority_fee_input.clone(),
+        ] {
+            cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.invalidate_advanced_public_send_estimate();
                     cx.notify();
                 }
             })

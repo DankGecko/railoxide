@@ -5,6 +5,7 @@ use alloy::sol_types::SolCall;
 use eyre::{Result, WrapErr, eyre};
 
 use super::contracts::{PublicErc20, PublicRelayAdapt, RelayAdaptCall};
+use super::gas::public_advanced_transaction_payload_fingerprint;
 use super::runtime::{public_chain_runtime_config, public_shield_token};
 use super::signer::vaulted_public_signer;
 use super::submission::{
@@ -14,7 +15,7 @@ use super::submission::{
 use super::types::{
     PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicActionSessionEvent, PublicAssetId, PublicSendRequest, PublicSendResult,
-    PublicShieldRequest,
+    PublicShieldRequest, PublicTransactionIntent,
 };
 use crate::{HttpContext, ShieldSendOutput, query_rpc_pool_with_http_client, report_chain_string};
 
@@ -30,9 +31,7 @@ pub async fn submit_public_send_with_progress(
     http: &HttpContext,
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<PublicSendResult> {
-    if request.amount.is_zero() {
-        return Err(eyre!("amount is required"));
-    }
+    validate_public_transaction_intent(&request.intent)?;
     let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
     let signer = vaulted_public_signer(
         &request.vault_store,
@@ -43,14 +42,15 @@ pub async fn submit_public_send_with_progress(
         request.trezor_pin_matrix_provider,
     )?;
     let from_address = signer.address();
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let tx_req = public_send_transaction_request(
+    let authorized_gas_limit = public_send_authorized_gas_limit(
         request.chain_id,
         from_address,
-        request.asset,
-        request.amount,
-        request.recipient,
-    );
+        &request.intent,
+        request.advanced_authorization,
+        request.gas_fee,
+    )?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let tx_req = public_send_transaction_request(request.chain_id, from_address, &request.intent)?;
     let mut command_rx = request.command_rx;
     let tx = submit_public_action_step_session(
         PublicActionProgressStep::Send,
@@ -62,6 +62,7 @@ pub async fn submit_public_send_with_progress(
         request.chain_id,
         from_address,
         &chain.gas,
+        authorized_gas_limit,
         None,
         request.gas_fee,
         &mut command_rx,
@@ -74,6 +75,56 @@ pub async fn submit_public_send_with_progress(
         return Err(eyre!("public send transaction reverted ({})", tx.tx_hash));
     }
     Ok(PublicSendResult { tx })
+}
+
+pub(super) fn public_send_authorized_gas_limit(
+    chain_id: u64,
+    from: Address,
+    intent: &PublicTransactionIntent,
+    authorization: Option<super::types::PublicAdvancedTransactionAuthorization>,
+    gas_fee: super::types::PublicActionGasFeeSelection,
+) -> Result<Option<u64>> {
+    match intent {
+        PublicTransactionIntent::Transfer { .. } => {
+            if authorization.is_some() {
+                return Err(eyre!(
+                    "advanced transaction authorization cannot be used for a transfer"
+                ));
+            }
+            Ok(None)
+        }
+        PublicTransactionIntent::Raw { .. } => {
+            let authorization =
+                authorization.ok_or_else(|| eyre!("advanced transaction estimate is required"))?;
+            if authorization.gas_limit == 0 {
+                return Err(eyre!(
+                    "authorized advanced gas limit must be greater than zero"
+                ));
+            }
+            let super::types::PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            } = gas_fee
+            else {
+                return Err(eyre!(
+                    "advanced transaction submission requires the estimated gas fee values"
+                ));
+            };
+            let fingerprint = public_advanced_transaction_payload_fingerprint(
+                chain_id,
+                from,
+                intent,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            );
+            if fingerprint != authorization.payload_fingerprint {
+                return Err(eyre!(
+                    "advanced transaction payload changed after gas estimation"
+                ));
+            }
+            Ok(Some(authorization.gas_limit))
+        }
+    }
 }
 
 pub async fn submit_public_shield(
@@ -191,6 +242,7 @@ pub async fn submit_public_shield_with_progress(
             request.chain_id,
             from_address,
             &chain.gas,
+            None,
             nonce,
             gas_fee,
             &mut command_rx,
@@ -236,6 +288,7 @@ pub async fn submit_public_shield_with_progress(
         request.chain_id,
         from_address,
         &chain.gas,
+        None,
         nonce,
         gas_fee,
         &mut command_rx,
@@ -297,22 +350,59 @@ pub(super) fn public_native_shield_transaction_request(
 pub(super) fn public_send_transaction_request(
     chain_id: u64,
     from: Address,
-    asset: PublicAssetId,
-    amount: U256,
-    recipient: Address,
-) -> TransactionRequest {
+    intent: &PublicTransactionIntent,
+) -> Result<TransactionRequest> {
+    validate_public_transaction_intent(intent)?;
     let mut tx_req = TransactionRequest::default()
         .with_chain_id(chain_id)
         .with_from(from);
-    match asset {
-        PublicAssetId::Native => {
-            tx_req = tx_req.with_to(recipient).with_value(amount);
+    match intent {
+        PublicTransactionIntent::Transfer {
+            asset: PublicAssetId::Native,
+            amount,
+            recipient,
+        } => {
+            tx_req = tx_req.with_to(*recipient).with_value(*amount);
         }
-        PublicAssetId::Erc20(token) => {
-            tx_req = tx_req
-                .with_to(token)
-                .with_input(PublicErc20::transferCall { recipient, amount }.abi_encode());
+        PublicTransactionIntent::Transfer {
+            asset: PublicAssetId::Erc20(token),
+            amount,
+            recipient,
+        } => {
+            tx_req = tx_req.with_to(*token).with_input(
+                PublicErc20::transferCall {
+                    recipient: *recipient,
+                    amount: *amount,
+                }
+                .abi_encode(),
+            );
+        }
+        PublicTransactionIntent::Raw { to, value, data } => {
+            match to {
+                Some(to) => tx_req = tx_req.with_to(*to),
+                None => tx_req = tx_req.create(),
+            }
+            tx_req = tx_req.with_value(*value).with_input(data.clone());
         }
     }
-    tx_req
+    Ok(tx_req)
+}
+
+pub(super) fn validate_public_transaction_intent(intent: &PublicTransactionIntent) -> Result<()> {
+    match intent {
+        PublicTransactionIntent::Transfer { amount, .. } if amount.is_zero() => {
+            Err(eyre!("amount is required"))
+        }
+        PublicTransactionIntent::Raw { to: None, data, .. } if data.is_empty() => {
+            Err(eyre!("contract creation requires non-empty init code"))
+        }
+        PublicTransactionIntent::Raw {
+            to: Some(_),
+            value,
+            data,
+        } if value.is_zero() && data.is_empty() => {
+            Err(eyre!("contract call must include native value or data"))
+        }
+        _ => Ok(()),
+    }
 }

@@ -183,6 +183,7 @@ pub async fn submit_walletconnect_send_transaction(
         &chain.gas,
         None,
         None,
+        None,
         PublicActionPreflightMode::PreserveRequestFields,
     )
     .await

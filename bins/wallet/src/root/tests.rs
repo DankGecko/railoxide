@@ -33,6 +33,7 @@ mod key_export;
 mod private_assets;
 mod private_display;
 mod progress;
+mod public_actions;
 mod settings;
 mod utxo_rows;
 mod waku_lifecycle;

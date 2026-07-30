@@ -15,8 +15,124 @@ pub(in crate::root) struct PublicSendDraft {
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) amount: U256,
     pub(in crate::root) recipient: Address,
+    pub(in crate::root) intent: PublicTransactionIntent,
+    pub(in crate::root) advanced_estimate: Option<PublicAdvancedTransactionEstimate>,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
     pub(in crate::root) fee_display: PublicActionFeeDisplay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum AdvancedPublicSendField {
+    Destination,
+    Value,
+    Data,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum PublicSendKind {
+    Transfer,
+    ContractCall,
+    Deploy,
+}
+
+impl PublicSendKind {
+    pub(in crate::root) const fn is_advanced(self) -> bool {
+        !matches!(self, Self::Transfer)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct AdvancedPublicSendValidationError {
+    pub(in crate::root) field: AdvancedPublicSendField,
+    pub(in crate::root) message: String,
+}
+
+pub(in crate::root) fn parse_advanced_public_send_intent(
+    kind: PublicSendKind,
+    destination: &str,
+    value: &str,
+    data: &str,
+    native_decimals: Option<u8>,
+) -> Result<PublicTransactionIntent, AdvancedPublicSendValidationError> {
+    let to = match kind {
+        PublicSendKind::Transfer => {
+            return Err(AdvancedPublicSendValidationError {
+                field: AdvancedPublicSendField::Destination,
+                message: "Choose Contract call or Deploy.".to_string(),
+            });
+        }
+        PublicSendKind::ContractCall => {
+            let destination = destination.trim();
+            if destination.is_empty() {
+                return Err(AdvancedPublicSendValidationError {
+                    field: AdvancedPublicSendField::Destination,
+                    message: "Enter a destination address.".to_string(),
+                });
+            }
+            Some(
+                parse_address(destination).ok_or_else(|| AdvancedPublicSendValidationError {
+                    field: AdvancedPublicSendField::Destination,
+                    message: "Enter a valid EVM destination address.".to_string(),
+                })?,
+            )
+        }
+        PublicSendKind::Deploy => None,
+    };
+    let value = if value.trim().is_empty() {
+        U256::ZERO
+    } else {
+        parse_send_amount(value, native_decimals).map_err(|error| {
+            AdvancedPublicSendValidationError {
+                field: AdvancedPublicSendField::Value,
+                message: error.to_string(),
+            }
+        })?
+    };
+    let data = data.trim();
+    let data = data
+        .strip_prefix("0x")
+        .or_else(|| data.strip_prefix("0X"))
+        .unwrap_or(data);
+    let data_label = if kind == PublicSendKind::Deploy {
+        "Init code"
+    } else {
+        "Calldata"
+    };
+    if !data.len().is_multiple_of(2) {
+        return Err(AdvancedPublicSendValidationError {
+            field: AdvancedPublicSendField::Data,
+            message: format!("{data_label} must contain an even number of hexadecimal characters."),
+        });
+    }
+    let data = alloy::hex::decode(data).map(Bytes::from).map_err(|_| {
+        AdvancedPublicSendValidationError {
+            field: AdvancedPublicSendField::Data,
+            message: format!("{data_label} must contain only hexadecimal characters."),
+        }
+    })?;
+    if kind == PublicSendKind::Deploy && data.is_empty() {
+        return Err(AdvancedPublicSendValidationError {
+            field: AdvancedPublicSendField::Data,
+            message: "Enter the contract init code.".to_string(),
+        });
+    }
+    if kind == PublicSendKind::ContractCall && value.is_zero() && data.is_empty() {
+        return Err(AdvancedPublicSendValidationError {
+            field: AdvancedPublicSendField::Data,
+            message: "Enter calldata or a native value.".to_string(),
+        });
+    }
+    Ok(PublicTransactionIntent::Raw { to, value, data })
+}
+
+pub(in crate::root) const fn advanced_public_send_estimate_required_message(
+    invalidated: bool,
+) -> &'static str {
+    if invalidated {
+        "The request changed. Estimate gas again before authorizing."
+    } else {
+        "Estimate gas before you can authorize this transaction."
+    }
 }
 
 pub(in crate::root) struct PublicShieldDraft {
@@ -44,6 +160,59 @@ pub(in crate::root) struct PublicActionFeeDisplay {
 pub(in crate::root) fn public_send_authorization_summary(
     draft: &PublicSendDraft,
 ) -> SpendAuthorizationSummary {
+    if let Some(metadata) = advanced_public_send_review_metadata(&draft.intent) {
+        let payload_label = if metadata.action_type == "Contract creation" {
+            "init code"
+        } else {
+            "calldata"
+        };
+        let full_data = metadata.full_data.clone();
+        let estimate = draft
+            .advanced_estimate
+            .as_ref()
+            .expect("advanced Public Send draft has an estimate");
+        let mut rows = vec![
+            SpendAuthorizationSummaryRow::new("Type", metadata.action_type),
+            SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
+            SpendAuthorizationSummaryRow::new("Destination", metadata.destination),
+            SpendAuthorizationSummaryRow::new(
+                "Native value",
+                format!(
+                    "{} {}",
+                    format_send_amount_input(metadata.value, draft.asset_decimals),
+                    draft.asset_label
+                ),
+            )
+            .with_icon(draft.asset_icon_path.clone()),
+            SpendAuthorizationSummaryRow::new(
+                "Data length",
+                format_advanced_data_length(metadata.data_length),
+            ),
+        ];
+        if let Some(selector) = metadata.selector {
+            rows.push(SpendAuthorizationSummaryRow::new("Selector", selector));
+        }
+        rows.extend([
+            SpendAuthorizationSummaryRow::new("Data hash", metadata.data_hash),
+            SpendAuthorizationSummaryRow::new("Gas limit", format_gas_limit(estimate.gas_limit)),
+            SpendAuthorizationSummaryRow::new(
+                "Maximum gas cost",
+                draft
+                    .fee_display
+                    .gas_cost
+                    .clone()
+                    .expect("advanced Public Send draft has a gas-cost display"),
+            ),
+        ]);
+        return SpendAuthorizationSummary::new(
+            "Advanced public transaction",
+            public_send_authorization_detail(draft.public_account_source),
+            rows,
+        )
+        .with_warnings(advanced_public_send_warnings(draft.public_account_source))
+        .with_payload(payload_label, full_data)
+        .requiring_explicit_review();
+    }
     let mut rows = vec![
         SpendAuthorizationSummaryRow::new("Amount", public_action_amount_label(draft))
             .with_icon(draft.asset_icon_path.clone()),
@@ -59,6 +228,67 @@ pub(in crate::root) fn public_send_authorization_summary(
         public_send_authorization_detail(draft.public_account_source),
         rows,
     )
+}
+
+pub(in crate::root) fn format_advanced_data_length(data_length: usize) -> String {
+    let unit = if data_length == 1 { "byte" } else { "bytes" };
+    format!("{data_length} {unit}")
+}
+
+pub(in crate::root) fn format_gas_limit(gas_limit: u64) -> String {
+    let mut formatted = gas_limit.to_string();
+    let mut separator_index = formatted.len().saturating_sub(3);
+    while separator_index > 0 {
+        formatted.insert(separator_index, ',');
+        separator_index = separator_index.saturating_sub(3);
+    }
+    formatted
+}
+
+pub(in crate::root) fn advanced_public_send_warnings(source: PublicAccountSource) -> Vec<Arc<str>> {
+    let mut warnings = vec![Arc::from(
+        "Arbitrary transaction data can transfer assets, grant allowances, or execute unknown code. Verify the destination and full payload independently.",
+    )];
+    if source == PublicAccountSource::HardwareDerived {
+        warnings.push(Arc::from(
+            "Your hardware wallet may require blind signing and may not display or decode the complete transaction data.",
+        ));
+    }
+    warnings
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct AdvancedPublicSendReviewMetadata {
+    pub(in crate::root) action_type: &'static str,
+    pub(in crate::root) destination: String,
+    pub(in crate::root) value: U256,
+    pub(in crate::root) data_length: usize,
+    pub(in crate::root) selector: Option<String>,
+    pub(in crate::root) data_hash: String,
+    pub(in crate::root) full_data: String,
+}
+
+pub(in crate::root) fn advanced_public_send_review_metadata(
+    intent: &PublicTransactionIntent,
+) -> Option<AdvancedPublicSendReviewMetadata> {
+    let PublicTransactionIntent::Raw { to, value, data } = intent else {
+        return None;
+    };
+    let selector =
+        (to.is_some() && data.len() >= 4).then(|| alloy::hex::encode_prefixed(&data[..4]));
+    Some(AdvancedPublicSendReviewMetadata {
+        action_type: if to.is_some() {
+            "Contract call"
+        } else {
+            "Contract creation"
+        },
+        destination: to.map_or_else(|| "New contract".to_string(), |to| to.to_checksum(None)),
+        value: *value,
+        data_length: data.len(),
+        selector,
+        data_hash: alloy::hex::encode_prefixed(keccak256(data)),
+        full_data: alloy::hex::encode_prefixed(data),
+    })
 }
 
 pub(in crate::root) fn public_shield_authorization_summary(

@@ -83,6 +83,7 @@ pub(super) async fn submit_public_action_step_session(
     chain_id: u64,
     from_address: Address,
     gas: &EffectiveChainGasSettings,
+    authorized_gas_limit: Option<u64>,
     mut nonce: Option<u64>,
     gas_fee: PublicActionGasFeeSelection,
     command_rx: &mut Option<PublicActionCommandReceiver>,
@@ -90,6 +91,7 @@ pub(super) async fn submit_public_action_step_session(
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<PublicActionStepOutcome> {
     let mut next_gas_fee = gas_fee;
+    let authorized_gas_fee = authorized_gas_limit.map(|_| gas_fee);
     let mut submitted_attempts = Vec::new();
 
     loop {
@@ -108,6 +110,7 @@ pub(super) async fn submit_public_action_step_session(
             base_tx_req.clone(),
             next_gas_fee,
             gas,
+            authorized_gas_limit,
             nonce,
             None,
         )
@@ -126,6 +129,11 @@ pub(super) async fn submit_public_action_step_session(
                     event_tx,
                     PublicActionSessionEvent::StepFailed { step, message },
                 );
+                if authorized_gas_limit.is_some() {
+                    return Err(error).wrap_err(
+                        "advanced transaction requires a refreshed estimate and authorization",
+                    );
+                }
                 let Some(command) = recv_public_action_command(command_rx).await else {
                     return Err(error);
                 };
@@ -166,6 +174,10 @@ pub(super) async fn submit_public_action_step_session(
                 let Some(command) = recv_public_action_command(command_rx).await else {
                     return Err(error);
                 };
+                ensure_public_action_command_gas_fee_authorized(
+                    authorized_gas_fee,
+                    command.gas_fee,
+                )?;
                 next_gas_fee = command.gas_fee;
                 continue;
             }
@@ -189,6 +201,19 @@ pub(super) async fn submit_public_action_step_session(
                             *command_rx = None;
                             continue;
                         };
+                        if let Err(error) = ensure_public_action_command_gas_fee_authorized(
+                            authorized_gas_fee,
+                            command.gas_fee,
+                        ) {
+                            emit_public_action_event(
+                                event_tx,
+                                PublicActionSessionEvent::AttemptRejected {
+                                    step,
+                                    message: report_chain_string(&error),
+                                },
+                            );
+                            continue;
+                        }
                         let Some(nonce) = nonce else {
                             next_gas_fee = command.gas_fee;
                             break;
@@ -204,6 +229,7 @@ pub(super) async fn submit_public_action_step_session(
                             base_tx_req.clone(),
                             command.gas_fee,
                             gas,
+                            authorized_gas_limit,
                             Some(nonce),
                             Some(gas_limit),
                         )
@@ -302,6 +328,10 @@ pub(super) async fn submit_public_action_step_session(
                             gas_fee,
                         });
                     };
+                    ensure_public_action_command_gas_fee_authorized(
+                        authorized_gas_fee,
+                        command.gas_fee,
+                    )?;
                     nonce = Some(winner.info.nonce.saturating_add(1));
                     next_gas_fee = command.gas_fee;
                     submitted_attempts.clear();
@@ -319,6 +349,18 @@ pub(super) async fn submit_public_action_step_session(
             }
         }
     }
+}
+
+pub(super) fn ensure_public_action_command_gas_fee_authorized(
+    authorized_gas_fee: Option<PublicActionGasFeeSelection>,
+    requested_gas_fee: PublicActionGasFeeSelection,
+) -> Result<()> {
+    if authorized_gas_fee.is_some_and(|authorized| authorized != requested_gas_fee) {
+        return Err(eyre!(
+            "advanced transaction fee changed after authorization; refresh the estimate and authorize again"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) async fn submit_public_action_attempt(
@@ -386,6 +428,7 @@ async fn public_action_preflight_from_rpc_pool(
     base_tx_req: TransactionRequest,
     gas_fee: PublicActionGasFeeSelection,
     gas: &EffectiveChainGasSettings,
+    authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
     gas_limit: Option<u64>,
 ) -> Result<PublicActionPreflight> {
@@ -397,6 +440,7 @@ async fn public_action_preflight_from_rpc_pool(
         base_tx_req,
         gas_fee,
         gas,
+        authorized_gas_limit,
         nonce,
         gas_limit,
         PublicActionPreflightMode::Managed,
@@ -412,6 +456,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
     base_tx_req: TransactionRequest,
     gas_fee: PublicActionGasFeeSelection,
     gas: &EffectiveChainGasSettings,
+    authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
     gas_limit: Option<u64>,
     mode: PublicActionPreflightMode,
@@ -438,6 +483,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
             gas_fee,
             quote,
             gas,
+            authorized_gas_limit,
             nonce,
             gas_limit,
             mode,
@@ -466,6 +512,7 @@ async fn public_action_preflight(
     gas_fee: PublicActionGasFeeSelection,
     quote: Option<PublicActionGasFeeQuote>,
     gas: &EffectiveChainGasSettings,
+    authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
     gas_limit: Option<u64>,
     mode: PublicActionPreflightMode,
@@ -522,7 +569,14 @@ async fn public_action_preflight(
             resolved.max_priority_fee_per_gas
         }
     });
-    let gas_limit = if let Some(gas_limit) = requested_gas_limit {
+    let gas_limit = if let Some(authorized_gas_limit) = authorized_gas_limit {
+        let estimated_gas = provider
+            .estimate_gas(tx_req.clone())
+            .await
+            .wrap_err("re-estimate authorized advanced public transaction gas")?;
+        ensure_advanced_gas_estimate_authorized(estimated_gas, authorized_gas_limit)?;
+        authorized_gas_limit
+    } else if let Some(gas_limit) = requested_gas_limit {
         gas_limit
     } else {
         provider
@@ -532,14 +586,19 @@ async fn public_action_preflight(
             .saturating_add(gas.gas_limit_buffer)
     };
     let estimated_native_gas_cost =
-        public_action_native_gas_cost(tx_req.value.unwrap_or_default(), gas_limit, max_fee_per_gas);
+        public_action_native_exposure(tx_req.value.unwrap_or_default(), gas_limit, max_fee_per_gas);
     let live_native_balance = provider
         .get_balance(from)
         .await
         .wrap_err("fetch public action native balance")?;
     if live_native_balance < estimated_native_gas_cost {
+        let action = if authorized_gas_limit.is_some() {
+            "advanced public transaction"
+        } else {
+            "public action"
+        };
         return Err(eyre!(
-            "insufficient native gas for public action: live balance {live_native_balance}, estimated max cost {estimated_native_gas_cost}"
+            "insufficient native balance for {action}: live balance {live_native_balance}, required value plus maximum gas cost {estimated_native_gas_cost}"
         ));
     }
     Ok(PublicActionPreflight {
@@ -638,8 +697,24 @@ fn walletconnect_resolved_gas_fee_from_request(
     })
 }
 
-fn public_action_native_gas_cost(value: U256, gas_limit: u64, max_fee_per_gas: u128) -> U256 {
+pub(super) fn public_action_native_exposure(
+    value: U256,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+) -> U256 {
     value + (U256::from(gas_limit) * U256::from(max_fee_per_gas))
+}
+
+pub(super) fn ensure_advanced_gas_estimate_authorized(
+    estimated_gas: u64,
+    authorized_gas_limit: u64,
+) -> Result<()> {
+    if estimated_gas > authorized_gas_limit {
+        return Err(eyre!(
+            "advanced transaction gas estimate {estimated_gas} exceeds authorized limit {authorized_gas_limit}; refresh the estimate and authorize again"
+        ));
+    }
+    Ok(())
 }
 
 async fn sign_send_public_action_transaction(

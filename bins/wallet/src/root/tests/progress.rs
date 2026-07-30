@@ -282,6 +282,10 @@ fn public_action_failed_step_retry_kind_distinguishes_gas_from_signing_cancel() 
             "public-shield-wrap: hardware sign: Failure_ActionCancelled",
         )),
     };
+    let balance_error = PublicActionStepState {
+        message: Some(Arc::from("insufficient native balance for public action")),
+        ..gas_error.clone()
+    };
 
     assert_eq!(
         public_action_error_retry_kind(&gas_error),
@@ -290,6 +294,10 @@ fn public_action_failed_step_retry_kind_distinguishes_gas_from_signing_cancel() 
     assert_eq!(
         public_action_error_retry_kind(&signing_cancel),
         PublicActionGasRetryKind::RetryStep,
+    );
+    assert_eq!(
+        public_action_error_retry_kind(&balance_error),
+        PublicActionGasRetryKind::RetryEstimate,
     );
     assert_eq!(
         public_action_error_summary(
@@ -789,6 +797,7 @@ fn test_self_broadcast_result(status: bool) -> DesktopSelfBroadcastResult {
             status,
             block_number: 10,
             gas_used: 21_000,
+            contract_address: None,
         },
         attempts: Vec::new(),
         native_top_up: None,

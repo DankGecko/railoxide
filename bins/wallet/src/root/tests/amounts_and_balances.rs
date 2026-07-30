@@ -1399,13 +1399,14 @@ fn public_action_max_label_notes_native_gas_estimate() {
     };
 
     assert_eq!(
-        public_action_max_label(&native),
-        Some("ETH after est. gas".to_string()),
+        public_action_max_label(&native, Some(U256::from(286_838_782_386_224_461_u128)),),
+        Some("0.7132 ETH after est. gas".to_string()),
     );
     assert_eq!(
-        public_action_max_label(&token),
+        public_action_max_label(&token, None),
         Some("1.5 USDC".to_string()),
     );
+    assert_eq!(public_action_max_label(&native, None), None);
 }
 
 #[test]

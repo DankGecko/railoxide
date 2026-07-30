@@ -70,12 +70,14 @@ impl WalletRoot {
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window),
-            PublicActionMode::Send => self
-                .public_form
-                .send_recipient_input
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window),
+            PublicActionMode::Send => {
+                let input = match self.public_form.public_send_kind {
+                    PublicSendKind::Transfer => &self.public_form.send_recipient_input,
+                    PublicSendKind::ContractCall => &self.public_form.advanced_send_to_input,
+                    PublicSendKind::Deploy => &self.public_form.advanced_send_value_input,
+                };
+                input.read(cx).focus_handle(cx).focus(window);
+            }
         }
     }
 
@@ -105,10 +107,30 @@ impl WalletRoot {
         let submit_root = root.clone();
         let gas_fee_root = root.clone();
         let progress_root = root.clone();
+        let advanced_mode_root = root.clone();
+        let advanced_estimate_root = root.clone();
+        let advanced_submit_root = root.clone();
         let max_root = root;
         let show_form_errors = !self.public_action_has_active_progress();
-        let max_label = balance_entry.as_ref().and_then(public_action_max_label);
         let amount_hint = format!("{asset_label} amount");
+        let send_amount_hint = selected_asset.map_or_else(
+            || "Amount".to_string(),
+            |asset| {
+                format!(
+                    "Amount ({})",
+                    public_action_asset_label(
+                        self.selected_chain,
+                        asset,
+                        Some(&self.effective_token_registry),
+                    )
+                )
+            },
+        );
+        let max_gas_reserve =
+            selected_asset.and_then(|asset| self.public_action_estimated_gas_cost(mode, asset, cx));
+        let max_label = balance_entry
+            .as_ref()
+            .and_then(|entry| public_action_max_label(entry, max_gas_reserve));
         let fee_amount = selected_asset.and_then(|asset| {
             let input = match mode {
                 PublicActionMode::Shield => &self.public_form.shield_amount_input,
@@ -220,51 +242,250 @@ impl WalletRoot {
                 }
             }
             PublicActionMode::Send => {
-                content = content
-                    .child(
-                        app_input(&self.public_form.send_recipient_input)
-                            .disabled(disabled || self.public_form.sending),
-                    )
-                    .child(render_public_action_amount_input(
-                        max_root,
-                        PublicActionMode::Send,
-                        &self.public_form.send_amount_input,
-                        amount_hint,
-                        max_label,
-                        disabled || self.public_form.sending,
-                    ))
-                    .child(render_eip1559_gas_fee_editor(
-                        gas_fee_root,
-                        Eip1559GasFeeTarget::Public {
-                            mode: PublicActionMode::Send,
-                        },
-                        &self.public_form.send_gas_fee,
-                        disabled || self.public_form.sending,
-                    ))
-                    .child(render_public_action_fee_estimate(
-                        PublicActionMode::Send,
-                        &fee_display,
-                        gas_pending,
-                    ))
-                    .child(
-                        app_button(
-                            "wallet-public-send",
-                            if self.public_form.sending {
-                                "Sending..."
-                            } else {
-                                "Send publicly"
-                            },
-                        )
-                        .primary()
-                        .small()
-                        .loading(self.public_form.sending)
-                        .disabled(disabled || self.public_form.sending || !fee_ready)
-                        .on_click(move |_event, window, cx| {
-                            submit_root.update(cx, |root, cx| {
-                                root.submit_public_send_from_form(window, cx);
-                            });
-                        }),
+                let send_kind = self.public_form.public_send_kind;
+                if selected_asset == Some(PublicAssetId::Native) {
+                    content = content.child(
+                        div().flex().justify_end().child(
+                            ButtonGroup::new("wallet-public-send-kind-toggle")
+                                .outline()
+                                .compact()
+                                .disabled(self.public_form.sending)
+                                .child(public_send_kind_segment_button(
+                                    "wallet-public-send-transfer".into(),
+                                    "Transfer",
+                                    send_kind == PublicSendKind::Transfer,
+                                ))
+                                .child(public_send_kind_segment_button(
+                                    "wallet-public-send-contract-call".into(),
+                                    "Contract call",
+                                    send_kind == PublicSendKind::ContractCall,
+                                ))
+                                .child(public_send_kind_segment_button(
+                                    "wallet-public-send-deploy".into(),
+                                    "Deploy",
+                                    send_kind == PublicSendKind::Deploy,
+                                ))
+                                .on_click(move |selected, window, cx| {
+                                    let Some(index) = selected.first() else {
+                                        return;
+                                    };
+                                    let kind = match *index {
+                                        0 => PublicSendKind::Transfer,
+                                        1 => PublicSendKind::ContractCall,
+                                        _ => PublicSendKind::Deploy,
+                                    };
+                                    advanced_mode_root.update(cx, |root, cx| {
+                                        root.set_public_send_kind(kind, window, cx);
+                                    });
+                                }),
+                        ),
                     );
+                }
+                if send_kind.is_advanced() && selected_asset == Some(PublicAssetId::Native) {
+                    if send_kind == PublicSendKind::ContractCall {
+                        content = content.child(
+                            labeled_field(
+                                "To",
+                                app_input(&self.public_form.advanced_send_to_input)
+                                    .disabled(disabled || self.public_form.sending),
+                            )
+                            .children(
+                                self.public_form
+                                    .advanced_send_to_error
+                                    .as_ref()
+                                    .map(|error| {
+                                        Alert::error(
+                                            "wallet-public-send-advanced-to-error",
+                                            error.to_string(),
+                                        )
+                                        .small()
+                                    }),
+                            ),
+                        );
+                    }
+                    let data_label = if send_kind == PublicSendKind::Deploy {
+                        "Init code"
+                    } else {
+                        "Calldata"
+                    };
+                    content = content
+                        .child(
+                            labeled_field(
+                                format!(
+                                    "Value ({})",
+                                    native_token_display_label(self.selected_chain)
+                                ),
+                                app_input(&self.public_form.advanced_send_value_input)
+                                    .disabled(disabled || self.public_form.sending),
+                            )
+                            .children(
+                                self.public_form
+                                    .advanced_send_value_error
+                                    .as_ref()
+                                    .map(|error| {
+                                        Alert::error(
+                                            "wallet-public-send-advanced-value-error",
+                                            error.to_string(),
+                                        )
+                                        .small()
+                                    }),
+                            ),
+                        )
+                        .child(
+                            labeled_field(
+                                data_label,
+                                app_input(&self.public_form.advanced_send_data_input)
+                                    .w_full()
+                                    .min_w(px(0.0))
+                                    .font_family(APP_MONO_FONT_FAMILY)
+                                    .text_size(APP_TEXT_SIZE)
+                                    .disabled(disabled || self.public_form.sending),
+                            )
+                            .w_full()
+                            .min_w(px(0.0))
+                            .children(
+                                self.public_form
+                                    .advanced_send_data_error
+                                    .as_ref()
+                                    .map(|error| {
+                                        Alert::error(
+                                            "wallet-public-send-advanced-data-error",
+                                            error.to_string(),
+                                        )
+                                        .small()
+                                    }),
+                            ),
+                        )
+                        .child(render_eip1559_gas_fee_editor(
+                            gas_fee_root,
+                            Eip1559GasFeeTarget::Public {
+                                mode: PublicActionMode::Send,
+                            },
+                            &self.public_form.send_gas_fee,
+                            disabled || self.public_form.sending,
+                        ))
+                        .child(match self.public_form.advanced_send_estimate.as_ref() {
+                            Some(estimate) => render_public_advanced_transaction_estimate(
+                                self.selected_chain,
+                                estimate,
+                                self.public_broadcaster_anchor_cache
+                                    .cached_native_usd_micro_value(
+                                        self.selected_chain,
+                                        estimate.max_gas_cost,
+                                    )
+                                    .map(format_usd_micro_value),
+                            ),
+                            None => Alert::info(
+                                "wallet-public-send-advanced-estimate-required",
+                                advanced_public_send_estimate_required_message(
+                                    self.public_form.advanced_send_estimate_invalidated,
+                                ),
+                            )
+                            .small()
+                            .into_any_element(),
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_wrap()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    app_button(
+                                        "wallet-public-send-advanced-estimate",
+                                        if self.public_form.advanced_send_estimate_pending {
+                                            "Estimating..."
+                                        } else {
+                                            "Estimate gas"
+                                        },
+                                    )
+                                    .outline()
+                                    .small()
+                                    .loading(self.public_form.advanced_send_estimate_pending)
+                                    .disabled(
+                                        disabled
+                                            || self.public_form.sending
+                                            || self.public_form.advanced_send_estimate_pending,
+                                    )
+                                    .on_click(
+                                        move |_event, _window, cx| {
+                                            advanced_estimate_root.update(cx, |root, cx| {
+                                                root.estimate_advanced_public_send(cx);
+                                            });
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    app_button(
+                                        "wallet-public-send-advanced-authorize",
+                                        "Review and authorize",
+                                    )
+                                    .primary()
+                                    .small()
+                                    .disabled(
+                                        disabled
+                                            || self.public_form.sending
+                                            || self.public_form.advanced_send_estimate_pending
+                                            || self.public_form.advanced_send_estimate.is_none(),
+                                    )
+                                    .on_click(
+                                        move |_event, window, cx| {
+                                            advanced_submit_root.update(cx, |root, cx| {
+                                                root.submit_public_send_from_form(window, cx);
+                                            });
+                                        },
+                                    ),
+                                ),
+                        );
+                } else {
+                    content = content
+                        .child(labeled_field(
+                            "To",
+                            app_input(&self.public_form.send_recipient_input)
+                                .disabled(disabled || self.public_form.sending),
+                        ))
+                        .child(render_public_action_amount_input(
+                            max_root,
+                            PublicActionMode::Send,
+                            &self.public_form.send_amount_input,
+                            send_amount_hint,
+                            max_label,
+                            disabled || self.public_form.sending,
+                        ))
+                        .child(render_eip1559_gas_fee_editor(
+                            gas_fee_root,
+                            Eip1559GasFeeTarget::Public {
+                                mode: PublicActionMode::Send,
+                            },
+                            &self.public_form.send_gas_fee,
+                            disabled || self.public_form.sending,
+                        ))
+                        .child(render_public_action_fee_estimate(
+                            PublicActionMode::Send,
+                            &fee_display,
+                            gas_pending,
+                        ))
+                        .child(
+                            app_button(
+                                "wallet-public-send",
+                                if self.public_form.sending {
+                                    "Sending..."
+                                } else {
+                                    "Send publicly"
+                                },
+                            )
+                            .primary()
+                            .small()
+                            .loading(self.public_form.sending)
+                            .disabled(disabled || self.public_form.sending || !fee_ready)
+                            .on_click(move |_event, window, cx| {
+                                submit_root.update(cx, |root, cx| {
+                                    root.submit_public_send_from_form(window, cx);
+                                });
+                            }),
+                        );
+                }
                 if show_form_errors && let Some(error) = self.public_form.send_error.as_ref() {
                     content = content
                         .child(Alert::error("wallet-public-send-error", error.to_string()).small());
@@ -288,6 +509,27 @@ impl WalletRoot {
         content
     }
 
+    pub(in crate::root) fn set_public_send_kind(
+        &mut self,
+        kind: PublicSendKind,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.sending
+            || self.public_form.selected_asset != Some(PublicAssetId::Native)
+            || self.public_form.public_send_kind == kind
+        {
+            return;
+        }
+        self.public_form.public_send_kind = kind;
+        self.public_form.send_error = None;
+        self.invalidate_advanced_public_send_estimate();
+        cx.defer_in(window, |root, window, cx| {
+            root.focus_public_action_dialog_input(window, cx);
+        });
+        cx.notify();
+    }
+
     pub(in crate::root) fn clear_public_action_dialog_inputs(
         &mut self,
         window: &mut Window,
@@ -296,6 +538,9 @@ impl WalletRoot {
         for input in [
             &self.public_form.send_recipient_input,
             &self.public_form.send_amount_input,
+            &self.public_form.advanced_send_to_input,
+            &self.public_form.advanced_send_value_input,
+            &self.public_form.advanced_send_data_input,
             &self.public_form.shield_amount_input,
         ] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
@@ -303,10 +548,157 @@ impl WalletRoot {
         self.clear_trezor_app_passphrase_input(window, cx);
         self.clear_trezor_pin_matrix_prompt(cx);
         self.public_form.send_error = None;
+        self.public_form.public_send_kind = PublicSendKind::Transfer;
+        self.public_form.advanced_send_estimate = None;
+        self.public_form.advanced_send_estimate_invalidated = false;
+        self.invalidate_advanced_public_send_estimate();
         self.public_form.shield_error = None;
         if !self.public_form.sending && !self.public_form.shielding {
             self.clear_public_action_progress_state();
         }
+    }
+
+    pub(in crate::root) fn invalidate_advanced_public_send_estimate(&mut self) {
+        self.public_form.advanced_send_estimate_generation = self
+            .public_form
+            .advanced_send_estimate_generation
+            .wrapping_add(1);
+        if self.public_form.advanced_send_estimate.take().is_some() {
+            self.public_form.advanced_send_estimate_invalidated = true;
+        }
+        self.public_form.advanced_send_estimate_pending = false;
+        self.public_form.advanced_send_to_error = None;
+        self.public_form.advanced_send_value_error = None;
+        self.public_form.advanced_send_data_error = None;
+    }
+
+    pub(in crate::root) fn estimate_advanced_public_send(&mut self, cx: &mut Context<'_, Self>) {
+        if self.public_form.sending
+            || self.public_form.advanced_send_estimate_pending
+            || !self.public_form.public_send_kind.is_advanced()
+            || self.public_form.selected_asset != Some(PublicAssetId::Native)
+        {
+            return;
+        }
+        let Some(account) = self.selected_public_account() else {
+            self.public_form.send_error = Some(Arc::from("Select a public account first"));
+            cx.notify();
+            return;
+        };
+        let from = account.address;
+        let public_account_uuid: Arc<str> = Arc::from(account.public_account_uuid.as_str());
+        let native_decimals = public_asset_decimals(
+            self.selected_chain,
+            PublicAssetId::Native,
+            Some(&self.effective_token_registry),
+        );
+        let intent = match parse_advanced_public_send_intent(
+            self.public_form.public_send_kind,
+            self.public_form
+                .advanced_send_to_input
+                .read(cx)
+                .value()
+                .as_ref(),
+            self.public_form
+                .advanced_send_value_input
+                .read(cx)
+                .value()
+                .as_ref(),
+            self.public_form
+                .advanced_send_data_input
+                .read(cx)
+                .value()
+                .as_ref(),
+            native_decimals,
+        ) {
+            Ok(intent) => intent,
+            Err(error) => {
+                self.set_advanced_public_send_validation_error(error);
+                cx.notify();
+                return;
+            }
+        };
+        let gas_fee = match self.public_action_gas_fee_selection(PublicActionMode::Send, cx) {
+            Ok(gas_fee) => gas_fee,
+            Err(error) => {
+                self.public_form.send_error = Some(Arc::from(error));
+                cx.notify();
+                return;
+            }
+        };
+        self.invalidate_advanced_public_send_estimate();
+        self.public_form.advanced_send_estimate_pending = true;
+        self.public_form.send_error = None;
+        let generation = self.public_form.advanced_send_estimate_generation;
+        let send_kind = self.public_form.public_send_kind;
+        let chain_id = self.selected_chain;
+        let selected_wallet_id = self.selected_wallet_id.clone();
+        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let http = self.http.clone();
+        cx.spawn(async move |this, cx| {
+            let result = estimate_public_advanced_transaction(
+                PublicAdvancedTransactionEstimateRequest {
+                    chain_id,
+                    effective_chain,
+                    from,
+                    intent,
+                    gas_fee,
+                },
+                &http,
+            )
+            .await;
+            let _ = this.update(cx, |root, cx| {
+                if root.selected_wallet_id != selected_wallet_id
+                    || root.selected_chain != chain_id
+                    || root.public_form.selected_account_uuid.as_deref()
+                        != Some(public_account_uuid.as_ref())
+                    || root.public_form.advanced_send_estimate_generation != generation
+                    || root.public_form.public_send_kind != send_kind
+                {
+                    return;
+                }
+                root.public_form.advanced_send_estimate_pending = false;
+                match result {
+                    Ok(estimate) => {
+                        root.public_form.advanced_send_estimate = Some(estimate);
+                        root.public_form.advanced_send_estimate_invalidated = false;
+                        root.public_form.send_error = None;
+                    }
+                    Err(error) => {
+                        root.public_form.advanced_send_estimate = None;
+                        root.public_form.send_error = Some(Arc::from(format!(
+                            "Could not estimate advanced transaction: {}",
+                            format_report_chain(&error)
+                        )));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_advanced_public_send_validation_error(
+        &mut self,
+        error: AdvancedPublicSendValidationError,
+    ) {
+        self.public_form.advanced_send_to_error = None;
+        self.public_form.advanced_send_value_error = None;
+        self.public_form.advanced_send_data_error = None;
+        let message = Arc::from(error.message);
+        match error.field {
+            AdvancedPublicSendField::Destination => {
+                self.public_form.advanced_send_to_error = Some(message);
+            }
+            AdvancedPublicSendField::Value => {
+                self.public_form.advanced_send_value_error = Some(message);
+            }
+            AdvancedPublicSendField::Data => {
+                self.public_form.advanced_send_data_error = Some(message);
+            }
+        }
+        self.public_form.send_error = None;
     }
 
     fn reset_public_action_gas_fee_quotes(&mut self) {
@@ -361,7 +753,9 @@ impl WalletRoot {
         self.public_form.action_command_tx = None;
         self.public_form.action_attempts.clear();
         self.public_form.action_current_gas_fee = None;
+        self.public_form.action_fees_authorized = false;
         self.public_form.action_action_error = None;
+        self.public_form.action_contract_address = None;
     }
 
     pub(in crate::root) fn set_public_action_gas_fee_mode(
@@ -383,6 +777,9 @@ impl WalletRoot {
             gas_fee.seed_custom_from_auto_if_empty(window, cx);
         }
         gas_fee.mode = mode;
+        if action_mode == PublicActionMode::Send {
+            self.invalidate_advanced_public_send_estimate();
+        }
         self.set_public_action_error(action_mode, None);
         cx.notify();
     }
@@ -409,6 +806,9 @@ impl WalletRoot {
             Eip1559GasFeeEditTarget::MaxTip => gas_fee.max_priority_fee_input.clone(),
         };
         gas_fee.mode = Eip1559GasFeeMode::Custom;
+        if action_mode == PublicActionMode::Send {
+            self.invalidate_advanced_public_send_estimate();
+        }
         self.set_public_action_error(action_mode, None);
         focus_input.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -450,6 +850,9 @@ impl WalletRoot {
                     Ok(quote) => {
                         gas_fee.quote = Some(quote);
                         gas_fee.error = None;
+                        if action_mode == PublicActionMode::Send {
+                            root.invalidate_advanced_public_send_estimate();
+                        }
                         root.set_public_action_error(action_mode, None);
                     }
                     Err(error) => {
@@ -472,6 +875,7 @@ impl WalletRoot {
         public_account_source: PublicAccountSource,
         command_tx: Option<PublicActionCommandSender>,
         initial_gas_fee: Option<(u128, u128)>,
+        fees_authorized: bool,
     ) -> u64 {
         self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
         let generation = self.public_form.action_generation;
@@ -487,7 +891,9 @@ impl WalletRoot {
         self.public_form.action_command_tx = command_tx;
         self.public_form.action_attempts.clear();
         self.public_form.action_current_gas_fee = initial_gas_fee;
+        self.public_form.action_fees_authorized = fees_authorized;
         self.public_form.action_action_error = None;
+        self.public_form.action_contract_address = None;
         self.public_form.action_progress =
             public_action_progress_steps_for_source(mode, asset, public_account_source)
                 .into_iter()
@@ -852,9 +1258,18 @@ impl WalletRoot {
                     self.public_form.action_requires_device_approval,
                     self.public_form.action_command_tx.is_some(),
                     self.public_form.action_current_gas_fee,
+                    self.public_form.action_fees_authorized,
                     self.public_form.action_action_error.as_deref(),
                     self.public_form.action_generation,
                 ));
+
+        if let Some(contract_address) = self.public_form.action_contract_address.as_ref() {
+            content = content.child(copyable_mono_field(
+                "Created contract",
+                contract_address.to_string(),
+                "wallet-public-action-created-contract-copy",
+            ));
+        }
 
         if let Some((max_fee, max_tip)) = self.public_form.action_current_gas_fee {
             content = content.child(
@@ -1172,7 +1587,7 @@ impl WalletRoot {
                     max_priority_fee_per_gas: quote.suggested_max_priority_fee_per_gas,
                 })
             }
-            custom => Ok(custom),
+            custom @ PublicActionGasFeeSelection::Custom { .. } => Ok(custom),
         }
     }
 
@@ -1188,34 +1603,19 @@ impl WalletRoot {
                 protocol_fee: None,
             };
         };
-        let (kind, gas_fee) = match mode {
-            PublicActionMode::Shield => {
-                (PublicActionKind::Shield, &self.public_form.shield_gas_fee)
-            }
-            PublicActionMode::Send => (PublicActionKind::Send, &self.public_form.send_gas_fee),
-        };
-        let gas_cost = gas_fee.selection(cx).ok().and_then(|selection| {
-            estimate_public_action_gas_cost(
-                self.selected_chain,
-                self.effective_chain_configs.get(&self.selected_chain),
-                kind,
-                asset,
-                selection,
-                gas_fee.quote,
-            )
-            .ok()
-            .map(|max_native_gas_cost| {
-                let token_value = format_native_token_amount_for_display(
-                    self.selected_chain,
-                    max_native_gas_cost,
-                );
-                let usd_value = self
-                    .public_broadcaster_anchor_cache
-                    .cached_native_usd_micro_value(self.selected_chain, max_native_gas_cost)
-                    .map(format_usd_micro_value);
-                public_action_fee_value_label(token_value, usd_value)
-            })
-        });
+        let gas_cost =
+            self.public_action_estimated_gas_cost(mode, asset, cx)
+                .map(|max_native_gas_cost| {
+                    let token_value = format_native_token_amount_for_display(
+                        self.selected_chain,
+                        max_native_gas_cost,
+                    );
+                    let usd_value = self
+                        .public_broadcaster_anchor_cache
+                        .cached_native_usd_micro_value(self.selected_chain, max_native_gas_cost)
+                        .map(format_usd_micro_value);
+                    public_action_fee_value_label(&token_value, usd_value)
+                });
         let protocol_fee = if mode == PublicActionMode::Shield {
             amount.map(|amount| {
                 let fee_amount = public_shield_protocol_fee_amount(amount);
@@ -1239,7 +1639,7 @@ impl WalletRoot {
                         .cached_token_usd_micro_value(self.selected_chain, token, fee_amount),
                 };
                 public_action_fee_value_label(
-                    token_value,
+                    &token_value,
                     usd_micro_value.map(format_usd_micro_value),
                 )
             })
@@ -1250,6 +1650,29 @@ impl WalletRoot {
             gas_cost,
             protocol_fee,
         }
+    }
+
+    fn public_action_estimated_gas_cost(
+        &self,
+        mode: PublicActionMode,
+        asset: PublicAssetId,
+        cx: &App,
+    ) -> Option<U256> {
+        let (kind, gas_fee) = match mode {
+            PublicActionMode::Shield => {
+                (PublicActionKind::Shield, &self.public_form.shield_gas_fee)
+            }
+            PublicActionMode::Send => (PublicActionKind::Send, &self.public_form.send_gas_fee),
+        };
+        estimate_public_action_gas_cost(
+            self.selected_chain,
+            self.effective_chain_configs.get(&self.selected_chain),
+            kind,
+            asset,
+            gas_fee.selection(cx).ok()?,
+            gas_fee.quote,
+        )
+        .ok()
     }
 
     pub(in crate::root) fn public_action_initial_gas_values(
@@ -1345,53 +1768,139 @@ impl WalletRoot {
         let public_account_label = public_account_display_label(public_account)
             .unwrap_or_else(|| short_address(&public_account.address));
         let public_account_source = public_account.source;
-        let amount_input = self
-            .public_form
-            .send_amount_input
-            .read(cx)
-            .value()
-            .to_string();
-        let amount = match parse_send_amount(&amount_input, asset_decimals) {
-            Ok(amount) if !amount.is_zero() => amount,
-            Ok(_) => {
-                self.public_form.send_error = Some(Arc::from("Amount must be greater than zero"));
-                cx.notify();
-                return None;
-            }
-            Err(error) => {
-                self.public_form.send_error = Some(Arc::from(error.to_string()));
-                cx.notify();
-                return None;
-            }
-        };
-        let Some(recipient) = parse_address(
-            self.public_form
-                .send_recipient_input
-                .read(cx)
-                .value()
-                .as_ref(),
-        ) else {
-            self.public_form.send_error = Some(Arc::from("Enter a valid EVM recipient address"));
-            cx.notify();
-            return None;
-        };
-        let gas_fee =
-            match self.public_action_authorized_gas_fee_selection(PublicActionMode::Send, cx) {
-                Ok(selection) => selection,
-                Err(error) => {
-                    self.public_form.send_error = Some(Arc::from(error));
+        let (amount, recipient, intent, advanced_estimate, gas_fee, fee_display) =
+            if self.public_form.public_send_kind.is_advanced() {
+                if asset != PublicAssetId::Native {
+                    self.public_form.send_error = Some(Arc::from(
+                        "Advanced transactions are available only from the native asset",
+                    ));
                     cx.notify();
                     return None;
                 }
+                let parsed = parse_advanced_public_send_intent(
+                    self.public_form.public_send_kind,
+                    self.public_form
+                        .advanced_send_to_input
+                        .read(cx)
+                        .value()
+                        .as_ref(),
+                    self.public_form
+                        .advanced_send_value_input
+                        .read(cx)
+                        .value()
+                        .as_ref(),
+                    self.public_form
+                        .advanced_send_data_input
+                        .read(cx)
+                        .value()
+                        .as_ref(),
+                    asset_decimals,
+                );
+                let intent = match parsed {
+                    Ok(intent) => intent,
+                    Err(error) => {
+                        self.set_advanced_public_send_validation_error(error);
+                        cx.notify();
+                        return None;
+                    }
+                };
+                let Some(estimate) = self.public_form.advanced_send_estimate.clone() else {
+                    self.public_form.send_error =
+                        Some(Arc::from(advanced_public_send_estimate_required_message(
+                            self.public_form.advanced_send_estimate_invalidated,
+                        )));
+                    cx.notify();
+                    return None;
+                };
+                let PublicTransactionIntent::Raw { to, value, .. } = &intent else {
+                    unreachable!("advanced parser returns a raw intent")
+                };
+                let token_value =
+                    format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
+                let usd_value = self
+                    .public_broadcaster_anchor_cache
+                    .cached_native_usd_micro_value(chain_id, estimate.max_gas_cost)
+                    .map(format_usd_micro_value);
+                let fee_display = PublicActionFeeDisplay {
+                    gas_cost: Some(public_action_fee_value_label(&token_value, usd_value)),
+                    protocol_fee: None,
+                };
+                (
+                    *value,
+                    to.unwrap_or_default(),
+                    intent,
+                    Some(estimate.clone()),
+                    PublicActionGasFeeSelection::Custom {
+                        max_fee_per_gas: estimate.max_fee_per_gas,
+                        max_priority_fee_per_gas: estimate.max_priority_fee_per_gas,
+                    },
+                    fee_display,
+                )
+            } else {
+                let amount_input = self
+                    .public_form
+                    .send_amount_input
+                    .read(cx)
+                    .value()
+                    .to_string();
+                let amount = match parse_send_amount(&amount_input, asset_decimals) {
+                    Ok(amount) if !amount.is_zero() => amount,
+                    Ok(_) => {
+                        self.public_form.send_error =
+                            Some(Arc::from("Amount must be greater than zero"));
+                        cx.notify();
+                        return None;
+                    }
+                    Err(error) => {
+                        self.public_form.send_error = Some(Arc::from(error.to_string()));
+                        cx.notify();
+                        return None;
+                    }
+                };
+                let Some(recipient) = parse_address(
+                    self.public_form
+                        .send_recipient_input
+                        .read(cx)
+                        .value()
+                        .as_ref(),
+                ) else {
+                    self.public_form.send_error =
+                        Some(Arc::from("Enter a valid EVM recipient address"));
+                    cx.notify();
+                    return None;
+                };
+                let gas_fee = match self
+                    .public_action_authorized_gas_fee_selection(PublicActionMode::Send, cx)
+                {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        self.public_form.send_error = Some(Arc::from(error));
+                        cx.notify();
+                        return None;
+                    }
+                };
+                let fee_display =
+                    self.public_action_fee_display(PublicActionMode::Send, Some(amount), cx);
+                if fee_display.gas_cost.is_none() {
+                    self.public_form.send_error = Some(Arc::from(
+                        "Wait for an estimated gas cost before authorizing the send",
+                    ));
+                    cx.notify();
+                    return None;
+                }
+                (
+                    amount,
+                    recipient,
+                    PublicTransactionIntent::Transfer {
+                        asset,
+                        amount,
+                        recipient,
+                    },
+                    None,
+                    gas_fee,
+                    fee_display,
+                )
             };
-        let fee_display = self.public_action_fee_display(PublicActionMode::Send, Some(amount), cx);
-        if fee_display.gas_cost.is_none() {
-            self.public_form.send_error = Some(Arc::from(
-                "Wait for an estimated gas cost before authorizing the send",
-            ));
-            cx.notify();
-            return None;
-        }
         Some(PublicSendDraft {
             chain_id,
             asset,
@@ -1405,6 +1914,8 @@ impl WalletRoot {
             vault_store,
             amount,
             recipient,
+            intent,
+            advanced_estimate,
             gas_fee,
             fee_display,
         })
@@ -1431,8 +1942,8 @@ impl WalletRoot {
             public_account_source,
             view_session,
             vault_store,
-            amount,
-            recipient,
+            intent,
+            advanced_estimate,
             gas_fee,
             ..
         } = draft;
@@ -1459,6 +1970,7 @@ impl WalletRoot {
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
         let initial_gas_fee =
             self.public_action_initial_gas_values(PublicActionMode::Send, &gas_fee);
+        let advanced_submission = advanced_estimate.is_some();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let generation = self.start_public_action_progress(
@@ -1469,6 +1981,7 @@ impl WalletRoot {
             public_account_source,
             Some(command_tx),
             initial_gas_fee,
+            advanced_submission,
         );
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         Self::spawn_public_action_progress_listener(
@@ -1495,9 +2008,13 @@ impl WalletRoot {
             trezor_app_passphrase,
             trezor_pin_matrix_provider,
             public_account_uuid: public_account_uuid.to_string(),
-            asset,
-            amount,
-            recipient,
+            intent,
+            advanced_authorization: advanced_estimate.map(|estimate| {
+                PublicAdvancedTransactionAuthorization {
+                    payload_fingerprint: estimate.payload_fingerprint,
+                    gas_limit: estimate.gas_limit,
+                }
+            }),
             gas_fee,
             command_rx: Some(command_rx),
             event_tx: Some(event_tx),
@@ -1526,9 +2043,11 @@ impl WalletRoot {
                 root.public_form.sending = false;
                 root.public_form.action_task_abort_handle = None;
                 match result {
-                    Ok(Ok(_result)) => {
+                    Ok(Ok(result)) => {
                         root.public_form.action_command_tx = None;
                         root.public_form.action_action_error = None;
+                        root.public_form.action_contract_address =
+                            result.tx.contract_address.as_deref().map(Arc::from);
                         match root
                             .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
                             .map(|account| account.status)
@@ -1546,12 +2065,18 @@ impl WalletRoot {
                         }
                         root.discard_active_trezor_session_if_stale(&message, cx);
                         root.public_form.action_command_tx = None;
+                        if advanced_submission {
+                            root.invalidate_advanced_public_send_estimate();
+                        }
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.send_error = Some(Arc::from(message));
                     }
                     Err(error) => {
                         let message = format!("Public send task failed: {error}");
                         root.public_form.action_command_tx = None;
+                        if advanced_submission {
+                            root.invalidate_advanced_public_send_estimate();
+                        }
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.send_error = Some(Arc::from(message));
                     }
@@ -1746,6 +2271,7 @@ impl WalletRoot {
             public_account_source,
             Some(command_tx),
             initial_gas_fee,
+            false,
         );
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         Self::spawn_public_action_progress_listener(

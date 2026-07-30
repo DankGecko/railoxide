@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use alloy::primitives::{U256, address};
+use alloy::primitives::{Bytes, TxKind, U256, address};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use alloy::uint;
@@ -837,17 +837,227 @@ fn public_send_request_uses_native_value_or_erc20_transfer() {
     let token = address!("0x3333333333333333333333333333333333333333");
     let amount = U256::from(5_u64);
 
-    let native = public_send_transaction_request(1, from, PublicAssetId::Native, amount, recipient);
+    let native = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::Transfer {
+            asset: PublicAssetId::Native,
+            amount,
+            recipient,
+        },
+    )
+    .expect("native transfer request");
     assert_eq!(native.to, Some(recipient.into()));
     assert_eq!(native.value, Some(amount));
 
-    let erc20 =
-        public_send_transaction_request(1, from, PublicAssetId::Erc20(token), amount, recipient);
+    let erc20 = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::Transfer {
+            asset: PublicAssetId::Erc20(token),
+            amount,
+            recipient,
+        },
+    )
+    .expect("ERC20 transfer request");
     assert_eq!(erc20.to, Some(token.into()));
     let expected_transfer = PublicErc20::transferCall { recipient, amount }.abi_encode();
     assert_eq!(
         erc20.input.input().expect("transfer input").as_ref(),
         expected_transfer.as_slice()
+    );
+}
+
+#[test]
+fn public_send_request_supports_raw_calls_and_contract_creation() {
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let to = address!("0x2222222222222222222222222222222222222222");
+    let call_data = Bytes::from_static(&[0x12, 0x34, 0x56, 0x78, 0xaa]);
+    let call = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::Raw {
+            to: Some(to),
+            value: U256::from(7_u64),
+            data: call_data.clone(),
+        },
+    )
+    .expect("raw call request");
+    assert_eq!(call.to, Some(to.into()));
+    assert_eq!(call.value, Some(U256::from(7_u64)));
+    assert_eq!(call.input.input(), Some(&call_data));
+
+    let init_code = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00]);
+    let creation = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::Raw {
+            to: None,
+            value: U256::ZERO,
+            data: init_code.clone(),
+        },
+    )
+    .expect("contract creation request");
+    assert_eq!(creation.to, Some(TxKind::Create));
+    assert_eq!(creation.value, Some(U256::ZERO));
+    assert_eq!(creation.input.input(), Some(&init_code));
+
+    let mut managed_creation =
+        public_action_eip1559_transaction_request(creation, 1, from, 10, 2, 3);
+    managed_creation.gas = Some(100_000);
+    let built = managed_creation
+        .build_consensus_tx()
+        .expect("build managed contract creation transaction");
+    let alloy::consensus::TypedTransaction::Eip1559(built) = built else {
+        panic!("expected EIP-1559 contract creation")
+    };
+    assert_eq!(built.to, TxKind::Create);
+    assert_eq!(built.value, U256::ZERO);
+    assert_eq!(built.input, init_code);
+
+    let value_call = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::Raw {
+            to: Some(to),
+            value: U256::from(1_u64),
+            data: Bytes::new(),
+        },
+    )
+    .expect("positive-value empty-data call");
+    assert_eq!(value_call.to, Some(to.into()));
+    assert_eq!(value_call.value, Some(U256::from(1_u64)));
+}
+
+#[test]
+fn public_send_request_rejects_empty_raw_intents() {
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let to = address!("0x2222222222222222222222222222222222222222");
+
+    let empty_creation = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::Raw {
+            to: None,
+            value: U256::from(1_u64),
+            data: Bytes::new(),
+        },
+    )
+    .expect_err("empty creation must fail");
+    assert!(empty_creation.to_string().contains("non-empty init code"));
+
+    let no_op = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::Raw {
+            to: Some(to),
+            value: U256::ZERO,
+            data: Bytes::new(),
+        },
+    )
+    .expect_err("empty zero-value call must fail");
+    assert!(no_op.to_string().contains("native value or data"));
+}
+
+#[test]
+fn advanced_public_transaction_authorization_is_payload_and_gas_bounded() {
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let to = address!("0x2222222222222222222222222222222222222222");
+    let intent = PublicTransactionIntent::Raw {
+        to: Some(to),
+        value: U256::from(7_u64),
+        data: Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]),
+    };
+    let fingerprint = public_advanced_transaction_payload_fingerprint(1, from, &intent, 10, 2);
+    let authorization = PublicAdvancedTransactionAuthorization {
+        payload_fingerprint: fingerprint,
+        gas_limit: buffered_advanced_gas_limit(50_000, 12_345),
+    };
+
+    assert_eq!(authorization.gas_limit, 62_345);
+    assert_eq!(
+        public_send_authorized_gas_limit(
+            1,
+            from,
+            &intent,
+            Some(authorization),
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 10,
+                max_priority_fee_per_gas: 2,
+            },
+        )
+        .expect("matching authorization"),
+        Some(62_345)
+    );
+    assert!(ensure_advanced_gas_estimate_authorized(62_345, 62_345).is_ok());
+    assert!(ensure_advanced_gas_estimate_authorized(62_346, 62_345).is_err());
+
+    let changed_intent = PublicTransactionIntent::Raw {
+        to: Some(to),
+        value: U256::from(8_u64),
+        data: Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]),
+    };
+    let stale = public_send_authorized_gas_limit(
+        1,
+        from,
+        &changed_intent,
+        Some(authorization),
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 2,
+        },
+    )
+    .expect_err("changed payload must invalidate authorization");
+    assert!(stale.to_string().contains("changed after gas estimation"));
+
+    let authorized_fee = PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 10,
+        max_priority_fee_per_gas: 2,
+    };
+    assert!(
+        ensure_public_action_command_gas_fee_authorized(Some(authorized_fee), authorized_fee)
+            .is_ok()
+    );
+    assert!(
+        ensure_public_action_command_gas_fee_authorized(
+            Some(authorized_fee),
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 11,
+                max_priority_fee_per_gas: 2,
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn advanced_native_balance_exposure_includes_value_and_authorized_gas() {
+    assert_eq!(
+        public_action_native_exposure(U256::from(7_u64), 50_000, 10),
+        U256::from(500_007_u64)
+    );
+}
+
+#[test]
+fn transaction_receipt_output_omits_absent_contract_address() {
+    let transfer = crate::TxReceiptOutput {
+        tx_hash: "0x01".to_string(),
+        status: true,
+        block_number: 1,
+        gas_used: 21_000,
+        contract_address: None,
+    };
+    let transfer_json = serde_json::to_value(&transfer).expect("serialize transfer receipt");
+    assert!(transfer_json.get("contract_address").is_none());
+
+    let creation = crate::TxReceiptOutput {
+        contract_address: Some("0x2222222222222222222222222222222222222222".to_string()),
+        ..transfer
+    };
+    let creation_json = serde_json::to_value(&creation).expect("serialize creation receipt");
+    assert_eq!(
+        creation_json["contract_address"],
+        "0x2222222222222222222222222222222222222222"
     );
 }
 
@@ -885,10 +1095,13 @@ fn public_action_eip1559_request_sets_fee_caps_and_nonce() {
     let base = public_send_transaction_request(
         1,
         from,
-        PublicAssetId::Native,
-        U256::from(5_u64),
-        recipient,
-    );
+        &PublicTransactionIntent::Transfer {
+            asset: PublicAssetId::Native,
+            amount: U256::from(5_u64),
+            recipient,
+        },
+    )
+    .expect("native transfer request");
 
     let tx = public_action_eip1559_transaction_request(base, 1, from, 42, 3, 9);
 
@@ -999,9 +1212,12 @@ fn public_actions_reject_zero_amount_before_signing() {
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: "unused".to_string(),
-            asset: PublicAssetId::Native,
-            amount: U256::ZERO,
-            recipient,
+            intent: PublicTransactionIntent::Transfer {
+                asset: PublicAssetId::Native,
+                amount: U256::ZERO,
+                recipient,
+            },
+            advanced_authorization: None,
             gas_fee: PublicActionGasFeeSelection::Auto,
             command_rx: None,
             event_tx: None,

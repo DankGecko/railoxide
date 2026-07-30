@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256, keccak256};
 use gpui::{
-    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
@@ -23,9 +23,12 @@ use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     PublicActionCommand, PublicActionCommandKind, PublicActionCommandSender,
     PublicActionGasFeeSelection, PublicActionKind, PublicActionProgressStatus,
-    PublicActionProgressStep, PublicActionProgressUpdate, PublicActionSessionEvent, PublicAssetId,
-    PublicBalanceEntry, PublicSendRequest, PublicShieldRequest, RAILGUN_PROTOCOL_FEE_BPS,
-    estimate_public_action_gas_cost, estimate_public_native_action_gas_reserve,
+    PublicActionProgressStep, PublicActionProgressUpdate, PublicActionSessionEvent,
+    PublicAdvancedTransactionAuthorization, PublicAdvancedTransactionEstimate,
+    PublicAdvancedTransactionEstimateRequest, PublicAssetId, PublicBalanceAmount,
+    PublicBalanceEntry, PublicSendRequest, PublicShieldRequest, PublicTransactionIntent,
+    RAILGUN_PROTOCOL_FEE_BPS, estimate_public_action_gas_cost,
+    estimate_public_advanced_transaction, estimate_public_native_action_gas_reserve,
     format_protocol_fee_percentage, parse_send_amount, public_action_replacement_bumped_fee,
     public_shield_protocol_fee_amount, quote_public_action_gas_fee,
     submit_public_send_with_progress, submit_public_shield_with_progress,
@@ -46,11 +49,11 @@ use super::spend_authorization::{
 use super::utxo::short_hash;
 use super::{
     PUBLIC_ACTION_DIALOG_WIDTH, WalletRoot, app_step_row, app_stepper_container,
-    dialog_content_max_height, dialog_max_height, format_native_token_amount_for_display,
-    format_report_chain, format_send_amount_input, format_token_amount_for_display,
-    native_token_display_label, parse_address, public_asset_decimals, public_asset_label,
-    public_balance_amount_label, scrollable_dialog_content, secondary_dialog_content_width,
-    token_label_row,
+    copyable_mono_field, dialog_content_max_height, dialog_max_height,
+    format_native_token_amount_for_display, format_report_chain, format_send_amount_input,
+    format_token_amount_for_display, labeled_field, native_token_display_label, parse_address,
+    public_asset_decimals, public_asset_label, public_balance_amount_label,
+    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};

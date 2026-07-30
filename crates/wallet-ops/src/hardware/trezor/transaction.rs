@@ -306,6 +306,38 @@ fn u128_to_trezor(value: u128) -> Vec<u8> {
     bytes[value.leading_zeros() as usize / 8..].to_vec()
 }
 
+#[cfg(test)]
+mod tests {
+    use alloy::consensus::TxEip1559;
+    use alloy::primitives::{Bytes, TxKind, U256};
+
+    use super::{TrezorSignRequest, trezor_sign_request};
+
+    #[test]
+    fn trezor_request_preserves_contract_creation_and_input() {
+        let input = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00]);
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 2,
+            gas_limit: 100_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 2,
+            to: TxKind::Create,
+            value: U256::from(7_u64),
+            input: input.clone(),
+            ..Default::default()
+        };
+
+        let request = trezor_sign_request(&tx).expect("Trezor creation request");
+        let TrezorSignRequest::Eip1559(request) = request else {
+            panic!("expected EIP-1559 request")
+        };
+        assert!(request.to.is_empty());
+        assert_eq!(request.data, input);
+        assert_eq!(request.value, vec![7]);
+    }
+}
+
 fn u256_to_trezor(value: U256) -> Vec<u8> {
     let bytes = value.to_be_bytes::<32>();
     bytes[value.leading_zeros() / 8..].to_vec()

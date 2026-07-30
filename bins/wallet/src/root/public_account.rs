@@ -66,7 +66,7 @@ pub(super) use qr::{public_address_qr_payload, render_public_address_qr_dialog_c
 pub(super) use types::PublicAccountFormState;
 
 use super::dialogs::PublicAccountDialogKind;
-use super::public_action::PublicActionMode;
+use super::public_action::{PublicActionMode, PublicSendKind};
 use super::public_balances::{
     public_asset_icon_path, public_balance_amount_label, public_balance_usd_label,
 };
@@ -313,6 +313,10 @@ impl WalletRoot {
         self.public_form.selected_account_uuid = None;
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
+        self.public_form.public_send_kind = PublicSendKind::Transfer;
+        self.public_form.advanced_send_estimate = None;
+        self.public_form.advanced_send_estimate_invalidated = false;
+        self.invalidate_advanced_public_send_estimate();
         self.clear_public_action_progress_state();
         self.public_form.next_derived_index = None;
         self.public_form.next_account_label_number = 1;
@@ -347,6 +351,9 @@ impl WalletRoot {
             &self.public_form.edit_label_input,
             &self.public_form.send_recipient_input,
             &self.public_form.send_amount_input,
+            &self.public_form.advanced_send_to_input,
+            &self.public_form.advanced_send_value_input,
+            &self.public_form.advanced_send_data_input,
             &self.public_form.shield_amount_input,
             &self.walletconnect.uri_input,
         ] {
@@ -354,6 +361,10 @@ impl WalletRoot {
         }
         self.public_form.import_global = false;
         self.public_form.action_mode = PublicActionMode::Shield;
+        self.public_form.public_send_kind = PublicSendKind::Transfer;
+        self.public_form.advanced_send_estimate = None;
+        self.public_form.advanced_send_estimate_invalidated = false;
+        self.invalidate_advanced_public_send_estimate();
     }
 
     pub(super) fn clear_public_account_dialog_inputs(
@@ -505,6 +516,10 @@ impl WalletRoot {
     ) {
         self.public_form.selected_account_uuid = Some(public_account_uuid);
         self.public_form.selected_asset = Some(asset);
+        self.public_form.public_send_kind = PublicSendKind::Transfer;
+        self.public_form.advanced_send_estimate = None;
+        self.public_form.advanced_send_estimate_invalidated = false;
+        self.invalidate_advanced_public_send_estimate();
         self.public_form.pending_global_delete_uuid = None;
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
