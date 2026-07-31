@@ -637,8 +637,8 @@ pub(super) async fn self_broadcast_provider_fee_sample(
     let url = crate::http::redact_url_for_display(&provider_handle.url);
     let rpc_gas_price = match gas_price {
         Ok(Ok(value)) => Some(value),
-        Ok(Err(error)) => {
-            tracing::warn!(%url, %error, "self-broadcast eth_gasPrice failed");
+        Ok(Err(_)) => {
+            tracing::warn!(%url, "self-broadcast eth_gasPrice failed");
             None
         }
         Err(_) => {
@@ -648,8 +648,8 @@ pub(super) async fn self_broadcast_provider_fee_sample(
     };
     let max_priority_fee_per_gas = match max_priority_fee {
         Ok(Ok(value)) => Some(value),
-        Ok(Err(error)) => {
-            tracing::debug!(%url, %error, "self-broadcast eth_maxPriorityFeePerGas failed");
+        Ok(Err(_)) => {
+            tracing::debug!(%url, "self-broadcast eth_maxPriorityFeePerGas failed");
             None
         }
         Err(_) => {
@@ -659,8 +659,8 @@ pub(super) async fn self_broadcast_provider_fee_sample(
     };
     let fee_history = match fee_history {
         Ok(Ok(value)) => Some(value),
-        Ok(Err(error)) => {
-            tracing::debug!(%url, %error, "self-broadcast eth_feeHistory failed");
+        Ok(Err(_)) => {
+            tracing::debug!(%url, "self-broadcast eth_feeHistory failed");
             None
         }
         Err(_) => {
