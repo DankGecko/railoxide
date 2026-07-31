@@ -314,21 +314,13 @@ pub(in crate::root) fn private_action_segment_button_with_accessory(
     if selected { button.primary() } else { button }
 }
 
-pub(in crate::root) fn render_self_broadcast_privacy_icon(
-    id: SharedString,
-    selected: bool,
-) -> gpui::AnyElement {
-    let color = if selected {
-        theme::PRIMARY_FOREGROUND
-    } else {
-        theme::WARNING
-    };
+pub(in crate::root) fn render_self_broadcast_privacy_icon(id: SharedString) -> gpui::AnyElement {
     Button::new(id)
         .text()
         .xsmall()
         .compact()
         .icon(IconName::TriangleAlert)
-        .text_color(rgb(color))
+        .text_color(rgb(theme::WARNING))
         .tooltip(SELF_BROADCAST_PRIVACY_WARNING)
         .into_any_element()
 }

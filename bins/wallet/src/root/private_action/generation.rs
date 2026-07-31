@@ -6,6 +6,37 @@ const SOFTWARE_SELF_BROADCAST_GAS_PAYER_PASSWORD_REQUIRED: &str = concat!(
     "password. Choose a hardware Public account, manual calldata, or public broadcaster delivery."
 );
 
+pub(in crate::root) fn sponsored_authorization_display(
+    chain_id: u64,
+    limit: SponsoredAuthorizationLimit,
+    token_registry: &EffectiveTokenRegistry,
+    anchor_cache: &TokenAnchorRateCache,
+) -> SponsoredAuthorizationDisplay {
+    let maximum_payment = limit
+        .maximum_payment()
+        .expect("sponsored authorization limit was validated when quoted");
+    let amount_label = |amount| {
+        let token_value = format_token_amount_ceiling_for_display(
+            chain_id,
+            limit.wrapped_native_token,
+            amount,
+            Some(token_registry),
+        );
+        let usd_value = anchor_cache
+            .cached_token_usd_micro_value(chain_id, limit.wrapped_native_token, amount)
+            .map(format_usd_micro_value);
+        format!(
+            "Up to {}",
+            public_action_fee_value_label(&token_value, usd_value)
+        )
+    };
+    SponsoredAuthorizationDisplay {
+        gross_wrapped_native_spend: amount_label(maximum_payment.gross_wrapped_native_spend),
+        max_fee_per_gas: format!("{} gwei", format_gwei(limit.max_fee_per_gas)),
+        max_priority_fee_per_gas: format!("{} gwei", format_gwei(limit.max_priority_fee_per_gas)),
+    }
+}
+
 impl WalletRoot {
     pub(in crate::root) fn generate_send_calldata_from_form(
         &mut self,
@@ -22,9 +53,12 @@ impl WalletRoot {
                 draft.self_broadcast_gas_payer_source,
             );
         let intent = if requires_gas_payer_password {
-            SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(key)
+            SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(
+                key,
+                draft.sponsored_authorization_limit,
+            )
         } else {
-            SpendAuthorizationIntent::PrivateSend(key)
+            SpendAuthorizationIntent::PrivateSend(key, draft.sponsored_authorization_limit)
         };
         let summary = if requires_gas_payer_password {
             private_send_gas_payer_authorization_summary(&draft)
@@ -54,6 +88,29 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
+        let self_broadcast_funding = effective_self_broadcast_funding_mode(
+            self.effective_chain_configs.get(&asset.chain_id),
+            form.self_broadcast_funding,
+        );
+        let sponsored_incentive = if delivery_mode == DeliveryMode::SelfBroadcast
+            && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship
+        {
+            match sponsored_incentive_from_text(
+                form.sponsored_incentive,
+                form.sponsored_custom_incentive_input
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+            ) {
+                Ok(incentive) => incentive,
+                Err(error) => {
+                    self.set_send_form_error(key, error.to_string(), cx);
+                    return None;
+                }
+            }
+        } else {
+            form.sponsored_incentive
+        };
         let self_broadcast_gas_payer_uuid = form.self_broadcast_gas_payer_uuid.clone();
         let self_broadcast_gas_fee = if delivery_mode == DeliveryMode::SelfBroadcast {
             match form.self_broadcast_gas_fee.selection(cx) {
@@ -82,6 +139,15 @@ impl WalletRoot {
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         let favorites_only_broadcasters = form.favorites_only_broadcasters;
+        if delivery_mode == DeliveryMode::SelfBroadcast
+            && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship
+            && let Some(reason) = sponsored_self_broadcast_availability_reason(
+                self.effective_chain_configs.get(&asset.chain_id),
+            )
+        {
+            self.set_send_form_error(key, reason, cx);
+            return None;
+        }
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_send_form_error(key, "Unlock the wallet vault before sending", cx);
@@ -111,10 +177,13 @@ impl WalletRoot {
         }
 
         let recipient_raw = recipient_input.read(cx).value().to_string();
-        if let Err(error) = parse_railgun_recipient(recipient_raw.as_str()) {
-            self.set_send_form_error(key, error.to_string(), cx);
-            return None;
-        }
+        let recipient_data = match parse_railgun_recipient(recipient_raw.as_str()) {
+            Ok(recipient) => recipient,
+            Err(error) => {
+                self.set_send_form_error(key, error.to_string(), cx);
+                return None;
+            }
+        };
         let recipient = recipient_raw.trim().to_string();
         let amount_raw = amount_input.read(cx).value().to_string();
         let amount = match parse_send_amount(amount_raw.as_str(), asset.decimals) {
@@ -144,14 +213,15 @@ impl WalletRoot {
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
             self_broadcast_gas_payer_source,
+            self_broadcast_gas_payer_address,
         ) = if delivery_mode == DeliveryMode::SelfBroadcast {
             let Some(uuid) = self_broadcast_gas_payer_uuid else {
-                self.set_send_form_error(key, "Choose a Public account to pay gas", cx);
+                self.set_send_form_error(key, "Choose a Public transaction signer", cx);
                 return None;
             };
             let Some(account) = self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
             else {
-                self.set_send_form_error(key, "Choose an active Public account to pay gas", cx);
+                self.set_send_form_error(key, "Choose an active Public transaction signer", cx);
                 return None;
             };
             let gas_payer_display = public_account_display_label(account).map_or_else(
@@ -162,10 +232,57 @@ impl WalletRoot {
                 Some(uuid.to_string()),
                 Some(gas_payer_display),
                 Some(account.source),
+                Some(account.address),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
+
+        let sponsored_authorization_limit = if self_broadcast_funding
+            == SelfBroadcastFundingMode::PrivateSponsorship
+        {
+            let Some(effective_chain) = self.effective_chain_configs.get(&asset.chain_id) else {
+                self.set_send_form_error(key, "Selected chain settings are unavailable", cx);
+                return None;
+            };
+            let Some((max_fee_per_gas, max_priority_fee_per_gas)) = self_broadcast_initial_gas_fee
+            else {
+                self.set_send_form_error(
+                    key,
+                    "Refresh self-broadcast gas fees before authorizing sponsorship",
+                    cx,
+                );
+                return None;
+            };
+            match quote_sponsored_send_authorization_limit(
+                asset.chain_id,
+                effective_chain,
+                &session.unspent_utxos(),
+                asset.token,
+                amount,
+                &recipient_data,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                sponsored_incentive,
+                self_broadcast_gas_payer_address.expect("self-broadcast signer was validated"),
+            ) {
+                Ok(limit) => Some(limit),
+                Err(error) => {
+                    self.set_send_form_error(key, error.to_string(), cx);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let sponsored_authorization_display = sponsored_authorization_limit.map(|limit| {
+            sponsored_authorization_display(
+                asset.chain_id,
+                limit,
+                &self.effective_token_registry,
+                &self.public_broadcaster_anchor_cache,
+            )
+        });
 
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
@@ -205,6 +322,10 @@ impl WalletRoot {
             cost_estimate,
             fee_token,
             self_broadcast_gas_fee,
+            self_broadcast_funding,
+            sponsored_incentive,
+            sponsored_authorization_limit,
+            sponsored_authorization_display,
             self_broadcast_initial_gas_fee,
             fee_mode,
             view_session,
@@ -225,6 +346,7 @@ impl WalletRoot {
         &mut self,
         key: UnshieldAssetKey,
         spend_authorization: DesktopPrivateSpendAuthorization,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -232,6 +354,7 @@ impl WalletRoot {
             key,
             spend_authorization,
             None,
+            authorization_limit,
             window,
             cx,
         );
@@ -242,12 +365,14 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         spend_authorization: DesktopPrivateSpendAuthorization,
         gas_payer_password: Option<Zeroizing<String>>,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(draft) = self.send_spend_draft(key, cx) else {
+        let Some(mut draft) = self.send_spend_draft(key, cx) else {
             return;
         };
+        draft.sponsored_authorization_limit = authorization_limit;
         let SendSpendDraft {
             asset,
             delivery_mode,
@@ -255,6 +380,10 @@ impl WalletRoot {
             cost_estimate,
             fee_token,
             self_broadcast_gas_fee,
+            self_broadcast_funding,
+            sponsored_incentive,
+            sponsored_authorization_limit,
+            sponsored_authorization_display: _,
             self_broadcast_initial_gas_fee,
             fee_mode,
             view_session,
@@ -270,6 +399,13 @@ impl WalletRoot {
             favorites_only_broadcasters,
         } = draft;
 
+        let self_broadcast_gas_fee =
+            sponsored_authorization_limit.map_or(self_broadcast_gas_fee, |limit| {
+                SelfBroadcastGasFeeSelection::Custom {
+                    max_fee_per_gas: limit.max_fee_per_gas,
+                    max_priority_fee_per_gas: limit.max_priority_fee_per_gas,
+                }
+            });
         let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
             if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
                 None
@@ -297,8 +433,16 @@ impl WalletRoot {
         self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
         let generation_id = self.send_generation_seq;
         let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
+        let sponsored = delivery_mode == DeliveryMode::SelfBroadcast
+            && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship;
+        let (sponsored_command_tx, sponsored_command_rx) = if sponsored {
+            let (tx, rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let (self_broadcast_command_tx, self_broadcast_command_rx) =
-            if delivery_mode == DeliveryMode::SelfBroadcast {
+            if delivery_mode == DeliveryMode::SelfBroadcast && !sponsored {
                 let (tx, rx) = mpsc::unbounded_channel();
                 (Some(tx), Some(rx))
             } else {
@@ -339,19 +483,39 @@ impl WalletRoot {
                 );
             }
             DeliveryMode::SelfBroadcast => {
-                self.start_private_self_broadcast_progress(
-                    DeliveryFormKind::Send,
-                    key,
-                    generation_id,
-                    asset.label.clone(),
-                    asset.icon_path.clone(),
-                    recipient.clone(),
-                    None,
-                    self_broadcast_gas_payer_display
-                        .expect("self-broadcast gas payer was validated"),
-                    self_broadcast_command_tx,
-                    self_broadcast_initial_gas_fee,
-                );
+                let signer =
+                    self_broadcast_gas_payer_display.expect("self-broadcast signer was validated");
+                if sponsored {
+                    self.start_private_self_broadcast_progress(
+                        DeliveryFormKind::Send,
+                        key,
+                        generation_id,
+                        asset.label.clone(),
+                        asset.icon_path.clone(),
+                        recipient.clone(),
+                        None,
+                        signer,
+                        None,
+                        None,
+                    );
+                    if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+                        progress.sponsored_funding = true;
+                        progress.sponsored_self_broadcast_command_tx = sponsored_command_tx;
+                    }
+                } else {
+                    self.start_private_self_broadcast_progress(
+                        DeliveryFormKind::Send,
+                        key,
+                        generation_id,
+                        asset.label.clone(),
+                        asset.icon_path.clone(),
+                        recipient.clone(),
+                        None,
+                        signer,
+                        self_broadcast_command_tx,
+                        self_broadcast_initial_gas_fee,
+                    );
+                }
             }
             DeliveryMode::ManualCalldata => {}
         }
@@ -438,32 +602,75 @@ impl WalletRoot {
                     .map(|_| self.trezor_pin_matrix_provider_for_operation(window, cx));
                 #[cfg(not(feature = "hardware"))]
                 let trezor_pin_matrix_provider = None;
-                let request = DesktopSendSelfBroadcastRequest {
-                    chain_id,
-                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
-                    view_session,
-                    session,
-                    vault_store,
-                    spend_authorization,
-                    vault_password: self_broadcast_vault_password,
-                    trezor_pin_matrix_provider,
-                    public_account_uuid: self_broadcast_public_account_uuid
-                        .expect("self-broadcast gas payer was validated"),
-                    token,
-                    fee_token,
-                    amount,
-                    recipient,
-                    verify_proof: true,
-                    gas_fee: self_broadcast_gas_fee,
-                    progress_tx: Some(progress_tx),
-                    command_rx: self_broadcast_command_rx,
-                    event_tx: self_broadcast_event_tx,
-                };
-                self.runtime.spawn(async move {
-                    submit_desktop_send_self_broadcast(request, &http)
-                        .await
-                        .map(|result| SendResult::SelfBroadcast(Box::new(result)))
-                })
+                let public_account_uuid = self_broadcast_public_account_uuid
+                    .expect("self-broadcast signer was validated");
+                if sponsored {
+                    let Some(effective_chain) =
+                        self.effective_chain_configs.get(&chain_id).cloned()
+                    else {
+                        self.set_send_form_error(
+                            key,
+                            "Selected chain settings are unavailable",
+                            cx,
+                        );
+                        self.clear_private_broadcaster_progress_state();
+                        return;
+                    };
+                    let request = DesktopSponsoredSendSelfBroadcastRequest {
+                        chain_id,
+                        effective_chain,
+                        view_session,
+                        session,
+                        vault_store,
+                        spend_authorization,
+                        vault_password: self_broadcast_vault_password,
+                        trezor_pin_matrix_provider,
+                        public_account_uuid,
+                        token,
+                        amount,
+                        recipient,
+                        verify_proof: true,
+                        gas_fee: self_broadcast_gas_fee,
+                        incentive: sponsored_incentive,
+                        authorization_limit: sponsored_authorization_limit
+                            .expect("sponsored authorization limit was created"),
+                        progress_tx: Some(progress_tx),
+                        command_rx: sponsored_command_rx
+                            .expect("sponsored command receiver was created"),
+                        event_tx: self_broadcast_event_tx,
+                    };
+                    self.runtime.spawn(async move {
+                        submit_desktop_sponsored_send_self_broadcast(request, &http)
+                            .await
+                            .map(|result| SendResult::Sponsored(Box::new(result)))
+                    })
+                } else {
+                    let request = DesktopSendSelfBroadcastRequest {
+                        chain_id,
+                        effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                        view_session,
+                        session,
+                        vault_store,
+                        spend_authorization,
+                        vault_password: self_broadcast_vault_password,
+                        trezor_pin_matrix_provider,
+                        public_account_uuid,
+                        token,
+                        fee_token,
+                        amount,
+                        recipient,
+                        verify_proof: true,
+                        gas_fee: self_broadcast_gas_fee,
+                        progress_tx: Some(progress_tx),
+                        command_rx: self_broadcast_command_rx,
+                        event_tx: self_broadcast_event_tx,
+                    };
+                    self.runtime.spawn(async move {
+                        submit_desktop_send_self_broadcast(request, &http)
+                            .await
+                            .map(|result| SendResult::SelfBroadcast(Box::new(result)))
+                    })
+                }
             }
         };
         if delivery_mode != DeliveryMode::ManualCalldata {
@@ -494,6 +701,7 @@ impl WalletRoot {
             let _ = this.update(cx, |root, cx| {
                 let mut progress_result = None;
                 let mut self_broadcast_progress_result = None;
+                let mut sponsored_progress_outcome = None;
                 let mut progress_error = None;
                 let mut clear_spend_authorization = false;
                 {
@@ -516,6 +724,9 @@ impl WalletRoot {
                                 form.self_broadcast_estimated_native_gas_cost =
                                     Some(result.estimated_native_gas_cost);
                                 self_broadcast_progress_result = Some((**result).clone());
+                            }
+                            if let SendResult::Sponsored(result) = &result {
+                                sponsored_progress_outcome = Some(result.outcome.clone());
                             }
                             form.error = None;
                             form.result = Some(result);
@@ -557,6 +768,16 @@ impl WalletRoot {
                         generation_id,
                         final_stage,
                         result,
+                        cx,
+                    );
+                }
+                if let Some(outcome) = sponsored_progress_outcome {
+                    root.finish_private_sponsored_self_broadcast_progress(
+                        DeliveryFormKind::Send,
+                        key,
+                        generation_id,
+                        final_stage,
+                        outcome,
                         cx,
                     );
                 }
@@ -648,9 +869,12 @@ impl WalletRoot {
                 draft.self_broadcast_gas_payer_source,
             );
         let intent = if requires_gas_payer_password {
-            SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(key)
+            SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(
+                key,
+                draft.sponsored_authorization_limit,
+            )
         } else {
-            SpendAuthorizationIntent::PrivateUnshield(key)
+            SpendAuthorizationIntent::PrivateUnshield(key, draft.sponsored_authorization_limit)
         };
         let summary = if requires_gas_payer_password {
             private_unshield_gas_payer_authorization_summary(&draft)
@@ -682,6 +906,29 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
+        let self_broadcast_funding = effective_self_broadcast_funding_mode(
+            self.effective_chain_configs.get(&asset.chain_id),
+            form.self_broadcast_funding,
+        );
+        let sponsored_incentive = if delivery_mode == DeliveryMode::SelfBroadcast
+            && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship
+        {
+            match sponsored_incentive_from_text(
+                form.sponsored_incentive,
+                form.sponsored_custom_incentive_input
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+            ) {
+                Ok(incentive) => incentive,
+                Err(error) => {
+                    self.set_unshield_form_error(key, error.to_string(), cx);
+                    return None;
+                }
+            }
+        } else {
+            form.sponsored_incentive
+        };
         let self_broadcast_gas_payer_uuid = form.self_broadcast_gas_payer_uuid.clone();
         let self_broadcast_gas_fee = if delivery_mode == DeliveryMode::SelfBroadcast {
             match form.self_broadcast_gas_fee.selection(cx) {
@@ -710,6 +957,15 @@ impl WalletRoot {
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         let favorites_only_broadcasters = form.favorites_only_broadcasters;
+        if delivery_mode == DeliveryMode::SelfBroadcast
+            && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship
+            && let Some(reason) = sponsored_self_broadcast_availability_reason(
+                self.effective_chain_configs.get(&asset.chain_id),
+            )
+        {
+            self.set_unshield_form_error(key, reason, cx);
+            return None;
+        }
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_unshield_form_error(key, "Unlock the wallet vault before unshielding", cx);
@@ -775,14 +1031,15 @@ impl WalletRoot {
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
             self_broadcast_gas_payer_source,
+            self_broadcast_gas_payer_address,
         ) = if delivery_mode == DeliveryMode::SelfBroadcast {
             let Some(uuid) = self_broadcast_gas_payer_uuid else {
-                self.set_unshield_form_error(key, "Choose a Public account to pay gas", cx);
+                self.set_unshield_form_error(key, "Choose a Public transaction signer", cx);
                 return None;
             };
             let Some(account) = self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
             else {
-                self.set_unshield_form_error(key, "Choose an active Public account to pay gas", cx);
+                self.set_unshield_form_error(key, "Choose an active Public transaction signer", cx);
                 return None;
             };
             let gas_payer_display = public_account_display_label(account).map_or_else(
@@ -793,10 +1050,60 @@ impl WalletRoot {
                 Some(uuid.to_string()),
                 Some(gas_payer_display),
                 Some(account.source),
+                Some(account.address),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
+
+        let sponsored_authorization_limit = if self_broadcast_funding
+            == SelfBroadcastFundingMode::PrivateSponsorship
+        {
+            let Some(effective_chain) = self.effective_chain_configs.get(&asset.chain_id) else {
+                self.set_unshield_form_error(key, "Selected chain settings are unavailable", cx);
+                return None;
+            };
+            let Some((max_fee_per_gas, max_priority_fee_per_gas)) = self_broadcast_initial_gas_fee
+            else {
+                self.set_unshield_form_error(
+                    key,
+                    "Refresh self-broadcast gas fees before authorizing sponsorship",
+                    cx,
+                );
+                return None;
+            };
+            match quote_sponsored_unshield_authorization_limit(
+                asset.chain_id,
+                effective_chain,
+                &session.unspent_utxos(),
+                asset.token,
+                amount,
+                fee_mode,
+                recipient,
+                unwrap,
+                native_top_up.as_ref(),
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                sponsored_incentive,
+                self_broadcast_gas_payer_address.expect("self-broadcast signer was validated"),
+            ) {
+                Ok(limit) => Some(limit),
+                Err(error) => {
+                    self.set_unshield_form_error(key, error.to_string(), cx);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let sponsored_authorization_display = sponsored_authorization_limit.map(|limit| {
+            sponsored_authorization_display(
+                asset.chain_id,
+                limit,
+                &self.effective_token_registry,
+                &self.public_broadcaster_anchor_cache,
+            )
+        });
 
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
@@ -837,6 +1144,10 @@ impl WalletRoot {
             cost_estimate,
             fee_token,
             self_broadcast_gas_fee,
+            self_broadcast_funding,
+            sponsored_incentive,
+            sponsored_authorization_limit,
+            sponsored_authorization_display,
             self_broadcast_initial_gas_fee,
             fee_mode,
             view_session,
@@ -858,6 +1169,7 @@ impl WalletRoot {
         &mut self,
         key: UnshieldAssetKey,
         spend_authorization: DesktopPrivateSpendAuthorization,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -865,6 +1177,7 @@ impl WalletRoot {
             key,
             spend_authorization,
             None,
+            authorization_limit,
             window,
             cx,
         );
@@ -875,12 +1188,14 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         spend_authorization: DesktopPrivateSpendAuthorization,
         gas_payer_password: Option<Zeroizing<String>>,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(draft) = self.unshield_spend_draft(key, cx) else {
+        let Some(mut draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
+        draft.sponsored_authorization_limit = authorization_limit;
         let UnshieldSpendDraft {
             asset,
             unwrap,
@@ -889,6 +1204,10 @@ impl WalletRoot {
             cost_estimate,
             fee_token,
             self_broadcast_gas_fee,
+            self_broadcast_funding,
+            sponsored_incentive,
+            sponsored_authorization_limit,
+            sponsored_authorization_display: _,
             self_broadcast_initial_gas_fee,
             fee_mode,
             view_session,
@@ -906,6 +1225,13 @@ impl WalletRoot {
         } = draft;
         let native_top_up_request = native_top_up_request_from_plan(native_top_up.as_ref());
 
+        let self_broadcast_gas_fee =
+            sponsored_authorization_limit.map_or(self_broadcast_gas_fee, |limit| {
+                SelfBroadcastGasFeeSelection::Custom {
+                    max_fee_per_gas: limit.max_fee_per_gas,
+                    max_priority_fee_per_gas: limit.max_priority_fee_per_gas,
+                }
+            });
         let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
             if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
                 None
@@ -933,8 +1259,16 @@ impl WalletRoot {
         self.unshield_generation_seq = self.unshield_generation_seq.wrapping_add(1);
         let generation_id = self.unshield_generation_seq;
         let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
+        let sponsored = delivery_mode == DeliveryMode::SelfBroadcast
+            && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship;
+        let (sponsored_command_tx, sponsored_command_rx) = if sponsored {
+            let (tx, rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let (self_broadcast_command_tx, self_broadcast_command_rx) =
-            if delivery_mode == DeliveryMode::SelfBroadcast {
+            if delivery_mode == DeliveryMode::SelfBroadcast && !sponsored {
                 let (tx, rx) = mpsc::unbounded_channel();
                 (Some(tx), Some(rx))
             } else {
@@ -986,19 +1320,39 @@ impl WalletRoot {
                 );
             }
             DeliveryMode::SelfBroadcast => {
-                self.start_private_self_broadcast_progress(
-                    DeliveryFormKind::Unshield,
-                    key,
-                    generation_id,
-                    asset.label.clone(),
-                    asset.icon_path.clone(),
-                    recipient.to_checksum(None),
-                    recipient_output,
-                    self_broadcast_gas_payer_display
-                        .expect("self-broadcast gas payer was validated"),
-                    self_broadcast_command_tx,
-                    self_broadcast_initial_gas_fee,
-                );
+                let signer =
+                    self_broadcast_gas_payer_display.expect("self-broadcast signer was validated");
+                if sponsored {
+                    self.start_private_self_broadcast_progress(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        generation_id,
+                        asset.label.clone(),
+                        asset.icon_path.clone(),
+                        recipient.to_checksum(None),
+                        recipient_output,
+                        signer,
+                        None,
+                        None,
+                    );
+                    if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+                        progress.sponsored_funding = true;
+                        progress.sponsored_self_broadcast_command_tx = sponsored_command_tx;
+                    }
+                } else {
+                    self.start_private_self_broadcast_progress(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        generation_id,
+                        asset.label.clone(),
+                        asset.icon_path.clone(),
+                        recipient.to_checksum(None),
+                        recipient_output,
+                        signer,
+                        self_broadcast_command_tx,
+                        self_broadcast_initial_gas_fee,
+                    );
+                }
             }
             DeliveryMode::ManualCalldata => {}
         }
@@ -1090,35 +1444,81 @@ impl WalletRoot {
                     .map(|_| self.trezor_pin_matrix_provider_for_operation(window, cx));
                 #[cfg(not(feature = "hardware"))]
                 let trezor_pin_matrix_provider = None;
-                let request = DesktopUnshieldSelfBroadcastRequest {
-                    chain_id,
-                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
-                    view_session,
-                    session,
-                    vault_store,
-                    spend_authorization,
-                    vault_password: self_broadcast_vault_password,
-                    trezor_pin_matrix_provider,
-                    public_account_uuid: self_broadcast_public_account_uuid
-                        .expect("self-broadcast gas payer was validated"),
-                    token,
-                    fee_token,
-                    amount,
-                    fee_mode,
-                    recipient,
-                    unwrap,
-                    native_top_up: native_top_up_request,
-                    verify_proof: true,
-                    gas_fee: self_broadcast_gas_fee,
-                    progress_tx: Some(progress_tx),
-                    command_rx: self_broadcast_command_rx,
-                    event_tx: self_broadcast_event_tx,
-                };
-                self.runtime.spawn(async move {
-                    submit_desktop_unshield_self_broadcast(request, &http)
-                        .await
-                        .map(|result| UnshieldResult::SelfBroadcast(Box::new(result)))
-                })
+                let public_account_uuid = self_broadcast_public_account_uuid
+                    .expect("self-broadcast signer was validated");
+                if sponsored {
+                    let Some(effective_chain) =
+                        self.effective_chain_configs.get(&chain_id).cloned()
+                    else {
+                        self.set_unshield_form_error(
+                            key,
+                            "Selected chain settings are unavailable",
+                            cx,
+                        );
+                        self.clear_private_broadcaster_progress_state();
+                        return;
+                    };
+                    let request = DesktopSponsoredUnshieldSelfBroadcastRequest {
+                        chain_id,
+                        effective_chain,
+                        view_session,
+                        session,
+                        vault_store,
+                        spend_authorization,
+                        vault_password: self_broadcast_vault_password,
+                        trezor_pin_matrix_provider,
+                        public_account_uuid,
+                        token,
+                        amount,
+                        fee_mode,
+                        recipient,
+                        unwrap,
+                        native_top_up: native_top_up_request,
+                        verify_proof: true,
+                        gas_fee: self_broadcast_gas_fee,
+                        incentive: sponsored_incentive,
+                        authorization_limit: sponsored_authorization_limit
+                            .expect("sponsored authorization limit was created"),
+                        progress_tx: Some(progress_tx),
+                        command_rx: sponsored_command_rx
+                            .expect("sponsored command receiver was created"),
+                        event_tx: self_broadcast_event_tx,
+                    };
+                    self.runtime.spawn(async move {
+                        submit_desktop_sponsored_unshield_self_broadcast(request, &http)
+                            .await
+                            .map(|result| UnshieldResult::Sponsored(Box::new(result)))
+                    })
+                } else {
+                    let request = DesktopUnshieldSelfBroadcastRequest {
+                        chain_id,
+                        effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                        view_session,
+                        session,
+                        vault_store,
+                        spend_authorization,
+                        vault_password: self_broadcast_vault_password,
+                        trezor_pin_matrix_provider,
+                        public_account_uuid,
+                        token,
+                        fee_token,
+                        amount,
+                        fee_mode,
+                        recipient,
+                        unwrap,
+                        native_top_up: native_top_up_request,
+                        verify_proof: true,
+                        gas_fee: self_broadcast_gas_fee,
+                        progress_tx: Some(progress_tx),
+                        command_rx: self_broadcast_command_rx,
+                        event_tx: self_broadcast_event_tx,
+                    };
+                    self.runtime.spawn(async move {
+                        submit_desktop_unshield_self_broadcast(request, &http)
+                            .await
+                            .map(|result| UnshieldResult::SelfBroadcast(Box::new(result)))
+                    })
+                }
             }
         };
         if delivery_mode != DeliveryMode::ManualCalldata {
@@ -1149,6 +1549,7 @@ impl WalletRoot {
             let _ = this.update(cx, |root, cx| {
                 let mut progress_result = None;
                 let mut self_broadcast_progress_result = None;
+                let mut sponsored_progress_outcome = None;
                 let mut progress_error = None;
                 let mut clear_spend_authorization = false;
                 let mut refresh_public_balances = false;
@@ -1179,6 +1580,16 @@ impl WalletRoot {
                                 UnshieldResult::SelfBroadcast(result) if result.tx.status => {
                                     affects_visible_public_account
                                 }
+                                UnshieldResult::Sponsored(result)
+                                    if matches!(
+                                        result.outcome,
+                                        SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(
+                                            ref receipt
+                                        ) if receipt.status
+                                    ) =>
+                                {
+                                    affects_visible_public_account
+                                }
                                 _ => false,
                             };
                             if let UnshieldResult::PublicBroadcaster(result) = &result {
@@ -1188,6 +1599,9 @@ impl WalletRoot {
                                 form.self_broadcast_estimated_native_gas_cost =
                                     Some(result.estimated_native_gas_cost);
                                 self_broadcast_progress_result = Some((**result).clone());
+                            }
+                            if let UnshieldResult::Sponsored(result) = &result {
+                                sponsored_progress_outcome = Some(result.outcome.clone());
                             }
                             form.error = None;
                             form.result = Some(result);
@@ -1232,6 +1646,16 @@ impl WalletRoot {
                         generation_id,
                         final_stage,
                         result,
+                        cx,
+                    );
+                }
+                if let Some(outcome) = sponsored_progress_outcome {
+                    root.finish_private_sponsored_self_broadcast_progress(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        generation_id,
+                        final_stage,
+                        outcome,
                         cx,
                     );
                 }

@@ -32,7 +32,9 @@ use wallet_ops::hardware::{
 use wallet_ops::vault::{
     DesktopVaultStore, DesktopViewSession, HardwareProfileSession, VaultError,
 };
-use wallet_ops::{BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization};
+use wallet_ops::{
+    BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization, SponsoredAuthorizationLimit,
+};
 use zeroize::Zeroizing;
 
 use crate::assets::WalletIconSource;
@@ -111,10 +113,10 @@ impl SpendAuthorizationCache {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationIntent {
-    PrivateSend(UnshieldAssetKey),
-    PrivateSendSelfBroadcastGasPassword(UnshieldAssetKey),
-    PrivateUnshield(UnshieldAssetKey),
-    PrivateUnshieldSelfBroadcastGasPassword(UnshieldAssetKey),
+    PrivateSend(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
+    PrivateSendSelfBroadcastGasPassword(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
+    PrivateUnshield(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
+    PrivateUnshieldSelfBroadcastGasPassword(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
     BlockedShieldRefund(BlockedShieldRescueUtxoId),
     BlockedShieldRefundGasPassword(BlockedShieldRescueUtxoId),
     PublicSend,
@@ -129,7 +131,7 @@ impl SpendAuthorizationIntent {
     const fn uses_private_wallet(&self) -> bool {
         matches!(
             self,
-            Self::PrivateSend(_) | Self::PrivateUnshield(_) | Self::BlockedShieldRefund(_)
+            Self::PrivateSend(..) | Self::PrivateUnshield(..) | Self::BlockedShieldRefund(_)
         )
     }
 }
@@ -141,10 +143,12 @@ pub(super) enum HardwareSpendAuthorizationCompletion {
     PrivateSendSelfBroadcast {
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
     },
     PrivateUnshieldSelfBroadcast {
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
     },
     BlockedShieldRefund {
         utxo_id: BlockedShieldRescueUtxoId,
@@ -243,6 +247,11 @@ impl SpendAuthorizationSummary {
             .map(|row| (row.label.to_string(), row.value.to_string()))
             .collect()
     }
+
+    #[cfg(test)]
+    pub(in crate::root) fn warnings_for_test(&self) -> Vec<String> {
+        self.warnings.iter().map(ToString::to_string).collect()
+    }
 }
 
 pub(in crate::root) const fn spend_authorization_can_use_cached_password(
@@ -304,6 +313,11 @@ impl SpendAuthorizationSummaryRow {
     pub(super) fn with_icon(mut self, icon_path: Option<WalletIconSource>) -> Self {
         self.icon_path = icon_path;
         self
+    }
+
+    #[cfg(test)]
+    pub(in crate::root) fn values_for_test(&self) -> (String, String) {
+        (self.label.to_string(), self.value.to_string())
     }
 }
 
@@ -413,27 +427,31 @@ impl HardwareSpendAuthorizationDialogContent {
                                                     cx,
                                                 );
                                             }
-                                            HardwareSpendAuthorizationCompletion::PrivateSendSelfBroadcast {
-                                                key,
-                                                vault_password,
-                                            } => {
+                                             HardwareSpendAuthorizationCompletion::PrivateSendSelfBroadcast {
+                                                 key,
+                                                 vault_password,
+                                                 authorization_limit,
+                                             } => {
                                                 root.generate_send_calldata_authorized_with_gas_password(
                                                     key,
-                                                    authorization,
-                                                    Some(vault_password),
-                                                    window,
+                                                     authorization,
+                                                     Some(vault_password),
+                                                     authorization_limit,
+                                                     window,
                                                     cx,
                                                 );
                                             }
-                                            HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
-                                                key,
-                                                vault_password,
-                                            } => {
+                                             HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
+                                                 key,
+                                                 vault_password,
+                                                 authorization_limit,
+                                             } => {
                                                 root.generate_unshield_calldata_authorized_with_gas_password(
                                                     key,
-                                                    authorization,
-                                                    Some(vault_password),
-                                                    window,
+                                                     authorization,
+                                                     Some(vault_password),
+                                                     authorization_limit,
+                                                     window,
                                                     cx,
                                                 );
                                             }
@@ -1299,10 +1317,19 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         match intent {
-            SpendAuthorizationIntent::PrivateSend(key) => {
-                self.generate_send_calldata_authorized(key, authorization, window, cx);
+            SpendAuthorizationIntent::PrivateSend(key, authorization_limit) => {
+                self.generate_send_calldata_authorized(
+                    key,
+                    authorization,
+                    authorization_limit,
+                    window,
+                    cx,
+                );
             }
-            SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(key) => {
+            SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(
+                key,
+                authorization_limit,
+            ) => {
                 let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
                 else {
                     self.set_vault_error(
@@ -1312,13 +1339,26 @@ impl WalletRoot {
                     return;
                 };
                 self.request_private_send_hardware_authorization_with_gas_password(
-                    key, password, window, cx,
+                    key,
+                    password,
+                    authorization_limit,
+                    window,
+                    cx,
                 );
             }
-            SpendAuthorizationIntent::PrivateUnshield(key) => {
-                self.generate_unshield_calldata_authorized(key, authorization, window, cx);
+            SpendAuthorizationIntent::PrivateUnshield(key, authorization_limit) => {
+                self.generate_unshield_calldata_authorized(
+                    key,
+                    authorization,
+                    authorization_limit,
+                    window,
+                    cx,
+                );
             }
-            SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(key) => {
+            SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(
+                key,
+                authorization_limit,
+            ) => {
                 let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
                 else {
                     self.set_vault_error(
@@ -1328,7 +1368,11 @@ impl WalletRoot {
                     return;
                 };
                 self.request_private_unshield_hardware_authorization_with_gas_password(
-                    key, password, window, cx,
+                    key,
+                    password,
+                    authorization_limit,
+                    window,
+                    cx,
                 );
             }
             SpendAuthorizationIntent::BlockedShieldRefund(utxo_id) => {
@@ -1420,16 +1464,19 @@ impl WalletRoot {
         &mut self,
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(draft) = self.send_spend_draft(key, cx) else {
+        let Some(mut draft) = self.send_spend_draft(key, cx) else {
             return;
         };
+        draft.sponsored_authorization_limit = authorization_limit;
         self.open_hardware_spend_authorization_dialog(
             HardwareSpendAuthorizationCompletion::PrivateSendSelfBroadcast {
                 key,
                 vault_password,
+                authorization_limit,
             },
             super::private_action::private_send_authorization_summary(&draft),
             window,
@@ -1441,16 +1488,19 @@ impl WalletRoot {
         &mut self,
         key: UnshieldAssetKey,
         vault_password: Zeroizing<String>,
+        authorization_limit: Option<SponsoredAuthorizationLimit>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(draft) = self.unshield_spend_draft(key, cx) else {
+        let Some(mut draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
+        draft.sponsored_authorization_limit = authorization_limit;
         self.open_hardware_spend_authorization_dialog(
             HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
                 key,
                 vault_password,
+                authorization_limit,
             },
             super::private_action::private_unshield_authorization_summary(&draft),
             window,

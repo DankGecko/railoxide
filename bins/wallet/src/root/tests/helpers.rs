@@ -208,6 +208,7 @@ pub(super) fn private_progress_state(
         recipient: Arc::from("0zk"),
         recipient_output: None,
         gas_payer: None,
+        sponsored_funding: false,
         steps: match flow {
             PrivateSubmissionProgressFlow::PublicBroadcaster => {
                 private_broadcaster_progress_steps()
@@ -220,6 +221,8 @@ pub(super) fn private_progress_state(
         result: None,
         self_broadcast_result: None,
         self_broadcast_command_tx: None,
+        sponsored_self_broadcast_command_tx: None,
+        sponsored_self_broadcast_outcome: None,
         self_broadcast_attempts: Vec::new(),
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,

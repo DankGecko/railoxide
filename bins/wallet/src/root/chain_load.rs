@@ -1352,6 +1352,7 @@ impl WalletRoot {
     }
 
     pub(super) fn shutdown_wallet_session_store(&mut self) {
+        self.clear_private_broadcaster_progress_state();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.start_wallet_sync_cleanup(cleanup);
     }
@@ -1360,6 +1361,7 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
+        self.clear_private_broadcaster_progress_state();
         self.public_sync_cache_resetting = true;
         self.advance_active_wallet_generation();
         let session_store = self.wallet_sync_lifecycle.public_sync_cache_reset_cell();
@@ -1381,6 +1383,7 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
+        self.clear_private_broadcaster_progress_state();
         self.public_sync_cache_resetting = true;
         self.advance_active_wallet_generation();
         let session_store = self.wallet_sync_lifecycle.public_sync_cache_reset_cell();

@@ -22,8 +22,8 @@ use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
-    PoiReadSource, ProverCacheBuildProgress, PublicBalanceSnapshot, TokenAnchorRateCache,
-    TokenAnchorRefreshHandle, WakuDeliveryClient, WalletNetworkHealth,
+    PoiReadSource, ProverCacheBuildProgress, PublicBalanceSnapshot, SponsoredSelfBroadcastCommand,
+    TokenAnchorRateCache, TokenAnchorRefreshHandle, WakuDeliveryClient, WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
@@ -126,7 +126,8 @@ use startup::WalletStartupRoot;
 use tokens::{
     format_exact_token_amount_for_display, format_native_token_amount_for_display,
     format_native_top_up_recipient_suffix, format_recipient_amount_with_native_top_up,
-    format_send_amount_input, format_token_amount_for_display, format_unshield_amount_input,
+    format_send_amount_input, format_token_amount_ceiling_for_display,
+    format_token_amount_for_display, format_unshield_amount_input,
     is_effective_wrapped_native_token, native_token_display_label, native_wrapped_output_labels,
     parse_address, token_display_label, token_display_metadata,
 };
@@ -246,14 +247,15 @@ use settings::{
     add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint, auto_lock_timeout_from_value,
     auto_lock_timeout_options, auto_lock_timeout_value, classify_settings_apply_mode,
     display_chain_contract_settings, display_chain_quick_sync_endpoint,
-    display_chain_rpc_endpoints, display_price_anchor_entries, display_token_entries,
-    display_waku_direct_peers, display_waku_dns_enr_trees, display_waku_doh_endpoint,
-    display_waku_doh_fallback_endpoints, format_anchor_bps_exact_range, format_anchor_bps_percent,
-    format_anchor_bps_percent_range, format_anchor_premium_range,
+    display_chain_rpc_endpoints, display_price_anchor_entries, display_sponsored_bundle_relays,
+    display_token_entries, display_waku_direct_peers, display_waku_dns_enr_trees,
+    display_waku_doh_endpoint, display_waku_doh_fallback_endpoints, format_anchor_bps_exact_range,
+    format_anchor_bps_percent, format_anchor_bps_percent_range, format_anchor_premium_range,
     price_anchor_dialog_values_from_entry, price_anchor_override_from_dialog_values,
     price_anchor_token_primary_label, remove_chain_rpc_endpoint, remove_poi_gateway_url,
-    remove_waku_direct_peer, remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint,
-    set_chain_rpc_endpoint, set_poi_gateway_url, set_price_anchor_override, set_waku_direct_peer,
+    remove_sponsored_bundle_relay, remove_waku_direct_peer, remove_waku_dns_enr_tree,
+    remove_waku_doh_fallback_endpoint, set_chain_rpc_endpoint, set_poi_gateway_url,
+    set_price_anchor_override, set_sponsored_bundle_relay, set_waku_direct_peer,
     set_waku_dns_enr_tree, set_waku_doh_fallback_endpoint, settings_draft_after_discard,
     settings_restart_action_enabled, settings_restart_reuses_active_network,
     settings_save_action_enabled, should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
@@ -602,6 +604,13 @@ fn complete_waku_worker_generation(
 
 impl Drop for WalletRoot {
     fn drop(&mut self) {
+        if let Some(command_tx) = self
+            .private_broadcaster_progress
+            .as_ref()
+            .and_then(|progress| progress.sponsored_self_broadcast_command_tx.as_ref())
+        {
+            let _ = command_tx.send(SponsoredSelfBroadcastCommand::Shutdown);
+        }
         self.stop_waku();
         let _ = self.root_shutdown.send(true);
         if !self.wallet_sync_lifecycle_shutdown_started {

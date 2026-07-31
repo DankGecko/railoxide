@@ -1,6 +1,111 @@
 use super::*;
 
+pub(in crate::root) const BLOCK_BUILDER_SPONSORSHIP_LABEL: &str = "Block builder sponsorship";
+
 impl WalletRoot {
+    pub(in crate::root) fn set_self_broadcast_funding_mode(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        funding: SelfBroadcastFundingMode,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key)
+                    && !form.generating
+                {
+                    form.self_broadcast_funding = funding;
+                    form.error = None;
+                    form.result = None;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key)
+                    && !form.generating
+                {
+                    form.self_broadcast_funding = funding;
+                    form.error = None;
+                    form.result = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(in crate::root) fn set_sponsored_incentive(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        incentive: SponsoredIncentive,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key)
+                    && !form.generating
+                {
+                    form.sponsored_incentive = incentive;
+                    form.error = None;
+                    form.result = None;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key)
+                    && !form.generating
+                {
+                    form.sponsored_incentive = incentive;
+                    form.error = None;
+                    form.result = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(in crate::root) fn set_sponsored_custom_incentive_from_text(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        value: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let parsed = value
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .map(SponsoredIncentive::Custom)
+            .filter(|incentive| incentive.percent().is_ok());
+        let error = parsed.is_none().then(|| {
+            Arc::<str>::from("Custom builder incentive must be an integer from 1% through 100%.")
+        });
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key)
+                    && !form.generating
+                {
+                    if let Some(incentive) = parsed {
+                        form.sponsored_incentive = incentive;
+                    }
+                    form.error = error;
+                    form.result = None;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key)
+                    && !form.generating
+                {
+                    if let Some(incentive) = parsed {
+                        form.sponsored_incentive = incentive;
+                    }
+                    form.error = error;
+                    form.result = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
     pub(in crate::root) fn active_self_broadcast_gas_payer_accounts(
         &self,
     ) -> Vec<PublicAccountMetadata> {
@@ -152,6 +257,66 @@ impl WalletRoot {
     }
 }
 
+pub(in crate::root) const fn sponsored_self_broadcast_availability_reason(
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+) -> Option<&'static str> {
+    let Some(chain) = chain else {
+        return Some("Selected chain settings are unavailable.");
+    };
+    if chain.sponsored_bundle_relays.is_empty() {
+        return Some("No compatible sponsored relay is configured for this chain.");
+    }
+    if chain.wrapped_native_token.is_none() {
+        return Some("This chain has no configured wrapped-native token.");
+    }
+    if chain.coinbase_payer.is_none() {
+        return Some("This chain has no configured reviewed coinbase payer.");
+    }
+    None
+}
+
+pub(in crate::root) fn sponsored_funding_choice_visible(
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+) -> bool {
+    chain.is_some_and(|chain| !chain.sponsored_bundle_relays.is_empty())
+}
+
+pub(in crate::root) const fn sponsored_funding_enabled(
+    choice_visible: bool,
+    unavailable_reason: Option<&str>,
+) -> bool {
+    choice_visible && unavailable_reason.is_none()
+}
+
+pub(in crate::root) fn effective_self_broadcast_funding_mode(
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    selected: SelfBroadcastFundingMode,
+) -> SelfBroadcastFundingMode {
+    if sponsored_funding_choice_visible(chain) {
+        selected
+    } else {
+        SelfBroadcastFundingMode::PublicBalance
+    }
+}
+
+pub(in crate::root) fn sponsored_incentive_from_text(
+    selected: SponsoredIncentive,
+    custom: &str,
+) -> Result<SponsoredIncentive, &'static str> {
+    if !matches!(selected, SponsoredIncentive::Custom(_)) {
+        return Ok(selected);
+    }
+    let percent = custom
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| "Custom builder incentive must be an integer from 1% through 100%.")?;
+    let incentive = SponsoredIncentive::Custom(percent);
+    incentive
+        .percent()
+        .map_err(|_| "Custom builder incentive must be an integer from 1% through 100%.")?;
+    Ok(incentive)
+}
+
 pub(in crate::root) fn default_self_broadcast_gas_payer_uuid(
     accounts: &[PublicAccountMetadata],
 ) -> Option<Arc<str>> {
@@ -240,16 +405,39 @@ pub(in crate::root) fn self_broadcast_native_balance_label(
     )
 }
 
+#[cfg(test)]
 pub(in crate::root) fn random_self_broadcast_gas_payer_uuid(
     accounts: &[PublicAccountMetadata],
     selected_uuid: Option<&str>,
     chain_id: u64,
     snapshot: Option<&PublicBalanceSnapshot>,
 ) -> Option<Arc<str>> {
+    random_self_broadcast_gas_payer_uuid_for_funding(
+        accounts,
+        selected_uuid,
+        chain_id,
+        snapshot,
+        SelfBroadcastFundingMode::PublicBalance,
+    )
+}
+
+pub(in crate::root) fn random_self_broadcast_gas_payer_uuid_for_funding(
+    accounts: &[PublicAccountMetadata],
+    selected_uuid: Option<&str>,
+    chain_id: u64,
+    snapshot: Option<&PublicBalanceSnapshot>,
+    funding: SelfBroadcastFundingMode,
+) -> Option<Arc<str>> {
     let candidates = accounts
         .iter()
         .filter(|account| {
-            self_broadcast_gas_payer_random_candidate(account, selected_uuid, chain_id, snapshot)
+            Some(account.public_account_uuid.as_str()) != selected_uuid
+                && (funding == SelfBroadcastFundingMode::PrivateSponsorship
+                    || self_broadcast_native_balance_state(
+                        snapshot,
+                        chain_id,
+                        &account.public_account_uuid,
+                    ) != SelfBroadcastNativeBalanceState::Zero)
         })
         .collect::<Vec<_>>();
     candidates

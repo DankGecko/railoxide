@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use wallet_ops::{PublicBroadcasterResultKind, TransactionGenerationStage};
+use wallet_ops::{
+    PublicBroadcasterResultKind, SponsoredSelfBroadcastSessionOutcome, TransactionGenerationStage,
+};
 
 use super::types::{
     PRIVATE_BROADCASTER_PROGRESS_STAGES, PUBLIC_BROADCASTER_STOP_RESEND_THRESHOLD,
@@ -138,6 +140,7 @@ pub(in crate::root) const fn private_submission_discard_attempt_available(
 
 pub(in crate::root) const fn private_progress_stage_disables_stop(
     flow: PrivateSubmissionProgressFlow,
+    sponsored_funding: bool,
     stage: TransactionGenerationStage,
 ) -> bool {
     match flow {
@@ -146,12 +149,25 @@ pub(in crate::root) const fn private_progress_stage_disables_stop(
             TransactionGenerationStage::PublishingToBroadcaster
                 | TransactionGenerationStage::WaitingForBroadcasterResponse
         ),
-        PrivateSubmissionProgressFlow::SelfBroadcast => matches!(
-            stage,
-            TransactionGenerationStage::SigningSelfBroadcast
-                | TransactionGenerationStage::WaitingForSelfBroadcastReceipt
-        ),
+        PrivateSubmissionProgressFlow::SelfBroadcast => {
+            !sponsored_funding
+                && matches!(
+                    stage,
+                    TransactionGenerationStage::SigningSelfBroadcast
+                        | TransactionGenerationStage::WaitingForSelfBroadcastReceipt
+                )
+        }
     }
+}
+
+pub(in crate::root) const fn sponsored_stop_uses_session_command(
+    stage: TransactionGenerationStage,
+) -> bool {
+    matches!(
+        stage,
+        TransactionGenerationStage::SigningSelfBroadcast
+            | TransactionGenerationStage::WaitingForSelfBroadcastReceipt
+    )
 }
 
 pub(in crate::root) fn private_broadcaster_progress_footer_action(
@@ -184,6 +200,7 @@ pub(in crate::root) fn private_broadcaster_progress_is_terminal(
     progress.stopped
         || progress.result.is_some()
         || progress.self_broadcast_result.is_some()
+        || progress.sponsored_self_broadcast_outcome.is_some()
         || progress.error.is_some()
         || (!progress.steps.is_empty()
             && (progress
@@ -207,10 +224,22 @@ pub(in crate::root) fn private_broadcaster_progress_is_successful(
                 matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
             })
         }
-        PrivateSubmissionProgressFlow::SelfBroadcast => progress
-            .self_broadcast_result
-            .as_ref()
-            .is_some_and(|result| result.tx.status),
+        PrivateSubmissionProgressFlow::SelfBroadcast => {
+            progress
+                .self_broadcast_result
+                .as_ref()
+                .is_some_and(|result| result.tx.status)
+                || progress
+                    .sponsored_self_broadcast_outcome
+                    .as_ref()
+                    .is_some_and(|outcome| {
+                        matches!(
+                            outcome,
+                            SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt)
+                                if receipt.status
+                        )
+                    })
+        }
     }
 }
 

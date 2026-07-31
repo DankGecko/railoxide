@@ -177,6 +177,8 @@ impl WalletRoot {
             cx,
         );
         let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
+        let sponsored_custom_incentive_input =
+            new_prefilled_input(window, cx, "incentive %", "25".to_owned());
         cx.subscribe_in(
             &recipient_input,
             window,
@@ -278,6 +280,20 @@ impl WalletRoot {
             },
         )
         .detach();
+        cx.subscribe(
+            &sponsored_custom_incentive_input,
+            move |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.set_sponsored_custom_incentive_from_text(
+                        DeliveryFormKind::Send,
+                        key,
+                        input.read(cx).value().as_ref(),
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.clear_private_broadcaster_progress_state();
@@ -300,6 +316,9 @@ impl WalletRoot {
                 self_broadcast_gas_payer_uuid,
                 self_broadcast_gas_payer_select: gas_payer_select,
                 self_broadcast_gas_fee: gas_fee_editor,
+                self_broadcast_funding: SelfBroadcastFundingMode::PublicBalance,
+                sponsored_incentive: SponsoredIncentive::Standard,
+                sponsored_custom_incentive_input,
                 self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
@@ -1131,21 +1150,32 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let accounts = self.active_self_broadcast_gas_payer_accounts();
-        let selected_uuid = match kind {
-            DeliveryFormKind::Send => self
-                .send_forms
-                .get(&key)
-                .and_then(|form| form.self_broadcast_gas_payer_uuid.clone()),
-            DeliveryFormKind::Unshield => self
-                .unshield_forms
-                .get(&key)
-                .and_then(|form| form.self_broadcast_gas_payer_uuid.clone()),
+        let (selected_uuid, funding) = match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).map_or(
+                (None, SelfBroadcastFundingMode::PublicBalance),
+                |form| {
+                    (
+                        form.self_broadcast_gas_payer_uuid.clone(),
+                        form.self_broadcast_funding,
+                    )
+                },
+            ),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).map_or(
+                (None, SelfBroadcastFundingMode::PublicBalance),
+                |form| {
+                    (
+                        form.self_broadcast_gas_payer_uuid.clone(),
+                        form.self_broadcast_funding,
+                    )
+                },
+            ),
         };
-        let Some(account_uuid) = random_self_broadcast_gas_payer_uuid(
+        let Some(account_uuid) = random_self_broadcast_gas_payer_uuid_for_funding(
             &accounts,
             selected_uuid.as_deref(),
             key.chain_id,
             self.public_balance_snapshot.as_deref(),
+            funding,
         ) else {
             return;
         };
@@ -1384,6 +1414,8 @@ impl WalletRoot {
             cx,
         );
         let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
+        let sponsored_custom_incentive_input =
+            new_prefilled_input(window, cx, "incentive %", "25".to_owned());
         cx.subscribe_in(
             &recipient_input,
             window,
@@ -1478,6 +1510,20 @@ impl WalletRoot {
             },
         )
         .detach();
+        cx.subscribe(
+            &sponsored_custom_incentive_input,
+            move |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.set_sponsored_custom_incentive_from_text(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        input.read(cx).value().as_ref(),
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.clear_private_broadcaster_progress_state();
@@ -1503,6 +1549,9 @@ impl WalletRoot {
                 self_broadcast_gas_payer_uuid,
                 self_broadcast_gas_payer_select: gas_payer_select,
                 self_broadcast_gas_fee: gas_fee_editor,
+                self_broadcast_funding: SelfBroadcastFundingMode::PublicBalance,
+                sponsored_incentive: SponsoredIncentive::Standard,
+                sponsored_custom_incentive_input,
                 self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,

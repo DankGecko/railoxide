@@ -1,9 +1,112 @@
 use super::*;
+use crate::root::private_broadcaster::{
+    cancel_private_broadcaster_progress, request_sponsored_session_cancel,
+    spawn_sponsored_abort_watchdog, sponsored_stop_uses_session_command,
+};
 use crate::root::public_action::{
     PublicActionGasRetryKind, public_action_discard_attempt_available,
     public_action_error_retry_kind, public_action_step_detail_for_context,
 };
 use wallet_ops::{DesktopSelfBroadcastResult, SelfBroadcastAttemptInfo, TxReceiptOutput};
+
+#[tokio::test]
+async fn sponsored_cleanup_aborts_preparation_but_drains_active_session() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x12; 20]));
+    let (prepare_tx, mut prepare_rx) =
+        tokio::sync::watch::channel(SponsoredSelfBroadcastCommand::Running);
+    let prepare_task = tokio::spawn(std::future::pending::<()>());
+    let mut preparing = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    preparing.sponsored_funding = true;
+    preparing.sponsored_self_broadcast_command_tx = Some(prepare_tx);
+    preparing.task_abort_handle = Some(prepare_task.abort_handle());
+    apply_private_broadcaster_progress_stage(
+        &mut preparing.steps,
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+
+    assert!(cancel_private_broadcaster_progress(&mut Some(preparing)).is_none());
+    prepare_rx.changed().await.expect("preparation shutdown");
+    assert_eq!(
+        *prepare_rx.borrow(),
+        SponsoredSelfBroadcastCommand::Shutdown
+    );
+    assert!(
+        prepare_task
+            .await
+            .expect_err("preparation aborted")
+            .is_cancelled()
+    );
+
+    let (session_tx, mut session_rx) =
+        tokio::sync::watch::channel(SponsoredSelfBroadcastCommand::Running);
+    let session_task = tokio::spawn(std::future::pending::<()>());
+    let mut waiting = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    waiting.sponsored_funding = true;
+    waiting.sponsored_self_broadcast_command_tx = Some(session_tx);
+    waiting.task_abort_handle = Some(session_task.abort_handle());
+    apply_private_broadcaster_progress_stage(
+        &mut waiting.steps,
+        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+    );
+
+    let retained = cancel_private_broadcaster_progress(&mut Some(waiting))
+        .expect("active session task retained for cleanup");
+    session_rx.changed().await.expect("session shutdown");
+    assert_eq!(
+        *session_rx.borrow(),
+        SponsoredSelfBroadcastCommand::Shutdown
+    );
+    assert!(!retained.is_finished());
+    retained.abort();
+    let _ = session_task.await;
+}
+
+#[tokio::test]
+async fn sponsored_abort_watchdog_bounds_an_unresponsive_session() {
+    let task = tokio::spawn(std::future::pending::<()>());
+    spawn_sponsored_abort_watchdog(
+        &tokio::runtime::Handle::current(),
+        task.abort_handle(),
+        Duration::from_millis(20),
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("watchdog completes within bound")
+        .expect_err("watchdog aborts task");
+    assert!(result.is_cancelled());
+}
+
+#[tokio::test]
+async fn sponsored_cancel_retains_sender_for_later_shutdown() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x13; 20]));
+    let (command_tx, mut command_rx) =
+        tokio::sync::watch::channel(SponsoredSelfBroadcastCommand::Running);
+    let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    progress.sponsored_self_broadcast_command_tx = Some(command_tx);
+
+    assert!(request_sponsored_session_cancel(&mut progress));
+    command_rx.changed().await.expect("cancel command");
+    assert_eq!(
+        *command_rx.borrow_and_update(),
+        SponsoredSelfBroadcastCommand::Cancel
+    );
+
+    progress
+        .sponsored_self_broadcast_command_tx
+        .as_ref()
+        .expect("sender retained")
+        .send(SponsoredSelfBroadcastCommand::Shutdown)
+        .expect("shutdown command");
+    command_rx
+        .changed()
+        .await
+        .expect("shutdown command observed");
+    assert_eq!(
+        *command_rx.borrow(),
+        SponsoredSelfBroadcastCommand::Shutdown
+    );
+}
 
 #[test]
 fn private_broadcaster_progress_stage_marks_prior_steps_done() {
@@ -492,11 +595,27 @@ fn private_self_broadcast_stop_footer_follows_signing_handoff_boundary() {
 
     assert!(!private_progress_stage_disables_stop(
         PrivateSubmissionProgressFlow::SelfBroadcast,
+        false,
         TransactionGenerationStage::EstimatingSelfBroadcastGas,
+    ));
+    assert!(!sponsored_stop_uses_session_command(
+        TransactionGenerationStage::GeneratingPoiProofs,
+    ));
+    assert!(sponsored_stop_uses_session_command(
+        TransactionGenerationStage::SigningSelfBroadcast,
+    ));
+    assert!(sponsored_stop_uses_session_command(
+        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
     ));
     assert!(private_progress_stage_disables_stop(
         PrivateSubmissionProgressFlow::SelfBroadcast,
+        false,
         TransactionGenerationStage::SigningSelfBroadcast,
+    ));
+    assert!(!private_progress_stage_disables_stop(
+        PrivateSubmissionProgressFlow::SelfBroadcast,
+        true,
+        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
     ));
     assert_eq!(
         private_broadcaster_progress_footer_action(&progress),
@@ -517,10 +636,12 @@ fn private_public_broadcaster_stop_footer_follows_publication_boundary() {
 
     assert!(!private_progress_stage_disables_stop(
         PrivateSubmissionProgressFlow::PublicBroadcaster,
+        false,
         TransactionGenerationStage::GeneratingPoiProofs,
     ));
     assert!(private_progress_stage_disables_stop(
         PrivateSubmissionProgressFlow::PublicBroadcaster,
+        false,
         TransactionGenerationStage::PublishingToBroadcaster,
     ));
     assert_eq!(
@@ -627,11 +748,14 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         recipient: Arc::from("0zk"),
         recipient_output: None,
         gas_payer: None,
+        sponsored_funding: false,
         steps: private_broadcaster_progress_steps(),
         estimate: None,
         result: None,
         self_broadcast_result: None,
         self_broadcast_command_tx: None,
+        sponsored_self_broadcast_command_tx: None,
+        sponsored_self_broadcast_outcome: None,
         self_broadcast_attempts: Vec::new(),
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,

@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use gpui::{Pixels, px};
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterSubmissionResult,
-    SelfBroadcastAttemptInfo, SelfBroadcastCommandSender, TransactionGenerationStage,
+    SelfBroadcastAttemptInfo, SelfBroadcastCommandSender, SponsoredSelfBroadcastCommandSender,
+    SponsoredSelfBroadcastSessionOutcome, TransactionGenerationStage,
 };
 
 use crate::assets::WalletIconSource;
@@ -70,11 +71,16 @@ pub(in crate::root) struct PrivateBroadcasterProgressState {
     pub(in crate::root) recipient: Arc<str>,
     pub(in crate::root) recipient_output: Option<Arc<str>>,
     pub(in crate::root) gas_payer: Option<Arc<str>>,
+    pub(in crate::root) sponsored_funding: bool,
     pub(in crate::root) steps: Vec<PrivateBroadcasterProgressStepState>,
     pub(in crate::root) estimate: Option<PublicBroadcasterCostEstimate>,
     pub(in crate::root) result: Option<PublicBroadcasterSubmissionResult>,
     pub(in crate::root) self_broadcast_result: Option<DesktopSelfBroadcastResult>,
     pub(in crate::root) self_broadcast_command_tx: Option<SelfBroadcastCommandSender>,
+    pub(in crate::root) sponsored_self_broadcast_command_tx:
+        Option<SponsoredSelfBroadcastCommandSender>,
+    pub(in crate::root) sponsored_self_broadcast_outcome:
+        Option<SponsoredSelfBroadcastSessionOutcome>,
     pub(in crate::root) self_broadcast_attempts: Vec<SelfBroadcastAttemptInfo>,
     pub(in crate::root) self_broadcast_current_gas_fee: Option<(u128, u128)>,
     pub(in crate::root) self_broadcast_action_error: Option<Arc<str>>,
@@ -90,7 +96,7 @@ pub(in crate::root) struct PrivateBroadcasterProgressState {
 }
 
 impl PrivateBroadcasterProgressState {
-    pub(super) fn accepts_update(
+    pub(in crate::root) fn accepts_update(
         &self,
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
@@ -101,6 +107,7 @@ impl PrivateBroadcasterProgressState {
             && self.generation_id == generation_id
             && self.result.is_none()
             && self.self_broadcast_result.is_none()
+            && self.sponsored_self_broadcast_outcome.is_none()
             && self.error.is_none()
             && !self.stopped
     }

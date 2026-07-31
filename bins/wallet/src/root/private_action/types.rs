@@ -1,16 +1,17 @@
 use super::{
-    Address, App, Arc, BroadcasterChoice, BroadcasterFeePolicy, DesktopNativeTopUpPlan,
-    DesktopSelfBroadcastResult, DesktopVaultStore, DesktopViewSession, Eip1559GasFeeEditorState,
-    Entity, FeeHandlingMode, FeeRow, InputState, IntoElement, PreparedSendCall,
-    PreparedUnshieldCall, PublicAccountSource, PublicBroadcasterCostEstimate,
-    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, ScrollHandle, SearchableVec,
-    SelectItem, SelectState, SelfBroadcastGasFeeSelection, SharedString, SpendAuthorizationSummary,
-    SpendAuthorizationSummaryRow, TransactionGenerationStage, U256, WalletIconSource,
-    WalletSession, Window, format_send_amount_input, format_unshield_amount_input,
-    native_token_display_label, native_top_up_primary_recipient_amount_for_fee_mode,
-    private_action_asset_select_row, self_broadcast_gas_payer_fields_match,
-    self_broadcast_gas_payer_select_menu_row, self_broadcast_gas_payer_select_trigger_row,
-    short_address,
+    Address, App, Arc, BLOCK_BUILDER_SPONSORSHIP_LABEL, BroadcasterChoice, BroadcasterFeePolicy,
+    DesktopNativeTopUpPlan, DesktopSelfBroadcastResult, DesktopSponsoredSelfBroadcastResult,
+    DesktopVaultStore, DesktopViewSession, Eip1559GasFeeEditorState, Entity, FeeHandlingMode,
+    FeeRow, InputState, IntoElement, PreparedSendCall, PreparedUnshieldCall, PublicAccountSource,
+    PublicBroadcasterCostEstimate, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
+    ScrollHandle, SearchableVec, SelectItem, SelectState, SelfBroadcastGasFeeSelection,
+    SharedString, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
+    SponsoredAuthorizationLimit, SponsoredIncentive, SponsoredSelfBroadcastSessionOutcome,
+    TransactionGenerationStage, U256, WalletIconSource, WalletSession, Window,
+    format_send_amount_input, format_unshield_amount_input,
+    native_top_up_primary_recipient_amount_for_fee_mode, private_action_asset_select_row,
+    self_broadcast_gas_payer_fields_match, self_broadcast_gas_payer_select_menu_row,
+    self_broadcast_gas_payer_select_trigger_row, short_address,
 };
 
 #[cfg(test)]
@@ -28,6 +29,13 @@ pub(in crate::root) enum DeliveryMode {
     #[default]
     PublicBroadcaster,
     SelfBroadcast,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::root) enum SelfBroadcastFundingMode {
+    #[default]
+    PublicBalance,
+    PrivateSponsorship,
 }
 
 impl DeliveryMode {
@@ -136,12 +144,14 @@ pub(in crate::root) enum SendResult {
     Manual(PreparedSendCall),
     PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
     SelfBroadcast(Box<DesktopSelfBroadcastResult>),
+    Sponsored(Box<DesktopSponsoredSelfBroadcastResult>),
 }
 
 pub(in crate::root) enum UnshieldResult {
     Manual(Box<PreparedUnshieldCall>),
     PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
     SelfBroadcast(Box<DesktopSelfBroadcastResult>),
+    Sponsored(Box<DesktopSponsoredSelfBroadcastResult>),
 }
 
 pub(in crate::root) fn send_form_submitted(form: &SendFormState) -> bool {
@@ -150,6 +160,15 @@ pub(in crate::root) fn send_form_submitted(form: &SendFormState) -> bool {
         Some(SendResult::PublicBroadcaster(result))
             if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
     ) || matches!(form.result.as_ref(), Some(SendResult::SelfBroadcast(_)))
+        || matches!(
+            form.result.as_ref(),
+        Some(SendResult::Sponsored(result))
+            if matches!(
+                result.outcome,
+                SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(ref receipt)
+                    if receipt.status
+            )
+        )
 }
 
 pub(in crate::root) fn unshield_form_submitted(form: &UnshieldFormState) -> bool {
@@ -158,6 +177,15 @@ pub(in crate::root) fn unshield_form_submitted(form: &UnshieldFormState) -> bool
         Some(UnshieldResult::PublicBroadcaster(result))
             if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
     ) || matches!(form.result.as_ref(), Some(UnshieldResult::SelfBroadcast(_)))
+        || matches!(
+            form.result.as_ref(),
+        Some(UnshieldResult::Sponsored(result))
+            if matches!(
+                result.outcome,
+                SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(ref receipt)
+                    if receipt.status
+            )
+        )
 }
 
 pub(in crate::root) fn self_broadcast_requires_software_gas_payer_password(
@@ -196,6 +224,13 @@ impl UnshieldAssetKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct SponsoredAuthorizationDisplay {
+    pub(in crate::root) gross_wrapped_native_spend: String,
+    pub(in crate::root) max_fee_per_gas: String,
+    pub(in crate::root) max_priority_fee_per_gas: String,
+}
+
 pub(in crate::root) struct SendSpendDraft {
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) delivery_mode: DeliveryMode,
@@ -203,6 +238,10 @@ pub(in crate::root) struct SendSpendDraft {
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
     pub(in crate::root) fee_token: Address,
     pub(in crate::root) self_broadcast_gas_fee: SelfBroadcastGasFeeSelection,
+    pub(in crate::root) self_broadcast_funding: SelfBroadcastFundingMode,
+    pub(in crate::root) sponsored_incentive: SponsoredIncentive,
+    pub(in crate::root) sponsored_authorization_limit: Option<SponsoredAuthorizationLimit>,
+    pub(in crate::root) sponsored_authorization_display: Option<SponsoredAuthorizationDisplay>,
     pub(in crate::root) self_broadcast_initial_gas_fee: Option<(u128, u128)>,
     pub(in crate::root) fee_mode: FeeHandlingMode,
     pub(in crate::root) view_session: Arc<DesktopViewSession>,
@@ -226,6 +265,10 @@ pub(in crate::root) struct UnshieldSpendDraft {
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
     pub(in crate::root) fee_token: Address,
     pub(in crate::root) self_broadcast_gas_fee: SelfBroadcastGasFeeSelection,
+    pub(in crate::root) self_broadcast_funding: SelfBroadcastFundingMode,
+    pub(in crate::root) sponsored_incentive: SponsoredIncentive,
+    pub(in crate::root) sponsored_authorization_limit: Option<SponsoredAuthorizationLimit>,
+    pub(in crate::root) sponsored_authorization_display: Option<SponsoredAuthorizationDisplay>,
     pub(in crate::root) self_broadcast_initial_gas_fee: Option<(u128, u128)>,
     pub(in crate::root) fee_mode: FeeHandlingMode,
     pub(in crate::root) view_session: Arc<DesktopViewSession>,
@@ -245,43 +288,70 @@ pub(in crate::root) struct UnshieldSpendDraft {
 pub(in crate::root) fn private_send_authorization_summary(
     draft: &SendSpendDraft,
 ) -> SpendAuthorizationSummary {
-    SpendAuthorizationSummary::new(
+    let mut rows = vec![
+        SpendAuthorizationSummaryRow::new(
+            "Amount",
+            private_amount_label(draft.amount, &draft.asset, true),
+        )
+        .with_icon(draft.asset.icon_path.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
+        SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
+    ];
+    append_sponsorship_authorization_rows(
+        &mut rows,
+        draft.self_broadcast_funding,
+        draft.sponsored_incentive,
+        draft.sponsored_authorization_display.as_ref(),
+        draft.self_broadcast_gas_payer_display.as_deref(),
+    );
+    let summary = SpendAuthorizationSummary::new(
         "Private send",
-        "Enter your vault password to authorize this private send.",
-        vec![
-            SpendAuthorizationSummaryRow::new(
-                "Amount",
-                private_amount_label(draft.amount, &draft.asset, true),
-            )
-            .with_icon(draft.asset.icon_path.clone()),
-            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
-            SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
-        ],
-    )
+        if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {
+            "Authorize this private action and transaction signer up to the displayed sponsorship maximum. Exact values may be lower; signing fails if the limit is exceeded."
+        } else {
+            "Enter your vault password to authorize this private send."
+        },
+        rows,
+    );
+    apply_sponsored_authorization_review(summary, draft.self_broadcast_funding)
 }
 
 pub(in crate::root) fn private_send_gas_payer_authorization_summary(
     draft: &SendSpendDraft,
 ) -> SpendAuthorizationSummary {
-    SpendAuthorizationSummary::new(
-        "Self-broadcast gas payer",
-        "Enter the vault password to unlock the selected software Public gas-payer account. Hardware approval is still required for the private spend.",
-        vec![
-            SpendAuthorizationSummaryRow::new(
-                "Amount",
-                private_amount_label(draft.amount, &draft.asset, true),
-            )
-            .with_icon(draft.asset.icon_path.clone()),
-            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
-            SpendAuthorizationSummaryRow::new(
-                "Gas payer",
-                draft
-                    .self_broadcast_gas_payer_display
-                    .clone()
-                    .unwrap_or_else(|| "Selected Public account".to_owned()),
-            ),
-        ],
-    )
+    let mut rows = vec![
+        SpendAuthorizationSummaryRow::new(
+            "Amount",
+            private_amount_label(draft.amount, &draft.asset, true),
+        )
+        .with_icon(draft.asset.icon_path.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
+        SpendAuthorizationSummaryRow::new(
+            if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {
+                "Transaction signer"
+            } else {
+                "Gas payer"
+            },
+            draft
+                .self_broadcast_gas_payer_display
+                .clone()
+                .unwrap_or_else(|| "Selected Public account".to_owned()),
+        ),
+    ];
+    append_sponsorship_authorization_rows(
+        &mut rows,
+        draft.self_broadcast_funding,
+        draft.sponsored_incentive,
+        draft.sponsored_authorization_display.as_ref(),
+        draft.self_broadcast_gas_payer_display.as_deref(),
+    );
+    let detail = if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {
+        "Authorize the software transaction signer up to the displayed sponsorship maximum. Hardware approval is still required for the private spend."
+    } else {
+        "Enter the vault password to unlock the selected software Public signer. Hardware approval is still required for the private spend."
+    };
+    let summary = SpendAuthorizationSummary::new("Self-broadcast signer", detail, rows);
+    apply_sponsored_authorization_review(summary, draft.self_broadcast_funding)
 }
 
 pub(in crate::root) fn private_unshield_authorization_summary(
@@ -303,11 +373,76 @@ pub(in crate::root) fn private_unshield_authorization_summary(
         "Delivery",
         draft.delivery_mode.label(),
     ));
-    SpendAuthorizationSummary::new(
-        "Private unshield",
-        "Enter your vault password to authorize this unshield.",
-        rows,
-    )
+    append_sponsorship_authorization_rows(
+        &mut rows,
+        draft.self_broadcast_funding,
+        draft.sponsored_incentive,
+        draft.sponsored_authorization_display.as_ref(),
+        draft.self_broadcast_gas_payer_display.as_deref(),
+    );
+    let detail = if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {
+        "Authorize this private action and transaction signer up to the displayed sponsorship maximum. Exact values may be lower; signing fails if the limit is exceeded."
+    } else {
+        "Enter your vault password to authorize this unshield."
+    };
+    let summary = SpendAuthorizationSummary::new("Private unshield", detail, rows);
+    apply_sponsored_authorization_review(summary, draft.self_broadcast_funding)
+}
+
+pub(in crate::root) fn append_sponsorship_authorization_rows(
+    rows: &mut Vec<SpendAuthorizationSummaryRow>,
+    funding: SelfBroadcastFundingMode,
+    incentive: SponsoredIncentive,
+    display: Option<&SponsoredAuthorizationDisplay>,
+    signer: Option<&str>,
+) {
+    if funding != SelfBroadcastFundingMode::PrivateSponsorship {
+        return;
+    }
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Gas funding",
+        BLOCK_BUILDER_SPONSORSHIP_LABEL,
+    ));
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Builder incentive",
+        format!("{}%", incentive.percent().unwrap_or_default()),
+    ));
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Transaction signer",
+        signer.unwrap_or("Selected Public account"),
+    ));
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Gross sponsorship wrapped-native spend",
+        display.map_or_else(
+            || "Unavailable".to_owned(),
+            |display| display.gross_wrapped_native_spend.clone(),
+        ),
+    ));
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Maximum fee per gas",
+        display.map_or_else(
+            || "Unavailable".to_owned(),
+            |display| display.max_fee_per_gas.clone(),
+        ),
+    ));
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Maximum priority fee per gas",
+        display.map_or_else(
+            || "Unavailable".to_owned(),
+            |display| display.max_priority_fee_per_gas.clone(),
+        ),
+    ));
+}
+
+pub(in crate::root) fn apply_sponsored_authorization_review(
+    summary: SpendAuthorizationSummary,
+    funding: SelfBroadcastFundingMode,
+) -> SpendAuthorizationSummary {
+    if funding == SelfBroadcastFundingMode::PrivateSponsorship {
+        summary.requiring_explicit_review()
+    } else {
+        summary
+    }
 }
 
 pub(in crate::root) fn private_unshield_gas_payer_authorization_summary(
@@ -326,20 +461,35 @@ pub(in crate::root) fn private_unshield_gas_payer_authorization_summary(
         SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
     ];
     rows.push(SpendAuthorizationSummaryRow::new(
-        "Gas payer",
+        if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {
+            "Transaction signer"
+        } else {
+            "Gas payer"
+        },
         draft
             .self_broadcast_gas_payer_display
             .clone()
             .unwrap_or_else(|| "Selected Public account".to_owned()),
     ));
-    SpendAuthorizationSummary::new(
-        "Self-broadcast gas payer",
-        "Enter the vault password to unlock the selected software Public gas-payer account. Hardware approval is still required for the private spend.",
-        rows,
-    )
+    append_sponsorship_authorization_rows(
+        &mut rows,
+        draft.self_broadcast_funding,
+        draft.sponsored_incentive,
+        draft.sponsored_authorization_display.as_ref(),
+        draft.self_broadcast_gas_payer_display.as_deref(),
+    );
+    let detail = if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {
+        "Authorize the software transaction signer up to the displayed sponsorship maximum. Hardware approval is still required for the private spend."
+    } else {
+        "Enter the vault password to unlock the selected software Public signer. Hardware approval is still required for the private spend."
+    };
+    let summary = SpendAuthorizationSummary::new("Self-broadcast signer", detail, rows);
+    apply_sponsored_authorization_review(summary, draft.self_broadcast_funding)
 }
 
-fn private_unshield_recipient_amount_label(draft: &UnshieldSpendDraft) -> String {
+pub(in crate::root) fn private_unshield_recipient_amount_label(
+    draft: &UnshieldSpendDraft,
+) -> String {
     if let Some(top_up) = draft.native_top_up.as_ref() {
         let recipient_amount = draft
             .cost_estimate
@@ -402,6 +552,9 @@ pub(in crate::root) struct UnshieldFormState {
     pub(in crate::root) self_broadcast_gas_payer_select:
         Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
     pub(in crate::root) self_broadcast_gas_fee: Eip1559GasFeeEditorState,
+    pub(in crate::root) self_broadcast_funding: SelfBroadcastFundingMode,
+    pub(in crate::root) sponsored_incentive: SponsoredIncentive,
+    pub(in crate::root) sponsored_custom_incentive_input: Entity<InputState>,
     pub(in crate::root) self_broadcast_estimated_native_gas_cost: Option<U256>,
     pub(in crate::root) selected_fee_token: Address,
     pub(in crate::root) broadcaster_choice: BroadcasterChoice,
@@ -437,6 +590,9 @@ pub(in crate::root) struct SendFormState {
     pub(in crate::root) self_broadcast_gas_payer_select:
         Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
     pub(in crate::root) self_broadcast_gas_fee: Eip1559GasFeeEditorState,
+    pub(in crate::root) self_broadcast_funding: SelfBroadcastFundingMode,
+    pub(in crate::root) sponsored_incentive: SponsoredIncentive,
+    pub(in crate::root) sponsored_custom_incentive_input: Entity<InputState>,
     pub(in crate::root) self_broadcast_estimated_native_gas_cost: Option<U256>,
     pub(in crate::root) selected_fee_token: Address,
     pub(in crate::root) broadcaster_choice: BroadcasterChoice,

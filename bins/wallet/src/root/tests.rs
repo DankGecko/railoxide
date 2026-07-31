@@ -35,6 +35,7 @@ mod private_display;
 mod progress;
 mod public_actions;
 mod settings;
+mod sponsored_self_broadcast;
 mod utxo_rows;
 mod waku_lifecycle;
 mod wallet_management;

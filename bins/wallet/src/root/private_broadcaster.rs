@@ -2,10 +2,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
-    div, prelude::FluentBuilder as _, px, rgb,
+    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Icon, IconName, Sizable, WindowExt, button::ButtonVariants};
+use gpui_component::{
+    Icon, IconName, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip,
+};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
 use ui::theme;
@@ -13,6 +16,7 @@ use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
     PublicBroadcasterSubmissionResult, SelfBroadcastAttemptInfo, SelfBroadcastCommand,
     SelfBroadcastCommandKind, SelfBroadcastCommandSender, SelfBroadcastGasFeeSelection,
+    SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastSessionOutcome,
     TransactionGenerationStage, self_broadcast_replacement_bumped_fee,
 };
 
@@ -25,8 +29,8 @@ use super::public_action::{
 };
 use super::public_broadcaster_cost::{
     PrivateBroadcasterProgressContext, PublicBroadcasterCostDisplay, cost_estimate_detail_text,
-    private_broadcaster_context_row, render_private_broadcaster_progress_context,
-    render_public_broadcaster_tx_hash_row,
+    private_broadcaster_context_row, private_broadcaster_context_row_with_action,
+    render_private_broadcaster_progress_context, render_public_broadcaster_tx_hash_row,
 };
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
@@ -36,6 +40,9 @@ use super::{
     format_recipient_amount_with_native_top_up, scrollable_dialog_content,
     secondary_dialog_content_width,
 };
+
+const SPONSORED_SHUTDOWN_ABORT_GRACE: Duration = Duration::from_secs(20);
+const SPONSORED_CANCEL_ABORT_GRACE: Duration = Duration::from_secs(90);
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};
 
@@ -54,6 +61,7 @@ pub(super) use progress::{
     private_broadcaster_progress_is_terminal, private_broadcaster_progress_steps,
     private_progress_stage_disables_stop, private_submission_discard_attempt_available,
     self_broadcast_progress_steps, self_broadcast_step_retry_kind,
+    sponsored_stop_uses_session_command,
 };
 use progress::{
     ensure_private_broadcaster_progress_stage, private_broadcaster_progress_stop_available,
@@ -204,7 +212,17 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
 
 impl WalletRoot {
     pub(super) fn clear_private_broadcaster_progress_state(&mut self) {
-        cancel_private_broadcaster_progress(&mut self.private_broadcaster_progress);
+        let sponsored_handle =
+            cancel_private_broadcaster_progress(&mut self.private_broadcaster_progress);
+        if let Some(sponsored_handle) = sponsored_handle {
+            self.public_broadcaster_task_abort_handles
+                .retain(|handle| handle.id() != sponsored_handle.id());
+            spawn_sponsored_abort_watchdog(
+                &self.runtime,
+                sponsored_handle,
+                SPONSORED_SHUTDOWN_ABORT_GRACE,
+            );
+        }
         cancel_public_broadcaster_tasks(&mut self.public_broadcaster_task_abort_handles);
         self.drop_trezor_pin_matrix_prompt();
     }
@@ -255,11 +273,14 @@ impl WalletRoot {
             recipient: Arc::from(recipient),
             recipient_output: None,
             gas_payer: None,
+            sponsored_funding: false,
             steps: private_broadcaster_progress_steps(),
             estimate,
             result: None,
             self_broadcast_result: None,
             self_broadcast_command_tx: None,
+            sponsored_self_broadcast_command_tx: None,
+            sponsored_self_broadcast_outcome: None,
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: None,
             self_broadcast_action_error: None,
@@ -303,11 +324,14 @@ impl WalletRoot {
             recipient: Arc::from(recipient),
             recipient_output: recipient_output.map(Arc::from),
             gas_payer: Some(Arc::from(gas_payer)),
+            sponsored_funding: false,
             steps: self_broadcast_progress_steps(kind),
             estimate: None,
             result: None,
             self_broadcast_result: None,
             self_broadcast_command_tx: command_tx,
+            sponsored_self_broadcast_command_tx: None,
+            sponsored_self_broadcast_outcome: None,
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: current_gas_fee,
             self_broadcast_action_error: None,
@@ -391,7 +415,7 @@ impl WalletRoot {
     }
 
     fn stop_private_broadcaster_progress(&mut self, cx: &mut Context<'_, Self>) {
-        let (kind, key, generation_id) = {
+        let (kind, key, generation_id, sponsored_stopping, sponsored_watchdog_handle) = {
             let Some(progress) = self.private_broadcaster_progress.as_mut() else {
                 return;
             };
@@ -401,18 +425,47 @@ impl WalletRoot {
             let kind = progress.kind;
             let key = progress.key;
             let generation_id = progress.generation_id;
-            if let Some(handle) = progress.task_abort_handle.take() {
-                handle.abort();
-            }
+            let sponsored_session_active = progress.steps.iter().any(|step| {
+                step.status == PublicActionStepStatus::Pending
+                    && sponsored_stop_uses_session_command(step.stage)
+            });
+            let sponsored_stopping = if sponsored_session_active {
+                request_sponsored_session_cancel(progress)
+            } else {
+                progress.sponsored_self_broadcast_command_tx.take();
+                if let Some(handle) = progress.task_abort_handle.take() {
+                    handle.abort();
+                }
+                false
+            };
             progress.self_broadcast_command_tx = None;
             progress.self_broadcast_action_error = None;
             progress.stop_available = false;
-            progress.stopped = true;
             progress.error = None;
-            mark_private_broadcaster_active_step_stopped(&mut progress.steps);
-            (kind, key, generation_id)
+            if !sponsored_stopping {
+                progress.stopped = true;
+                mark_private_broadcaster_active_step_stopped(&mut progress.steps);
+            }
+            let sponsored_watchdog_handle = sponsored_stopping
+                .then(|| progress.task_abort_handle.clone())
+                .flatten();
+            (
+                kind,
+                key,
+                generation_id,
+                sponsored_stopping,
+                sponsored_watchdog_handle,
+            )
         };
         self.clear_trezor_pin_matrix_prompt(cx);
+
+        if sponsored_stopping {
+            if let Some(handle) = sponsored_watchdog_handle {
+                spawn_sponsored_abort_watchdog(&self.runtime, handle, SPONSORED_CANCEL_ABORT_GRACE);
+            }
+            cx.notify();
+            return;
+        }
 
         match kind {
             DeliveryFormKind::Send => {
@@ -554,7 +607,7 @@ impl WalletRoot {
         {
             progress.public_broadcaster_wait_started_at = Some(Instant::now());
         }
-        if private_progress_stage_disables_stop(progress.flow, stage) {
+        if private_progress_stage_disables_stop(progress.flow, progress.sponsored_funding, stage) {
             progress.stop_available = false;
         }
         ensure_private_broadcaster_progress_stage(progress, stage);
@@ -650,6 +703,43 @@ impl WalletRoot {
         progress.self_broadcast_action_error = None;
         progress.self_broadcast_result = Some(result);
         progress.self_broadcast_command_tx = None;
+        progress.task_abort_handle = None;
+        progress.stop_available = false;
+        progress.error = None;
+        cx.notify();
+    }
+
+    pub(super) fn finish_private_sponsored_self_broadcast_progress(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        final_stage: TransactionGenerationStage,
+        outcome: SponsoredSelfBroadcastSessionOutcome,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if !progress.accepts_update(kind, key, generation_id) {
+            return;
+        }
+        progress.sponsored_self_broadcast_outcome = Some(outcome.clone());
+        match outcome {
+            SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt) => {
+                ensure_private_broadcaster_progress_stage(progress, final_stage);
+                finish_private_self_broadcast_progress_steps_at_stage(
+                    &mut progress.steps,
+                    final_stage,
+                    receipt.status,
+                );
+            }
+            SponsoredSelfBroadcastSessionOutcome::Stopped { .. } => {
+                mark_private_broadcaster_active_step_stopped(&mut progress.steps);
+                progress.stopped = true;
+            }
+        }
+        progress.sponsored_self_broadcast_command_tx = None;
         progress.task_abort_handle = None;
         progress.stop_available = false;
         progress.error = None;
@@ -1053,11 +1143,40 @@ impl WalletRoot {
 
 pub(in crate::root) fn cancel_private_broadcaster_progress(
     progress: &mut Option<PrivateBroadcasterProgressState>,
-) {
-    if let Some(mut progress) = progress.take()
-        && let Some(handle) = progress.task_abort_handle.take()
-    {
+) -> Option<tokio::task::AbortHandle> {
+    let mut progress = progress.take()?;
+    if let Some(command_tx) = progress.sponsored_self_broadcast_command_tx.take() {
+        let _ = command_tx.send(SponsoredSelfBroadcastCommand::Shutdown);
+        let session_active = progress.steps.iter().any(|step| {
+            step.status == PublicActionStepStatus::Pending
+                && sponsored_stop_uses_session_command(step.stage)
+        });
+        let handle = progress.task_abort_handle.take();
+        if !session_active {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            return None;
+        }
+        return handle;
+    }
+    if let Some(handle) = progress.task_abort_handle.take() {
         handle.abort();
+    }
+    None
+}
+
+pub(in crate::root) fn request_sponsored_session_cancel(
+    progress: &mut PrivateBroadcasterProgressState,
+) -> bool {
+    if let Some(command_tx) = progress.sponsored_self_broadcast_command_tx.as_ref() {
+        let _ = command_tx.send(SponsoredSelfBroadcastCommand::Cancel);
+        true
+    } else if let Some(handle) = progress.task_abort_handle.take() {
+        handle.abort();
+        false
+    } else {
+        false
     }
 }
 
@@ -1067,6 +1186,19 @@ pub(in crate::root) fn cancel_public_broadcaster_tasks(
     for handle in handles.drain(..) {
         handle.abort();
     }
+}
+
+pub(in crate::root) fn spawn_sponsored_abort_watchdog(
+    runtime: &tokio::runtime::Handle,
+    handle: tokio::task::AbortHandle,
+    grace: Duration,
+) {
+    drop(runtime.spawn(async move {
+        tokio::time::sleep(grace).await;
+        if !handle.is_finished() {
+            handle.abort();
+        }
+    }));
 }
 
 fn public_broadcaster_progress_address(progress: &PrivateBroadcasterProgressState) -> Option<&str> {
@@ -1106,7 +1238,25 @@ fn render_pending_public_broadcaster_progress_context(
         ))
 }
 
+fn private_broadcaster_copy_action(id: String, value: String, tooltip: &'static str) -> AnyElement {
+    div()
+        .id(SharedString::from(format!("{id}-action")))
+        .flex_none()
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .child(clipboard_with_toast(SharedString::from(id), value))
+        .into_any_element()
+}
+
 fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressState) -> gpui::Div {
+    let recipient = progress.recipient.to_string();
+    let recipient_copy_action = private_broadcaster_copy_action(
+        format!(
+            "private-self-broadcast-recipient-copy-{}",
+            progress.generation_id
+        ),
+        recipient.clone(),
+        "Copy recipient",
+    );
     let mut context = div()
         .flex()
         .flex_col()
@@ -1118,16 +1268,21 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
         .border_color(rgb(theme::BORDER))
         .child(app_strong_text("Transaction context"))
         .child(private_broadcaster_context_row(
-            "Gas payer",
+            if progress.sponsored_funding {
+                "Transaction signer"
+            } else {
+                "Gas payer"
+            },
             progress
                 .gas_payer
                 .as_deref()
                 .unwrap_or("Selected Public account")
                 .to_string(),
         ))
-        .child(private_broadcaster_context_row(
+        .child(private_broadcaster_context_row_with_action(
             "Recipient",
-            spend_authorization_recipient_display(progress.recipient.as_ref()),
+            spend_authorization_recipient_display(&recipient),
+            Some(recipient_copy_action),
         ));
     if let Some(result) = progress.self_broadcast_result.as_ref() {
         for (label, value) in self_broadcast_composite_output_rows(progress, result) {
@@ -1161,6 +1316,36 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
             .child(private_broadcaster_context_row(
                 "Block",
                 result.tx.block_number.to_string(),
+            ));
+    }
+    if let Some(SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt)) =
+        progress.sponsored_self_broadcast_outcome.as_ref()
+    {
+        context = context
+            .child(private_broadcaster_context_row(
+                "Receipt",
+                if receipt.status {
+                    "confirmed"
+                } else {
+                    "reverted"
+                }
+                .to_owned(),
+            ))
+            .child(private_broadcaster_context_row_with_action(
+                "Transaction hash",
+                receipt.tx_hash.clone(),
+                Some(private_broadcaster_copy_action(
+                    format!(
+                        "private-self-broadcast-tx-hash-copy-{}",
+                        progress.generation_id
+                    ),
+                    receipt.tx_hash.clone(),
+                    "Copy transaction hash",
+                )),
+            ))
+            .child(private_broadcaster_context_row(
+                "Block",
+                receipt.block_number.to_string(),
             ));
     }
     context
@@ -1210,6 +1395,8 @@ fn render_private_broadcaster_progress_footer(
             "progress-stop",
             if public_broadcaster_waiting_can_stop(progress, now) && !progress.stop_available {
                 "Stop waiting"
+            } else if progress.sponsored_funding {
+                "Stop retries"
             } else {
                 "Stop"
             },

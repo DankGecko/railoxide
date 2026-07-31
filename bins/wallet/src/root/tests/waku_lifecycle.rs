@@ -259,7 +259,7 @@ async fn lock_cancellation_aborts_in_flight_broadcaster_work() {
     let task = tokio::spawn(std::future::pending::<()>());
     progress.as_mut().expect("progress").task_abort_handle = Some(task.abort_handle());
 
-    cancel_private_broadcaster_progress(&mut progress);
+    let _ = cancel_private_broadcaster_progress(&mut progress);
 
     assert!(progress.is_none());
     assert!(task.await.expect_err("task was aborted").is_cancelled());

@@ -100,6 +100,24 @@ pub(super) fn format_token_amount_for_display(
     )
 }
 
+pub(super) fn format_token_amount_ceiling_for_display(
+    chain_id: u64,
+    token: Address,
+    amount: U256,
+    registry: Option<&EffectiveTokenRegistry>,
+) -> String {
+    token_display_metadata(registry, chain_id, &token).map_or_else(
+        || format!("{} raw token units ({})", amount, short_address(&token)),
+        |info| {
+            format!(
+                "{} {}",
+                railgun_ui::format_token_amount_ceiling(amount, info.decimals),
+                info.symbol
+            )
+        },
+    )
+}
+
 pub(super) const fn native_token_display_label(chain_id: u64) -> &'static str {
     match native_wrapped_output_labels(chain_id) {
         Some((native_label, _wrapped_label)) => native_label,

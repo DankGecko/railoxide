@@ -1268,7 +1268,7 @@ fn private_broadcaster_context_row_with_optional_suffix(
         .child(strong_wrapping_value(value, suffix))
 }
 
-fn private_broadcaster_context_row_with_action(
+pub(super) fn private_broadcaster_context_row_with_action(
     label: &'static str,
     value: String,
     action: Option<AnyElement>,

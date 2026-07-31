@@ -1,7 +1,8 @@
 use super::{
     Alert, ButtonVariants, DeliveryFormKind, DeliveryMode, Disableable, Entity, ParentElement,
-    PublicBroadcasterResultKind, SendResult, Sizable, Styled, UnshieldAssetKey, UnshieldResult,
-    WalletRoot, app_button, delivery_element_id, div, fee_policy_eligible_public_broadcasters,
+    Pixels, PublicBroadcasterResultKind, SendResult, Sizable, SponsoredSelfBroadcastSessionOutcome,
+    Styled, UnshieldAssetKey, UnshieldResult, WalletRoot, app_button, app_muted_text,
+    app_strong_text, delivery_element_id, div, fee_policy_eligible_public_broadcasters,
     format_form_error_for_asset, is_effective_wrapped_native_token, labeled_field,
     private_action_input, private_broadcaster_closed_active_progress,
     public_broadcaster_cost_status, public_broadcaster_fee_token_warning,
@@ -13,7 +14,9 @@ use super::{
     render_recipient_picker, render_self_broadcast_settings, render_send_result,
     render_unshield_generating_status, render_unshield_native_top_up_control,
     render_unshield_output_toggle, render_unshield_result, selected_broadcaster_fee_warning,
-    send_element_id, should_render_public_broadcaster_cost_preview, unshield_element_id,
+    send_element_id, should_render_public_broadcaster_cost_preview,
+    sponsored_funding_choice_visible, sponsored_funding_enabled,
+    sponsored_self_broadcast_availability_reason, unshield_element_id,
 };
 
 impl WalletRoot {
@@ -40,6 +43,15 @@ impl WalletRoot {
         let recipient_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
+        let effective_chain = self.effective_chain_configs.get(&asset.chain_id);
+        let show_sponsored_funding_choice = sponsored_funding_choice_visible(effective_chain);
+        let sponsorship_unavailable_reason = show_sponsored_funding_choice
+            .then(|| sponsored_self_broadcast_availability_reason(effective_chain))
+            .flatten();
+        let sponsorship_enabled = sponsored_funding_enabled(
+            show_sponsored_funding_choice,
+            sponsorship_unavailable_reason,
+        );
         let mut public_broadcaster_submit_disabled = false;
         let mut self_broadcast_submit_disabled = false;
         let generation_ready = self.private_action_generation_ready(asset.chain_id);
@@ -50,7 +62,17 @@ impl WalletRoot {
         );
         let self_broadcast_submitted =
             matches!(form.result.as_ref(), Some(SendResult::SelfBroadcast(_)));
-        let submitted = public_broadcaster_submitted || self_broadcast_submitted;
+        let sponsored_submitted = matches!(
+            form.result.as_ref(),
+            Some(SendResult::Sponsored(result))
+                if matches!(
+                    result.outcome,
+                    SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(ref receipt)
+                        if receipt.status
+                )
+        );
+        let submitted =
+            public_broadcaster_submitted || self_broadcast_submitted || sponsored_submitted;
         let recipient_options = self.private_send_recipient_options();
 
         let mut card =
@@ -82,6 +104,7 @@ impl WalletRoot {
             form.delivery_mode,
             form.generating,
             !self_broadcast_accounts.is_empty(),
+            sponsorship_enabled,
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
@@ -166,6 +189,12 @@ impl WalletRoot {
                 self.public_balance_snapshot.as_deref(),
                 &form.self_broadcast_gas_payer_select,
                 &form.self_broadcast_gas_fee,
+                form.self_broadcast_funding,
+                form.sponsored_incentive,
+                &form.sponsored_custom_incentive_input,
+                show_sponsored_funding_choice,
+                sponsorship_enabled,
+                sponsorship_unavailable_reason,
                 form.generating,
             ));
         }
@@ -336,6 +365,9 @@ impl WalletRoot {
                         ),
                     ));
                 }
+                SendResult::Sponsored(result) => {
+                    card = card.child(render_sponsored_self_broadcast_result(result));
+                }
             }
         }
 
@@ -373,6 +405,15 @@ impl WalletRoot {
         let top_up_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
+        let effective_chain = self.effective_chain_configs.get(&asset.chain_id);
+        let show_sponsored_funding_choice = sponsored_funding_choice_visible(effective_chain);
+        let sponsorship_unavailable_reason = show_sponsored_funding_choice
+            .then(|| sponsored_self_broadcast_availability_reason(effective_chain))
+            .flatten();
+        let sponsorship_enabled = sponsored_funding_enabled(
+            show_sponsored_funding_choice,
+            sponsorship_unavailable_reason,
+        );
         let mut public_broadcaster_submit_disabled = false;
         let mut self_broadcast_submit_disabled = false;
         let generation_ready = self.private_action_generation_ready(asset.chain_id);
@@ -383,7 +424,17 @@ impl WalletRoot {
         );
         let self_broadcast_submitted =
             matches!(form.result.as_ref(), Some(UnshieldResult::SelfBroadcast(_)));
-        let submitted = public_broadcaster_submitted || self_broadcast_submitted;
+        let sponsored_submitted = matches!(
+            form.result.as_ref(),
+            Some(UnshieldResult::Sponsored(result))
+                if matches!(
+                    result.outcome,
+                    SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(ref receipt)
+                        if receipt.status
+                )
+        );
+        let submitted =
+            public_broadcaster_submitted || self_broadcast_submitted || sponsored_submitted;
         let recipient_options = self.private_unshield_recipient_options();
 
         let mut card =
@@ -415,6 +466,7 @@ impl WalletRoot {
             form.delivery_mode,
             form.generating,
             !self_broadcast_accounts.is_empty(),
+            sponsorship_enabled,
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
@@ -500,6 +552,12 @@ impl WalletRoot {
                 self.public_balance_snapshot.as_deref(),
                 &form.self_broadcast_gas_payer_select,
                 &form.self_broadcast_gas_fee,
+                form.self_broadcast_funding,
+                form.sponsored_incentive,
+                &form.sponsored_custom_incentive_input,
+                show_sponsored_funding_choice,
+                sponsorship_enabled,
+                sponsorship_unavailable_reason,
                 form.generating,
             ));
         }
@@ -696,9 +754,55 @@ impl WalletRoot {
                         ),
                     ));
                 }
+                UnshieldResult::Sponsored(result) => {
+                    card = card.child(render_sponsored_self_broadcast_result(result));
+                }
             }
         }
 
         card
     }
+}
+
+fn render_sponsored_self_broadcast_result(
+    result: &wallet_ops::DesktopSponsoredSelfBroadcastResult,
+) -> gpui::Div {
+    let authorization = result.prepared.authorization;
+    let status = match &result.outcome {
+        SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt) if receipt.status => {
+            "Sponsored transaction confirmed"
+        }
+        SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(_) => {
+            "Sponsored transaction reverted"
+        }
+        SponsoredSelfBroadcastSessionOutcome::Stopped { .. } => "Sponsored retries stopped locally",
+    };
+    let mut content = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p(px(10.0))
+        .child(app_strong_text(status))
+        .child(app_muted_text(format!(
+            "Builder payment: {} native base units",
+            authorization.builder_payment
+        )))
+        .child(app_muted_text(format!(
+            "Private wrapped-native spend: {} (protocol fee {})",
+            authorization.gross_wrapped_native_spend, authorization.protocol_fee
+        )))
+        .child(app_muted_text(format!(
+            "Outer gas limit: {} · signer: {}",
+            authorization.transaction_gas_limit,
+            authorization.signer.to_checksum(None)
+        )))
+        .child(app_muted_text(
+            "Priority fee is paid to the block builder in addition to the private builder payment.",
+        ));
+    if let SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt) = &result.outcome {
+        content = content
+            .child(app_muted_text(format!("Transaction: {}", receipt.tx_hash)))
+            .child(app_muted_text(format!("Block: {}", receipt.block_number)));
+    }
+    content
 }

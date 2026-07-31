@@ -21,31 +21,37 @@ use gpui_component::{
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
 };
-use railgun_ui::{format_token_amount, short_address};
+use railgun_ui::{format_token_amount, format_usd_micro_value, short_address};
 use rand::seq::IndexedRandom;
 use tokio::sync::{mpsc, watch};
 use ui::controls::{
-    app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
+    app_button, app_button_base, app_button_label, app_inline_control_row, app_input,
+    app_muted_text, app_segment_button, app_strong_text,
 };
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     BroadcasterFeePolicy, DesktopNativeTopUpPlan, DesktopNativeTopUpRequest,
     DesktopPrivateSpendAuthorization, DesktopSelfBroadcastResult, DesktopSendCalldataRequest,
     DesktopSendPublicBroadcasterRequest, DesktopSendSelfBroadcastRequest,
-    DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterRequest,
-    DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode, ListUtxosOutput, PreparedSendCall,
-    PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
-    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
-    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, TokenAnchorRateCache,
-    TransactionGenerationStage, WalletSession, fee_policy_eligible_public_broadcasters,
-    native_top_up_policy_for_chain, native_top_up_primary_recipient_amount_for_fee_mode,
+    DesktopSponsoredSelfBroadcastResult, DesktopSponsoredSendSelfBroadcastRequest,
+    DesktopSponsoredUnshieldSelfBroadcastRequest, DesktopUnshieldCalldataRequest,
+    DesktopUnshieldPublicBroadcasterRequest, DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode,
+    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount,
+    PublicBalanceEntry, PublicBalanceSnapshot, PublicBroadcasterCandidate,
+    PublicBroadcasterCostEstimate, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
+    SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent,
+    SponsoredAuthorizationLimit, SponsoredIncentive, SponsoredSelfBroadcastCommand,
+    SponsoredSelfBroadcastSessionOutcome, TokenAnchorRateCache, TransactionGenerationStage,
+    WalletSession, fee_policy_eligible_public_broadcasters, native_top_up_policy_for_chain,
+    native_top_up_primary_recipient_amount_for_fee_mode,
     native_top_up_required_wrapped_native_amount_for_fee_mode, native_top_up_wrapped_native_amount,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
-    quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy_and_trust,
+    quote_desktop_self_broadcast_gas_fee, quote_sponsored_send_authorization_limit,
+    quote_sponsored_unshield_authorization_limit, select_public_broadcaster_with_policy_and_trust,
     settings::EffectiveTokenRegistry,
     submit_desktop_send_public_broadcaster, submit_desktop_send_self_broadcast,
+    submit_desktop_sponsored_send_self_broadcast, submit_desktop_sponsored_unshield_self_broadcast,
     submit_desktop_unshield_public_broadcaster, submit_desktop_unshield_self_broadcast,
     vault::{
         DesktopVaultStore, DesktopViewSession, PrivateAddressBookEntry, PublicAccountMetadata,
@@ -61,7 +67,7 @@ use super::broadcaster_picker::{
 };
 use super::gas_fee::{
     Eip1559GasFeeEditTarget, Eip1559GasFeeEditorState, Eip1559GasFeeMode, Eip1559GasFeeTarget,
-    render_eip1559_gas_fee_editor,
+    format_gwei, render_eip1559_gas_fee_editor,
 };
 use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
@@ -72,6 +78,7 @@ use super::private_broadcaster::{
     render_private_self_broadcast_status_notice, render_private_submission_active_status_notice,
 };
 use super::public_account::public_account_display_label;
+use super::public_action::public_action_fee_value_label;
 use super::public_balances::public_balance_entry_for_chain;
 use super::public_broadcaster::resolve_selected_public_broadcaster_fee_token;
 use super::public_broadcaster_cost::{
@@ -89,7 +96,8 @@ use super::{
     copyable_mono_field, dialog_content_max_height, dialog_max_height, effective_fee_handling_mode,
     format_exact_token_amount_for_display, format_native_token_amount_for_display,
     format_native_top_up_recipient_suffix, format_recipient_amount_with_native_top_up,
-    format_report_chain, format_send_amount_input, format_unshield_amount_input,
+    format_report_chain, format_send_amount_input, format_token_amount_ceiling_for_display,
+    format_token_amount_for_display, format_unshield_amount_input,
     is_effective_wrapped_native_token, labeled_field, native_token_display_label,
     native_wrapped_output_labels, new_prefilled_input, new_text_input, parse_address,
     public_balance_amount_label, public_broadcaster_fee_token_warning,
@@ -110,6 +118,8 @@ mod self_broadcast;
 mod types;
 
 pub(super) use delivery::*;
+#[cfg(test)]
+pub(super) use generation::sponsored_authorization_display;
 pub(super) use helpers::*;
 pub(super) use recipient_picker::*;
 pub(super) use render_helpers::*;

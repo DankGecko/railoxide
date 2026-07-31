@@ -1,5 +1,21 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum SelfBroadcastPrivacyIconPlacement {
+    DeliverySelector,
+    PublicFunding,
+}
+
+pub(in crate::root) const fn self_broadcast_privacy_icon_placement(
+    sponsorship_enabled: bool,
+) -> SelfBroadcastPrivacyIconPlacement {
+    if sponsorship_enabled {
+        SelfBroadcastPrivacyIconPlacement::PublicFunding
+    } else {
+        SelfBroadcastPrivacyIconPlacement::DeliverySelector
+    }
+}
+
 pub(in crate::root) fn render_delivery_selector(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -7,12 +23,14 @@ pub(in crate::root) fn render_delivery_selector(
     mode: DeliveryMode,
     generating: bool,
     self_broadcast_available: bool,
+    sponsorship_enabled: bool,
 ) -> gpui::Div {
     let selector_root = root;
+    let privacy_icon_placement = self_broadcast_privacy_icon_placement(sponsorship_enabled);
     div().flex().flex_col().gap_2().child(
         ButtonGroup::new(delivery_element_id(key, kind, "mode-toggle"))
             .w_full()
-            .children([
+            .children(vec![
                 private_action_segment_button(
                     delivery_element_id(key, kind, "public"),
                     "Public broadcaster",
@@ -23,10 +41,14 @@ pub(in crate::root) fn render_delivery_selector(
                     delivery_element_id(key, kind, "self"),
                     "Self-broadcast",
                     mode == DeliveryMode::SelfBroadcast,
-                    Some(render_self_broadcast_privacy_icon(
-                        delivery_element_id(key, kind, "self-privacy-warning"),
-                        mode == DeliveryMode::SelfBroadcast,
-                    )),
+                    (privacy_icon_placement == SelfBroadcastPrivacyIconPlacement::DeliverySelector)
+                        .then(|| {
+                            render_self_broadcast_privacy_icon(delivery_element_id(
+                                key,
+                                kind,
+                                "self-privacy-warning",
+                            ))
+                        }),
                 )
                 .disabled(generating || !self_broadcast_available),
                 private_action_segment_button(
@@ -274,10 +296,25 @@ pub(in crate::root) fn render_self_broadcast_settings(
     balance_snapshot: Option<&PublicBalanceSnapshot>,
     gas_payer_select: &Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
     gas_fee: &Eip1559GasFeeEditorState,
+    funding: SelfBroadcastFundingMode,
+    incentive: SponsoredIncentive,
+    custom_incentive_input: &Entity<InputState>,
+    show_sponsored_funding_choice: bool,
+    sponsorship_enabled: bool,
+    sponsorship_unavailable_reason: Option<&'static str>,
     generating: bool,
 ) -> gpui::Div {
     let random_root = root.clone();
+    let funding_root = root.clone();
+    let incentive_root = root.clone();
     let gas_fee_root = root;
+    let custom_incentive_input_for_select = custom_incentive_input.clone();
+    let funding = if show_sponsored_funding_choice {
+        funding
+    } else {
+        SelfBroadcastFundingMode::PublicBalance
+    };
+    let privacy_icon_placement = self_broadcast_privacy_icon_placement(sponsorship_enabled);
     let selected_uuid = selected_uuid.map(str::to_owned);
     let selected_account = selected_uuid.as_deref().and_then(|uuid| {
         accounts
@@ -286,6 +323,9 @@ pub(in crate::root) fn render_self_broadcast_settings(
     });
     let random_disabled = generating
         || !accounts.iter().any(|account| {
+            if funding == SelfBroadcastFundingMode::PrivateSponsorship {
+                return Some(account.public_account_uuid.as_str()) != selected_uuid.as_deref();
+            }
             self_broadcast_gas_payer_random_candidate(
                 account,
                 selected_uuid.as_deref(),
@@ -294,10 +334,11 @@ pub(in crate::root) fn render_self_broadcast_settings(
             )
         });
     let missing_selection = !accounts.is_empty() && selected_account.is_none();
-    let selected_zero_balance = selected_uuid.as_deref().is_some_and(|uuid| {
-        self_broadcast_native_balance_state(balance_snapshot, key.chain_id, uuid)
-            == SelfBroadcastNativeBalanceState::Zero
-    });
+    let selected_zero_balance = funding == SelfBroadcastFundingMode::PublicBalance
+        && selected_uuid.as_deref().is_some_and(|uuid| {
+            self_broadcast_native_balance_state(balance_snapshot, key.chain_id, uuid)
+                == SelfBroadcastNativeBalanceState::Zero
+        });
 
     div()
         .flex()
@@ -307,6 +348,128 @@ pub(in crate::root) fn render_self_broadcast_settings(
         .rounded_md()
         .border_1()
         .border_color(rgb(theme::BORDER))
+        .when(show_sponsored_funding_choice, |this| {
+            this.child(app_inline_control_row(
+                "Gas funding",
+                ButtonGroup::new(delivery_element_id(key, kind, "funding-toggle"))
+                    .outline()
+                    .compact()
+                    .disabled(generating)
+                    .child(app_segment_button(
+                        delivery_element_id(key, kind, "funding-public"),
+                        "Public balance",
+                        funding == SelfBroadcastFundingMode::PublicBalance,
+                        (privacy_icon_placement
+                            == SelfBroadcastPrivacyIconPlacement::PublicFunding)
+                            .then(|| {
+                                render_self_broadcast_privacy_icon(delivery_element_id(
+                                    key,
+                                    kind,
+                                    "funding-public-privacy-warning",
+                                ))
+                            }),
+                    ))
+                    .child(
+                        app_segment_button(
+                            delivery_element_id(key, kind, "funding-private"),
+                            BLOCK_BUILDER_SPONSORSHIP_LABEL,
+                            funding == SelfBroadcastFundingMode::PrivateSponsorship,
+                            None,
+                        )
+                        .disabled(sponsorship_unavailable_reason.is_some()),
+                    )
+                    .on_click(move |selected, _window, cx| {
+                        let Some(index) = selected.first() else {
+                            return;
+                        };
+                        let funding = if *index == 0 {
+                            SelfBroadcastFundingMode::PublicBalance
+                        } else {
+                            SelfBroadcastFundingMode::PrivateSponsorship
+                        };
+                        funding_root.update(cx, |root, cx| {
+                            root.set_self_broadcast_funding_mode(kind, key, funding, cx);
+                        });
+                    }),
+            ))
+        })
+        .when_some(sponsorship_unavailable_reason, |this, reason| {
+            this.child(app_muted_text(reason))
+        })
+        .when(
+            funding == SelfBroadcastFundingMode::PrivateSponsorship,
+            |this| {
+                this.child(app_inline_control_row(
+                    "Builder incentive",
+                    ButtonGroup::new(delivery_element_id(key, kind, "incentive-toggle"))
+                        .outline()
+                        .compact()
+                        .disabled(generating)
+                        .children(vec![
+                            app_segment_button(
+                                delivery_element_id(key, kind, "incentive-economy"),
+                                "Economy 1%",
+                                incentive == SponsoredIncentive::Economy,
+                                None,
+                            ),
+                            app_segment_button(
+                                delivery_element_id(key, kind, "incentive-standard"),
+                                "Standard 5%",
+                                incentive == SponsoredIncentive::Standard,
+                                None,
+                            ),
+                            app_segment_button(
+                                delivery_element_id(key, kind, "incentive-priority"),
+                                "Priority 15%",
+                                incentive == SponsoredIncentive::Priority,
+                                None,
+                            ),
+                            app_segment_button(
+                                delivery_element_id(key, kind, "incentive-custom"),
+                                "Custom",
+                                matches!(incentive, SponsoredIncentive::Custom(_)),
+                                None,
+                            ),
+                        ])
+                        .on_click(move |selected, _window, cx| {
+                            let Some(index) = selected.first() else {
+                                return;
+                            };
+                            let incentive = match *index {
+                                0 => SponsoredIncentive::Economy,
+                                1 => SponsoredIncentive::Standard,
+                                2 => SponsoredIncentive::Priority,
+                                3 => {
+                                    let Ok(percent) = custom_incentive_input_for_select
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .parse::<u8>()
+                                    else {
+                                        return;
+                                    };
+                                    SponsoredIncentive::Custom(percent)
+                                }
+                                _ => return,
+                            };
+                            incentive_root.update(cx, |root, cx| {
+                                root.set_sponsored_incentive(kind, key, incentive, cx);
+                            });
+                        }),
+                ))
+                .when(
+                    matches!(incentive, SponsoredIncentive::Custom(_)),
+                    |this| {
+                        this.child(app_inline_control_row(
+                            "Custom incentive (1-100%)",
+                            private_action_input(custom_incentive_input)
+                                .disabled(generating)
+                                .w(px(180.0)),
+                        ))
+                    },
+                )
+            },
+        )
         .child(
             div()
                 .flex()
@@ -319,7 +482,13 @@ pub(in crate::root) fn render_self_broadcast_settings(
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(app_muted_text("Gas payer"))
+                            .child(app_muted_text(
+                                if funding == SelfBroadcastFundingMode::PrivateSponsorship {
+                                    "Transaction signer"
+                                } else {
+                                    "Gas payer"
+                                },
+                            ))
                             .when(selected_zero_balance, |this| {
                                 this.child(render_self_broadcast_gas_payer_warning_icon(
                                     delivery_element_id(key, kind, "zero-gas-payer-warning"),
@@ -339,7 +508,13 @@ pub(in crate::root) fn render_self_broadcast_settings(
                                 .ghost()
                                 .small()
                                 .compact()
-                                .tooltip("Choose random gas payer")
+                                .tooltip(
+                                    if funding == SelfBroadcastFundingMode::PrivateSponsorship {
+                                        "Choose random transaction signer"
+                                    } else {
+                                        "Choose random gas payer"
+                                    },
+                                )
                                 .disabled(random_disabled)
                                 .on_click(move |_event, window, cx| {
                                     random_root.update(cx, |root, cx| {
@@ -356,7 +531,11 @@ pub(in crate::root) fn render_self_broadcast_settings(
                                     .w_full()
                                     .h(px(32.0))
                                     .placeholder(if missing_selection {
-                                        "Gas payer required"
+                                        if funding == SelfBroadcastFundingMode::PrivateSponsorship {
+                                            "Transaction signer required"
+                                        } else {
+                                            "Gas payer required"
+                                        }
                                     } else {
                                         "Please select"
                                     })
@@ -371,7 +550,11 @@ pub(in crate::root) fn render_self_broadcast_settings(
         )
         .when(accounts.is_empty(), |this| {
             this.child(app_muted_text(
-                "No active Public accounts are available for self-broadcast gas payment.",
+                if funding == SelfBroadcastFundingMode::PrivateSponsorship {
+                    "No active Public accounts are available as transaction signers."
+                } else {
+                    "No active Public accounts are available for self-broadcast gas payment."
+                },
             ))
         })
         .child(render_eip1559_gas_fee_editor(
