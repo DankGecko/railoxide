@@ -157,7 +157,7 @@ use broadcaster_picker::{
 #[cfg(test)]
 use chain_load::{
     BalanceSyncIssue, PresenceStatus, WalletStatusCounts, balance_lag_threshold_blocks,
-    balance_stale_timeout_secs, balance_sync_issue, balances_presence_status, loading_summary,
+    balance_stale_timeout, balance_sync_issue, balances_presence_status, loading_summary,
     ppoi_presence_status, progress_detail, ready_wallet_status_labels,
     ready_wallet_status_shows_text, wallet_generation_matches,
 };

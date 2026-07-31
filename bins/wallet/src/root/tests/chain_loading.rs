@@ -1537,6 +1537,7 @@ fn ppoi_retry_stale_completion_does_not_clear_replacement() {
 #[test]
 fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
     let now = 1_000;
+    let ethereum_block_time = Duration::from_secs(12);
     let fresh = WalletSyncTip {
         last_scanned_block: Some(990),
         head_block: Some(1_012),
@@ -1545,13 +1546,30 @@ fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
         indexed_catch_up: None,
     };
 
-    assert_eq!(balance_stale_timeout_secs(1), 120);
-    assert_eq!(balance_lag_threshold_blocks(1), 10);
-    assert_eq!(balance_stale_timeout_secs(137), 45);
-    assert_eq!(balance_lag_threshold_blocks(137), 22);
-    assert_eq!(balance_sync_issue(Some(fresh), 1, now), None);
     assert_eq!(
-        balances_presence_status(false, true, Some(fresh), 1, now),
+        balance_stale_timeout(ethereum_block_time),
+        Duration::from_mins(2)
+    );
+    assert_eq!(balance_lag_threshold_blocks(ethereum_block_time), 10);
+    assert_eq!(
+        balance_stale_timeout(Duration::from_millis(450)),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        balance_lag_threshold_blocks(Duration::from_millis(450)),
+        100
+    );
+    assert_eq!(balance_lag_threshold_blocks(Duration::from_secs(1)), 45);
+    assert_eq!(
+        balance_lag_threshold_blocks(Duration::from_millis(250)),
+        180
+    );
+    assert_eq!(
+        balance_sync_issue(Some(fresh), ethereum_block_time, now),
+        None
+    );
+    assert_eq!(
+        balances_presence_status(false, true, Some(fresh), ethereum_block_time, now),
         PresenceStatus::Healthy
     );
 
@@ -1560,14 +1578,14 @@ fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
         ..fresh
     };
     assert_eq!(
-        balance_sync_issue(Some(stalled), 1, now),
+        balance_sync_issue(Some(stalled), ethereum_block_time, now),
         Some(BalanceSyncIssue::HeadStalled {
             stale_secs: 121,
             threshold_secs: 120,
         })
     );
     assert_eq!(
-        balances_presence_status(false, true, Some(stalled), 1, now),
+        balances_presence_status(false, true, Some(stalled), ethereum_block_time, now),
         PresenceStatus::Active
     );
 
@@ -1576,14 +1594,14 @@ fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
         ..fresh
     };
     assert_eq!(
-        balance_sync_issue(Some(lagging), 1, now),
+        balance_sync_issue(Some(lagging), ethereum_block_time, now),
         Some(BalanceSyncIssue::Lagging {
             lag_blocks: 11,
             threshold_blocks: 10,
         })
     );
     assert_eq!(
-        balances_presence_status(false, true, Some(lagging), 1, now),
+        balances_presence_status(false, true, Some(lagging), ethereum_block_time, now),
         PresenceStatus::Active
     );
 
@@ -1595,22 +1613,31 @@ fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
         }),
         ..fresh
     };
-    assert_eq!(balance_sync_issue(Some(indexed_catch_up), 1, now), None);
     assert_eq!(
-        balances_presence_status(false, true, Some(indexed_catch_up), 1, now),
+        balance_sync_issue(Some(indexed_catch_up), ethereum_block_time, now),
+        None
+    );
+    assert_eq!(
+        balances_presence_status(
+            false,
+            true,
+            Some(indexed_catch_up),
+            ethereum_block_time,
+            now,
+        ),
         PresenceStatus::Active
     );
 
     assert_eq!(
-        balance_sync_issue(None, 1, now),
+        balance_sync_issue(None, ethereum_block_time, now),
         Some(BalanceSyncIssue::HeadUnavailable)
     );
     assert_eq!(
-        balances_presence_status(false, true, None, 1, now),
+        balances_presence_status(false, true, None, ethereum_block_time, now),
         PresenceStatus::Unknown
     );
     assert_eq!(
-        balances_presence_status(true, false, None, 1, now),
+        balances_presence_status(true, false, None, ethereum_block_time, now),
         PresenceStatus::Active
     );
 }

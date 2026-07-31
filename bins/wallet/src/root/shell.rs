@@ -787,11 +787,18 @@ impl WalletRoot {
     }
 
     fn balances_status_for_state(&self, state: &ChainUtxoState) -> PresenceStatus {
+        let Some(block_time) = self
+            .effective_chain_configs
+            .get(&self.selected_chain)
+            .map(|chain| chain.block_time)
+        else {
+            return PresenceStatus::Unknown;
+        };
         balances_presence_status(
             state.is_syncing(),
             matches!(state, ChainUtxoState::Ready { .. }),
             state.sync_tip(),
-            self.selected_chain,
+            block_time,
             now_epoch_secs(),
         )
     }
@@ -1175,6 +1182,10 @@ impl Render for BalancesStatusHoverCard {
         let (status, labels, sync_tip, data_source, issue, counts, network_mode) = {
             let root = self.root.read(cx);
             let chain_id = root.selected_chain;
+            let block_time = root
+                .effective_chain_configs
+                .get(&chain_id)
+                .map(|chain| chain.block_time);
             let state = root.chain_states.get(&chain_id);
             let counts = root
                 .wallet_status_counts(state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref));
@@ -1194,7 +1205,7 @@ impl Render for BalancesStatusHoverCard {
             let data_source = balance_sync_data_source(context, progress);
             let issue = state
                 .filter(|state| matches!(state, ChainUtxoState::Ready { .. }))
-                .and_then(|_| balance_sync_issue(sync_tip, chain_id, now));
+                .and_then(|_| block_time.and_then(|time| balance_sync_issue(sync_tip, time, now)));
             (
                 status,
                 labels,

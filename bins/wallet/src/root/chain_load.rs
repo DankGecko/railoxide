@@ -3,7 +3,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-#[cfg(test)]
 use std::time::Duration;
 
 use gpui::{
@@ -746,7 +745,7 @@ pub(super) fn balances_presence_status(
     syncing: bool,
     ready: bool,
     sync_tip: Option<WalletSyncTip>,
-    chain_id: u64,
+    block_time: Duration,
     now_secs: u64,
 ) -> PresenceStatus {
     if syncing {
@@ -758,7 +757,7 @@ pub(super) fn balances_presence_status(
     if sync_tip.is_some_and(|tip| tip.indexed_catch_up.is_some()) {
         return PresenceStatus::Active;
     }
-    match balance_sync_issue(sync_tip, chain_id, now_secs) {
+    match balance_sync_issue(sync_tip, block_time, now_secs) {
         None => PresenceStatus::Healthy,
         Some(BalanceSyncIssue::HeadUnavailable) => PresenceStatus::Unknown,
         Some(BalanceSyncIssue::HeadStalled { .. } | BalanceSyncIssue::Lagging { .. }) => {
@@ -767,9 +766,9 @@ pub(super) fn balances_presence_status(
     }
 }
 
-pub(super) const fn balance_sync_issue(
+pub(super) fn balance_sync_issue(
     sync_tip: Option<WalletSyncTip>,
-    chain_id: u64,
+    block_time: Duration,
     now_secs: u64,
 ) -> Option<BalanceSyncIssue> {
     let Some(sync_tip) = sync_tip else {
@@ -785,7 +784,7 @@ pub(super) const fn balance_sync_issue(
         return Some(BalanceSyncIssue::HeadUnavailable);
     };
 
-    let threshold_secs = balance_stale_timeout_secs(chain_id);
+    let threshold_secs = balance_stale_timeout(block_time).as_secs();
     let stale_secs = now_secs.saturating_sub(head_last_advanced_at);
     if stale_secs > threshold_secs {
         return Some(BalanceSyncIssue::HeadStalled {
@@ -798,7 +797,7 @@ pub(super) const fn balance_sync_issue(
         return Some(BalanceSyncIssue::HeadUnavailable);
     };
     let lag_blocks = safe_head_block.saturating_sub(last_scanned_block);
-    let threshold_blocks = balance_lag_threshold_blocks(chain_id);
+    let threshold_blocks = balance_lag_threshold_blocks(block_time);
     if lag_blocks > threshold_blocks {
         return Some(BalanceSyncIssue::Lagging {
             lag_blocks,
@@ -809,24 +808,13 @@ pub(super) const fn balance_sync_issue(
     None
 }
 
-pub(super) const fn balance_block_time_secs(chain_id: u64) -> u64 {
-    match chain_id {
-        56 => 3,
-        137 => 2,
-        42161 => 1,
-        _ => 12,
-    }
+pub(super) fn balance_stale_timeout(block_time: Duration) -> Duration {
+    block_time.saturating_mul(10).max(Duration::from_secs(45))
 }
 
-pub(super) const fn balance_stale_timeout_secs(chain_id: u64) -> u64 {
-    let timeout = balance_block_time_secs(chain_id) * 10;
-    if timeout < 45 { 45 } else { timeout }
-}
-
-pub(super) const fn balance_lag_threshold_blocks(chain_id: u64) -> u64 {
-    let block_time = balance_block_time_secs(chain_id);
-    let threshold = balance_stale_timeout_secs(chain_id) / block_time;
-    if threshold < 2 { 2 } else { threshold }
+pub(super) fn balance_lag_threshold_blocks(block_time: Duration) -> u64 {
+    let threshold = balance_stale_timeout(block_time).as_nanos() / block_time.as_nanos().max(1);
+    u64::try_from(threshold).unwrap_or(u64::MAX).max(2)
 }
 
 pub(super) const fn ppoi_presence_status(
