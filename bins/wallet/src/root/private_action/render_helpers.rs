@@ -451,7 +451,7 @@ pub(in crate::root) fn render_unshield_native_top_up_control(
         );
         let native_amount =
             format_native_token_amount_for_display(key.chain_id, plan.native_amount);
-        let source_amount = format_exact_token_amount_for_display(
+        let source_amount = format_token_amount_for_display(
             key.chain_id,
             plan.wrapped_native_token,
             plan.wrapped_native_amount,
