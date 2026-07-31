@@ -45,5 +45,11 @@ pub use public_broadcaster::*;
 pub(crate) use public_broadcaster_submit::*;
 pub use requests::*;
 pub(crate) use self_broadcast::*;
+pub use self_broadcast::{
+    SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastCommandSender,
+    SponsoredSelfBroadcastSessionOutcome, SponsoredSelfBroadcastSessionRequest,
+    SponsoredSelfBroadcastStopReason, run_sponsored_self_broadcast_session,
+    sponsored_self_broadcast_head_poll_interval,
+};
 pub use sessions::*;
 pub(crate) use sync_helpers::*;

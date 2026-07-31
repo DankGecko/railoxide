@@ -354,6 +354,68 @@ pub(crate) async fn persist_pending_composite_unshield_output_poi_contexts(
     create_pending_output_poi_contexts(session, &records).await
 }
 
+pub(crate) async fn persist_pending_mixed_output_poi_contexts(
+    session: &WalletSession,
+    chunks: &[TransactionPlanChunk],
+    private_outputs: &[MixedPrivatePlannedOutput],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+) -> Result<usize> {
+    let created_at = now_epoch_secs()?;
+    let records = build_pending_mixed_output_poi_context_records(
+        session.chain_id,
+        &session.cache_key,
+        created_at,
+        chunks,
+        private_outputs,
+        pre_transaction_pois,
+        poi_list_keys,
+    )?;
+    create_pending_output_poi_contexts(session, &records).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_pending_mixed_output_poi_context_records(
+    chain_id: u64,
+    wallet_id: &str,
+    created_at: u64,
+    chunks: &[TransactionPlanChunk],
+    private_outputs: &[MixedPrivatePlannedOutput],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+) -> Result<Vec<PendingOutputPoiContextRecord>> {
+    let mut records = Vec::with_capacity(private_outputs.len());
+    for output in private_outputs {
+        if !output.persist_for_pending_output_poi() {
+            continue;
+        }
+        let chunk = chunks
+            .get(output.transaction_index)
+            .ok_or_else(|| eyre!("mixed output role references missing chunk"))?;
+        let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
+        let note = chunk
+            .outputs
+            .get(output.output_index)
+            .ok_or_else(|| eyre!("mixed output role references missing private output"))?;
+        records.push(pending_output_poi_context_record(
+            chain_id,
+            wallet_id,
+            created_at,
+            &chunk_context,
+            note,
+            pending_output_role_from_mixed(output.role),
+        ));
+    }
+    Ok(records)
+}
+
+const fn pending_output_role_from_mixed(role: MixedPrivateOutputRole) -> PendingOutputPoiRole {
+    match role {
+        MixedPrivateOutputRole::Recipient(_) => PendingOutputPoiRole::Recipient,
+        MixedPrivateOutputRole::Change => PendingOutputPoiRole::Change,
+    }
+}
+
 const fn pending_output_role_from_composite(
     role: CompositePrivateOutputRoleKind,
 ) -> PendingOutputPoiRole {

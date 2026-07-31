@@ -4,8 +4,8 @@ use railgun_wallet::RailgunSpendSigner;
 
 pub(crate) use crate::poi_contexts::{
     active_list_pre_transaction_pois, persist_pending_composite_unshield_output_poi_contexts,
-    persist_pending_send_output_poi_contexts, persist_pending_unshield_output_poi_contexts,
-    public_broadcaster_pre_transaction_pois,
+    persist_pending_mixed_output_poi_contexts, persist_pending_send_output_poi_contexts,
+    persist_pending_unshield_output_poi_contexts, public_broadcaster_pre_transaction_pois,
 };
 pub(crate) use crate::utxos::utxo_outputs_from_utxos;
 
@@ -351,6 +351,107 @@ pub struct DesktopSendSelfBroadcastRequest {
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
     pub command_rx: Option<SelfBroadcastCommandReceiver>,
+    pub event_tx: Option<SelfBroadcastSessionEventSender>,
+}
+
+pub struct DesktopSponsoredSendCalldataRequest {
+    pub chain_id: u64,
+    pub effective_chain: settings::EffectiveChainConfig,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
+    pub public_account_uuid: String,
+    pub token: Address,
+    pub amount: U256,
+    pub recipient: String,
+    pub verify_proof: bool,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+    pub incentive: SponsoredIncentive,
+    pub authorization_limit: SponsoredAuthorizationLimit,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+}
+
+pub struct DesktopSponsoredUnshieldCalldataRequest {
+    pub chain_id: u64,
+    pub effective_chain: settings::EffectiveChainConfig,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
+    pub public_account_uuid: String,
+    pub token: Address,
+    pub amount: U256,
+    pub fee_mode: FeeHandlingMode,
+    pub recipient: Address,
+    pub unwrap: bool,
+    pub native_top_up: Option<DesktopNativeTopUpRequest>,
+    pub verify_proof: bool,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+    pub incentive: SponsoredIncentive,
+    pub authorization_limit: SponsoredAuthorizationLimit,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+}
+
+pub struct DesktopPreparedSponsoredSelfBroadcastRequest {
+    pub chain_id: u64,
+    pub effective_chain: settings::EffectiveChainConfig,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub vault_password: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    pub public_account_uuid: String,
+    pub prepared: PreparedSponsoredCall,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub command_rx: watch::Receiver<SponsoredSelfBroadcastCommand>,
+    pub event_tx: Option<SelfBroadcastSessionEventSender>,
+}
+
+pub struct DesktopSponsoredSendSelfBroadcastRequest {
+    pub chain_id: u64,
+    pub effective_chain: settings::EffectiveChainConfig,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
+    pub vault_password: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    pub public_account_uuid: String,
+    pub token: Address,
+    pub amount: U256,
+    pub recipient: String,
+    pub verify_proof: bool,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+    pub incentive: SponsoredIncentive,
+    pub authorization_limit: SponsoredAuthorizationLimit,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub command_rx: watch::Receiver<SponsoredSelfBroadcastCommand>,
+    pub event_tx: Option<SelfBroadcastSessionEventSender>,
+}
+
+pub struct DesktopSponsoredUnshieldSelfBroadcastRequest {
+    pub chain_id: u64,
+    pub effective_chain: settings::EffectiveChainConfig,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
+    pub vault_password: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    pub public_account_uuid: String,
+    pub token: Address,
+    pub amount: U256,
+    pub fee_mode: FeeHandlingMode,
+    pub recipient: Address,
+    pub unwrap: bool,
+    pub native_top_up: Option<DesktopNativeTopUpRequest>,
+    pub verify_proof: bool,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+    pub incentive: SponsoredIncentive,
+    pub authorization_limit: SponsoredAuthorizationLimit,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub command_rx: watch::Receiver<SponsoredSelfBroadcastCommand>,
     pub event_tx: Option<SelfBroadcastSessionEventSender>,
 }
 

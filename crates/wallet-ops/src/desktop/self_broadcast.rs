@@ -1,5 +1,7 @@
 use super::*;
+use async_trait::async_trait;
 use eyre::eyre;
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
 
 const TREZOR_APP_PASSPHRASE_ERROR_TEXT: &str =
     "Trezor requested an app-entered passphrase but none was provided";
@@ -963,6 +965,33 @@ pub(crate) fn self_broadcast_transaction_request(
         .with_nonce(nonce)
 }
 
+pub(super) async fn sponsored_code_preflight_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    payer: Address,
+    signer: Address,
+) -> std::result::Result<ProviderHandle, SponsorshipError> {
+    for provider_handle in query_rpc_pool.available_providers() {
+        match sponsored_code_preflight(&provider_handle.provider, payer, signer).await {
+            Ok(()) => return Ok(provider_handle),
+            Err(SponsorshipError::CodeQueryFailed) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(SponsorshipError::CodeQueryFailed)
+}
+
+pub(super) async fn sponsored_exact_gas_estimate(
+    provider_handle: &ProviderHandle,
+    to: Address,
+    data: Bytes,
+) -> Result<u64> {
+    provider_handle
+        .provider
+        .estimate_gas(TransactionRequest::default().with_to(to).with_input(data))
+        .await
+        .map_err(|_| eyre!("exact sponsored calldata gas estimation failed"))
+}
+
 pub(crate) const fn self_broadcast_gas_limit_with_buffer(
     estimated_gas: u64,
     gas_limit_buffer: u64,
@@ -1232,9 +1261,1040 @@ pub(crate) fn parse_submitted_tx_hash(tx_hash: &str) -> Option<FixedBytes<32>> {
     tx_hash.parse().ok()
 }
 
+const SPONSORED_HEAD_POLL_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const SPONSORED_HEAD_POLL_MAX_INTERVAL: Duration = Duration::from_secs(3);
+const SPONSORED_PENDING_LOCK_RENEW_INTERVAL: Duration = Duration::from_mins(5);
+const SPONSORED_PENDING_MARK_TIMEOUT: Duration = Duration::from_secs(5);
+const SPONSORED_CANCEL_GRACE_MIN: Duration = Duration::from_secs(15);
+const SPONSORED_CANCEL_GRACE_MAX: Duration = Duration::from_mins(1);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SponsoredSelfBroadcastCommand {
+    #[default]
+    Running,
+    Cancel,
+    Shutdown,
+}
+
+pub type SponsoredSelfBroadcastCommandSender = watch::Sender<SponsoredSelfBroadcastCommand>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SponsoredSelfBroadcastStopReason {
+    Cancelled,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SponsoredSelfBroadcastSessionOutcome {
+    CanonicalReceipt(TxReceiptOutput),
+    Stopped {
+        reason: SponsoredSelfBroadcastStopReason,
+        bundle_was_accepted: bool,
+    },
+}
+
+pub struct SponsoredSelfBroadcastSessionRequest {
+    pub chain_id: u64,
+    pub effective_chain: settings::EffectiveChainConfig,
+    pub session: Arc<WalletSession>,
+    pub signed_raw_transaction: Vec<u8>,
+    pub pending_spent_inputs: Vec<Utxo>,
+    pub command_rx: watch::Receiver<SponsoredSelfBroadcastCommand>,
+}
+
+#[must_use]
+pub fn sponsored_self_broadcast_head_poll_interval(block_time: Duration) -> Duration {
+    (block_time / 4).clamp(
+        SPONSORED_HEAD_POLL_MIN_INTERVAL,
+        SPONSORED_HEAD_POLL_MAX_INTERVAL,
+    )
+}
+
+#[must_use]
+pub(crate) fn sponsored_self_broadcast_cancel_grace(block_time: Duration) -> Duration {
+    block_time
+        .saturating_mul(2)
+        .clamp(SPONSORED_CANCEL_GRACE_MIN, SPONSORED_CANCEL_GRACE_MAX)
+}
+
+/// Runs one signed sponsored transaction until a canonical receipt or local stop.
+///
+/// The signed payload is owned only by this call. It is reused for every relay
+/// attempt and is neither persisted nor submitted through normal chain RPCs.
+pub async fn run_sponsored_self_broadcast_session(
+    request: SponsoredSelfBroadcastSessionRequest,
+    http: &HttpContext,
+) -> Result<SponsoredSelfBroadcastSessionOutcome> {
+    if request.session.chain_id != request.chain_id {
+        return Err(eyre!(
+            "selected wallet session is for chain {}, not {}",
+            request.session.chain_id,
+            request.chain_id
+        ));
+    }
+    if request.effective_chain.chain_id != request.chain_id {
+        return Err(eyre!(
+            "effective chain config is for chain {}, not {}",
+            request.effective_chain.chain_id,
+            request.chain_id
+        ));
+    }
+    if request.effective_chain.block_time.is_zero() {
+        return Err(eyre!(
+            "sponsored self-broadcast block time must be non-zero"
+        ));
+    }
+    if request.effective_chain.sponsored_bundle_relays.is_empty() {
+        return Err(eyre!(
+            "sponsored self-broadcast requires at least one relay"
+        ));
+    }
+
+    let rpc_urls =
+        parse_effective_rpc_urls(request.chain_id, &request.effective_chain.rpc_endpoints)?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(rpc_urls, http);
+    let tx_hash = keccak256(&request.signed_raw_transaction);
+    let signed_raw_transaction = Zeroizing::new(hex::encode_prefixed(
+        Zeroizing::new(request.signed_raw_transaction).as_slice(),
+    ));
+    let backend = LiveSponsoredSelfBroadcastBackend {
+        http,
+        relays: &request.effective_chain.sponsored_bundle_relays,
+        query_rpc_pool,
+        session: &request.session,
+        pending_spent_inputs: &request.pending_spent_inputs,
+    };
+
+    run_sponsored_self_broadcast_session_with_backend(
+        &backend,
+        request.effective_chain.block_time,
+        tx_hash,
+        signed_raw_transaction.as_str(),
+        request.command_rx,
+    )
+    .await
+}
+
+fn resolve_sponsored_pending_spent_inputs(
+    available: Vec<Utxo>,
+    selected: &[SelectedInputIdentity],
+) -> Result<Vec<Utxo>> {
+    let mut by_identity = available
+        .into_iter()
+        .map(|utxo| (SelectedInputIdentity::from_utxo(&utxo), utxo))
+        .collect::<BTreeMap<_, _>>();
+    let mut resolved = Vec::with_capacity(selected.len());
+    for identity in selected {
+        let utxo = by_identity.remove(identity).ok_or_else(|| {
+            eyre!(
+                "sponsored selected input at tree {} position {} is no longer spendable",
+                identity.tree,
+                identity.position
+            )
+        })?;
+        resolved.push(utxo);
+    }
+    Ok(resolved)
+}
+
+pub(super) async fn submit_prepared_sponsored_self_broadcast(
+    mut request: DesktopPreparedSponsoredSelfBroadcastRequest,
+    http: &HttpContext,
+) -> Result<SponsoredSelfBroadcastSessionOutcome> {
+    if request.prepared.chain_id != request.chain_id {
+        return Err(eyre!(
+            "prepared sponsored call is for chain {}, not {}",
+            request.prepared.chain_id,
+            request.chain_id
+        ));
+    }
+    if request.prepared.authorization.delivery != PrivateDeliveryMode::SelfBroadcast {
+        return Err(SponsorshipError::DeliveryUnsupported.into());
+    }
+
+    let chain = effective_desktop_chain_config(request.chain_id, Some(&request.effective_chain))?;
+    let signer_address = self_broadcast_gas_payer(
+        &request.vault_store,
+        &request.view_session,
+        &request.public_account_uuid,
+    )?;
+    if signer_address != request.prepared.authorization.signer {
+        return Err(eyre!(
+            "selected sponsored signer does not match the authorized signer"
+        ));
+    }
+    let payer = request
+        .effective_chain
+        .coinbase_payer
+        .ok_or(SponsorshipError::MissingCoinbasePayer)?;
+    if payer != request.prepared.authorization.coinbase_payer {
+        return Err(eyre!(
+            "effective coinbase payer does not match the authorized payer"
+        ));
+    }
+
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let provider_handle =
+        sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
+    let nonce = provider_handle
+        .provider
+        .get_transaction_count(signer_address)
+        .await
+        .map_err(|_| eyre!("sponsored self-broadcast nonce query failed"))?;
+    let pending_spent_inputs = resolve_sponsored_pending_spent_inputs(
+        request.session.unspent_utxos(),
+        &request.prepared.selected_inputs,
+    )?;
+    if pending_spent_inputs.len() != request.prepared.input_count {
+        return Err(eyre!(
+            "prepared sponsored input count does not match selected input identities"
+        ));
+    }
+
+    if let Some(reason) = sponsored_pending_stop_reason(&request.command_rx) {
+        return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+            reason,
+            bundle_was_accepted: false,
+        });
+    }
+
+    let vault_password = request.vault_password.take();
+    let signer = vaulted_public_signer(
+        &request.vault_store,
+        &request.view_session,
+        vault_password.as_ref().map(|password| password.as_str()),
+        &request.public_account_uuid,
+        None,
+        request.trezor_pin_matrix_provider,
+    )?;
+    drop(vault_password);
+    if signer.address() != signer_address {
+        return Err(eyre!(
+            "selected public account signer address does not match account metadata"
+        ));
+    }
+    let data = request
+        .prepared
+        .data
+        .strip_prefix("0x")
+        .unwrap_or(&request.prepared.data);
+    let data = Bytes::from(hex::decode(data).wrap_err("decode prepared sponsored calldata")?);
+    let authorization = request.prepared.authorization;
+    let tx_req = self_broadcast_transaction_request(
+        request.chain_id,
+        signer_address,
+        request.prepared.to,
+        data,
+        authorization.max_fee_per_gas,
+        authorization.max_priority_fee_per_gas,
+        nonce,
+    )
+    .with_gas_limit(authorization.transaction_gas_limit);
+
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::SigningSelfBroadcast,
+    );
+    if let Some(reason) = sponsored_pending_stop_reason(&request.command_rx) {
+        return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+            reason,
+            bundle_was_accepted: false,
+        });
+    }
+    let signed_raw_transaction = {
+        let signing = signer.sign_transaction_request(tx_req, "sponsored self-broadcast");
+        tokio::pin!(signing);
+        tokio::select! {
+            result = &mut signing => result?,
+            changed = request.command_rx.changed() => {
+                let reason = if changed.is_err() {
+                    SponsoredSelfBroadcastStopReason::Shutdown
+                } else {
+                    sponsored_stop_reason(*request.command_rx.borrow_and_update())
+                        .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                };
+                return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                    reason,
+                    bundle_was_accepted: false,
+                });
+            }
+        }
+    };
+    emit_refreshed_self_broadcast_hardware_session(request.event_tx.as_ref(), &signer);
+    drop(signer);
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+    );
+    run_sponsored_self_broadcast_session(
+        SponsoredSelfBroadcastSessionRequest {
+            chain_id: request.chain_id,
+            effective_chain: request.effective_chain,
+            session: request.session,
+            signed_raw_transaction,
+            pending_spent_inputs,
+            command_rx: request.command_rx,
+        },
+        http,
+    )
+    .await
+}
+
+fn sponsored_pending_stop_reason(
+    command_rx: &watch::Receiver<SponsoredSelfBroadcastCommand>,
+) -> Option<SponsoredSelfBroadcastStopReason> {
+    if command_rx.has_changed().is_err() {
+        sponsored_stop_reason(*command_rx.borrow())
+            .or(Some(SponsoredSelfBroadcastStopReason::Shutdown))
+    } else {
+        sponsored_stop_reason(*command_rx.borrow())
+    }
+}
+
+#[async_trait]
+trait SponsoredSelfBroadcastBackend {
+    async fn submit_bundle(&self, signed_raw_transaction: &str, tx_hash: FixedBytes<32>) -> bool;
+    async fn canonical_state(&self, tx_hash: FixedBytes<32>) -> SponsoredCanonicalState;
+    async fn mark_inputs_pending_spent(&self, tx_hash: FixedBytes<32>) -> Result<()>;
+}
+
+#[derive(Default)]
+struct SponsoredCanonicalState {
+    receipt: Option<TxReceiptOutput>,
+    head: Option<(usize, u64)>,
+}
+
+struct LiveSponsoredSelfBroadcastBackend<'a> {
+    http: &'a HttpContext,
+    relays: &'a [SensitiveUrl],
+    query_rpc_pool: Arc<QueryRpcPool>,
+    session: &'a WalletSession,
+    pending_spent_inputs: &'a [Utxo],
+}
+
+#[async_trait]
+impl SponsoredSelfBroadcastBackend for LiveSponsoredSelfBroadcastBackend<'_> {
+    async fn submit_bundle(&self, signed_raw_transaction: &str, tx_hash: FixedBytes<32>) -> bool {
+        match submit_sponsored_bundle_with_acceptance(
+            self.http,
+            self.relays,
+            signed_raw_transaction,
+            || async {
+                if tokio::time::timeout(
+                    SPONSORED_PENDING_MARK_TIMEOUT,
+                    self.session
+                        .mark_pending_spent_utxos(self.pending_spent_inputs, Some(tx_hash)),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!(
+                        "timed out marking sponsored inputs pending-spent after relay acceptance"
+                    );
+                }
+            },
+        )
+        .await
+        {
+            Ok(fanout) => {
+                for failure in &fanout.failures {
+                    tracing::warn!(
+                        relay = %failure.relay,
+                        failure = ?failure.kind,
+                        "sponsored self-broadcast relay rejected bundle"
+                    );
+                }
+                tracing::info!(
+                    accepted_relays = fanout.accepted_relays.len(),
+                    failed_relays = fanout.failures.len(),
+                    "sponsored self-broadcast bundle submitted"
+                );
+                true
+            }
+            Err(error) => {
+                for failure in &error.failures {
+                    tracing::warn!(
+                        relay = %failure.relay,
+                        failure = ?failure.kind,
+                        "sponsored self-broadcast relay rejected bundle"
+                    );
+                }
+                tracing::warn!(
+                    failed_relays = error.failures.len(),
+                    "sponsored self-broadcast bundle was not accepted"
+                );
+                false
+            }
+        }
+    }
+
+    async fn canonical_state(&self, tx_hash: FixedBytes<32>) -> SponsoredCanonicalState {
+        let providers = self.query_rpc_pool.available_providers();
+        let mut polls = FuturesUnordered::new();
+        for provider_handle in providers {
+            polls.push(async move {
+                let receipt_provider = provider_handle.provider.clone();
+                let head_provider = provider_handle.provider.clone();
+                let (receipt, head) = tokio::join!(
+                    receipt_provider.get_transaction_receipt(tx_hash),
+                    head_provider.get_block_number(),
+                );
+                (provider_handle, receipt, head)
+            });
+        }
+
+        while let Some((provider_handle, receipt, head)) = polls.next().await {
+            let rpc = crate::http::redact_url_for_display(&provider_handle.url);
+            if let Err(error) = &receipt {
+                tracing::warn!(%rpc, %error, "sponsored self-broadcast receipt poll failed");
+            }
+            if let Err(error) = &head {
+                tracing::warn!(%rpc, %error, "sponsored self-broadcast head poll failed");
+            }
+            if receipt.is_err() && head.is_err() {
+                self.query_rpc_pool.mark_bad_provider(&provider_handle);
+                continue;
+            }
+            if let Ok(Some(receipt)) = receipt {
+                return SponsoredCanonicalState {
+                    receipt: Some(tx_receipt_output(tx_hash, &receipt)),
+                    head: head.ok().map(|head| (provider_handle.index, head)),
+                };
+            }
+            if let Ok(head) = head {
+                return SponsoredCanonicalState {
+                    receipt: None,
+                    head: Some((provider_handle.index, head)),
+                };
+            }
+        }
+        SponsoredCanonicalState::default()
+    }
+
+    async fn mark_inputs_pending_spent(&self, tx_hash: FixedBytes<32>) -> Result<()> {
+        self.session
+            .renew_pending_spent_utxos(self.pending_spent_inputs, tx_hash)
+            .await
+    }
+}
+
+async fn submit_sponsored_bundle_latching_stop(
+    backend: &impl SponsoredSelfBroadcastBackend,
+    signed_raw_transaction: &str,
+    tx_hash: FixedBytes<32>,
+    command_rx: &mut watch::Receiver<SponsoredSelfBroadcastCommand>,
+    command_open: &mut bool,
+    stop_reason: &mut Option<SponsoredSelfBroadcastStopReason>,
+) -> bool {
+    let submission = backend.submit_bundle(signed_raw_transaction, tx_hash);
+    tokio::pin!(submission);
+    loop {
+        tokio::select! {
+            accepted = &mut submission => return accepted,
+            changed = command_rx.changed(), if *command_open && *stop_reason != Some(SponsoredSelfBroadcastStopReason::Shutdown) => {
+                *command_open = changed.is_ok();
+                let observed = if changed.is_err() {
+                    sponsored_stop_reason(*command_rx.borrow())
+                        .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                } else {
+                    sponsored_stop_reason(*command_rx.borrow_and_update())
+                        .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                };
+                *stop_reason = merge_sponsored_stop_reason(*stop_reason, Some(observed));
+            }
+        }
+    }
+}
+
+async fn mark_sponsored_inputs_with_command(
+    backend: &impl SponsoredSelfBroadcastBackend,
+    tx_hash: FixedBytes<32>,
+    command_rx: &mut watch::Receiver<SponsoredSelfBroadcastCommand>,
+    command_open: &mut bool,
+    stop_reason: &mut Option<SponsoredSelfBroadcastStopReason>,
+    cancel_deadline: Option<tokio::time::Instant>,
+) -> Result<bool> {
+    let mark = tokio::time::timeout(
+        SPONSORED_PENDING_MARK_TIMEOUT,
+        backend.mark_inputs_pending_spent(tx_hash),
+    );
+    tokio::pin!(mark);
+    tokio::select! {
+        result = &mut mark => {
+            result.map_err(|_| eyre!("timed out marking sponsored inputs pending-spent"))??;
+            Ok(true)
+        }
+        changed = command_rx.changed(), if *command_open => {
+            *command_open = changed.is_ok();
+            let observed = if changed.is_err() {
+                sponsored_stop_reason(*command_rx.borrow())
+                    .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+            } else {
+                sponsored_stop_reason(*command_rx.borrow_and_update())
+                    .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+            };
+            *stop_reason = merge_sponsored_stop_reason(*stop_reason, Some(observed));
+            Ok(false)
+        }
+        () = wait_for_sponsored_cancel_deadline(cancel_deadline) => Ok(false),
+    }
+}
+
+async fn run_sponsored_self_broadcast_session_with_backend(
+    backend: &impl SponsoredSelfBroadcastBackend,
+    block_time: Duration,
+    tx_hash: FixedBytes<32>,
+    signed_raw_transaction: &str,
+    mut command_rx: watch::Receiver<SponsoredSelfBroadcastCommand>,
+) -> Result<SponsoredSelfBroadcastSessionOutcome> {
+    let poll_interval = sponsored_self_broadcast_head_poll_interval(block_time);
+    let cancel_grace = sponsored_self_broadcast_cancel_grace(block_time);
+    let mut stop_reason = sponsored_pending_stop_reason(&command_rx);
+    let mut command_open = command_rx.has_changed().is_ok();
+    if let Some(reason) = stop_reason {
+        return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+            reason,
+            bundle_was_accepted: false,
+        });
+    }
+
+    let mut last_submission_started = tokio::time::Instant::now();
+    let mut bundle_was_accepted = submit_sponsored_bundle_latching_stop(
+        backend,
+        signed_raw_transaction,
+        tx_hash,
+        &mut command_rx,
+        &mut command_open,
+        &mut stop_reason,
+    )
+    .await;
+    if stop_reason == Some(SponsoredSelfBroadcastStopReason::Shutdown) {
+        return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+            reason: SponsoredSelfBroadcastStopReason::Shutdown,
+            bundle_was_accepted,
+        });
+    }
+    if bundle_was_accepted {
+        let _ = mark_sponsored_inputs_with_command(
+            backend,
+            tx_hash,
+            &mut command_rx,
+            &mut command_open,
+            &mut stop_reason,
+            None,
+        )
+        .await?;
+    }
+
+    let mut accepted_head_baselines = BTreeMap::new();
+    let mut last_observed_head = None;
+    let mut next_head_poll = tokio::time::Instant::now();
+    let mut heartbeat_deadline = last_submission_started + block_time;
+    let mut retry_pending = false;
+    let mut pending_lock_renewal = bundle_was_accepted
+        .then(|| tokio::time::Instant::now() + SPONSORED_PENDING_LOCK_RENEW_INTERVAL);
+    let mut cancel_deadline = (bundle_was_accepted
+        && stop_reason == Some(SponsoredSelfBroadcastStopReason::Cancelled))
+    .then(|| tokio::time::Instant::now() + cancel_grace);
+
+    loop {
+        stop_reason =
+            merge_sponsored_stop_reason(stop_reason, sponsored_pending_stop_reason(&command_rx));
+        if stop_reason == Some(SponsoredSelfBroadcastStopReason::Shutdown) {
+            return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Shutdown,
+                bundle_was_accepted,
+            });
+        }
+        if let Some(reason) = stop_reason
+            && !bundle_was_accepted
+        {
+            return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason,
+                bundle_was_accepted,
+            });
+        }
+        if stop_reason == Some(SponsoredSelfBroadcastStopReason::Cancelled)
+            && cancel_deadline.is_none()
+        {
+            cancel_deadline = Some(tokio::time::Instant::now() + cancel_grace);
+        }
+
+        let now = tokio::time::Instant::now();
+        if cancel_deadline.is_some_and(|deadline| now >= deadline) {
+            return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Cancelled,
+                bundle_was_accepted,
+            });
+        }
+        if now >= next_head_poll {
+            next_head_poll = now + poll_interval;
+            let canonical = backend.canonical_state(tx_hash);
+            tokio::pin!(canonical);
+            let state = tokio::select! {
+                state = &mut canonical => Some(state),
+                changed = command_rx.changed(), if command_open => {
+                    command_open = changed.is_ok();
+                    let observed = if changed.is_err() {
+                        sponsored_stop_reason(*command_rx.borrow())
+                            .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                    } else {
+                        sponsored_stop_reason(*command_rx.borrow_and_update())
+                            .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                    };
+                    stop_reason = merge_sponsored_stop_reason(stop_reason, Some(observed));
+                    None
+                }
+                () = wait_for_sponsored_cancel_deadline(cancel_deadline) => {
+                    return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                        reason: SponsoredSelfBroadcastStopReason::Cancelled,
+                        bundle_was_accepted,
+                    });
+                }
+            };
+            let Some(state) = state else {
+                continue;
+            };
+            if let Some(receipt) = state.receipt {
+                return Ok(SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(
+                    receipt,
+                ));
+            }
+            if let Some((provider_index, head)) = state.head {
+                if let Some(reason) = stop_reason
+                    && accepted_head_baselines
+                        .get(&provider_index)
+                        .is_some_and(|accepted_head| head > *accepted_head)
+                {
+                    return Ok(SponsoredSelfBroadcastSessionOutcome::Stopped {
+                        reason,
+                        bundle_was_accepted,
+                    });
+                }
+                accepted_head_baselines
+                    .entry(provider_index)
+                    .or_insert(head);
+                if last_observed_head.is_some_and(|previous| head > previous)
+                    && stop_reason.is_none()
+                {
+                    retry_pending = true;
+                    heartbeat_deadline = now + block_time;
+                }
+                last_observed_head =
+                    Some(last_observed_head.map_or(head, |previous| previous.max(head)));
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        if pending_lock_renewal.is_some_and(|deadline| now >= deadline) {
+            let _ = mark_sponsored_inputs_with_command(
+                backend,
+                tx_hash,
+                &mut command_rx,
+                &mut command_open,
+                &mut stop_reason,
+                cancel_deadline,
+            )
+            .await?;
+            pending_lock_renewal = Some(now + SPONSORED_PENDING_LOCK_RENEW_INTERVAL);
+            continue;
+        }
+        if stop_reason.is_none() && now >= heartbeat_deadline {
+            retry_pending = true;
+            heartbeat_deadline = now + block_time;
+        }
+
+        let next_submission = last_submission_started + poll_interval;
+        if stop_reason.is_none() && retry_pending && now >= next_submission {
+            retry_pending = false;
+            last_submission_started = now;
+            let accepted = submit_sponsored_bundle_latching_stop(
+                backend,
+                signed_raw_transaction,
+                tx_hash,
+                &mut command_rx,
+                &mut command_open,
+                &mut stop_reason,
+            )
+            .await;
+            heartbeat_deadline = last_submission_started + block_time;
+            if accepted {
+                bundle_was_accepted = true;
+                if stop_reason == Some(SponsoredSelfBroadcastStopReason::Shutdown) {
+                    continue;
+                }
+                let _ = mark_sponsored_inputs_with_command(
+                    backend,
+                    tx_hash,
+                    &mut command_rx,
+                    &mut command_open,
+                    &mut stop_reason,
+                    None,
+                )
+                .await?;
+                pending_lock_renewal =
+                    Some(tokio::time::Instant::now() + SPONSORED_PENDING_LOCK_RENEW_INTERVAL);
+                accepted_head_baselines.clear();
+                if stop_reason == Some(SponsoredSelfBroadcastStopReason::Cancelled) {
+                    cancel_deadline = Some(tokio::time::Instant::now() + cancel_grace);
+                }
+            }
+            continue;
+        }
+
+        let mut wake_at = if stop_reason.is_some() {
+            next_head_poll
+        } else if retry_pending {
+            next_head_poll.min(heartbeat_deadline).min(next_submission)
+        } else {
+            next_head_poll.min(heartbeat_deadline)
+        };
+        if let Some(renewal) = pending_lock_renewal {
+            wake_at = wake_at.min(renewal);
+        }
+        if let Some(deadline) = cancel_deadline {
+            wake_at = wake_at.min(deadline);
+        }
+        tokio::select! {
+            () = tokio::time::sleep_until(wake_at) => {}
+            changed = command_rx.changed(), if command_open => {
+                command_open = changed.is_ok();
+                let observed = if changed.is_err() {
+                    sponsored_stop_reason(*command_rx.borrow())
+                        .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                } else {
+                    sponsored_stop_reason(*command_rx.borrow_and_update())
+                        .unwrap_or(SponsoredSelfBroadcastStopReason::Shutdown)
+                };
+                stop_reason = merge_sponsored_stop_reason(stop_reason, Some(observed));
+            }
+        }
+    }
+}
+
+async fn wait_for_sponsored_cancel_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+const fn merge_sponsored_stop_reason(
+    current: Option<SponsoredSelfBroadcastStopReason>,
+    observed: Option<SponsoredSelfBroadcastStopReason>,
+) -> Option<SponsoredSelfBroadcastStopReason> {
+    match (current, observed) {
+        (_, Some(SponsoredSelfBroadcastStopReason::Shutdown)) => {
+            Some(SponsoredSelfBroadcastStopReason::Shutdown)
+        }
+        (Some(current), _) => Some(current),
+        (None, observed) => observed,
+    }
+}
+
+const fn sponsored_stop_reason(
+    command: SponsoredSelfBroadcastCommand,
+) -> Option<SponsoredSelfBroadcastStopReason> {
+    match command {
+        SponsoredSelfBroadcastCommand::Running => None,
+        SponsoredSelfBroadcastCommand::Cancel => Some(SponsoredSelfBroadcastStopReason::Cancelled),
+        SponsoredSelfBroadcastCommand::Shutdown => Some(SponsoredSelfBroadcastStopReason::Shutdown),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
     use super::*;
+    use serde_json::{Value, json};
+
+    fn sponsored_input(tree: u32, position: u64, value: u64) -> Utxo {
+        Utxo::new(
+            Note::new_unshield(Address::ZERO, Address::from([0x44; 20]), U256::from(value)),
+            tree,
+            position,
+            UtxoSource {
+                tx_hash: FixedBytes::from([value as u8; 32]),
+                block_number: value,
+                block_timestamp: value,
+            },
+            UtxoCommitmentKind::Transact,
+        )
+    }
+
+    #[test]
+    fn sponsored_pending_inputs_resolve_exact_pinned_identities() {
+        let first = sponsored_input(1, 2, 3);
+        let second = sponsored_input(4, 5, 6);
+        let selected = [
+            SelectedInputIdentity::from_utxo(&second),
+            SelectedInputIdentity::from_utxo(&first),
+        ];
+        let resolved =
+            resolve_sponsored_pending_spent_inputs(vec![first.clone(), second.clone()], &selected)
+                .expect("resolve pinned inputs");
+        assert_eq!(resolved[0].tree, second.tree);
+        assert_eq!(resolved[0].position, second.position);
+        assert_eq!(resolved[1].tree, first.tree);
+        assert_eq!(resolved[1].position, first.position);
+
+        let missing = SelectedInputIdentity {
+            tree: 99,
+            position: 100,
+        };
+        assert!(resolve_sponsored_pending_spent_inputs(vec![first], &[missing]).is_err());
+    }
+
+    fn spawn_query_rpc_response(
+        result: std::result::Result<Value, Value>,
+    ) -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test query RPC");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("test query RPC address")
+        ))
+        .expect("test query RPC URL");
+        let task = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept query RPC request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set query RPC read timeout");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut buffer).expect("read query RPC request");
+                assert!(read != 0, "query RPC request ended before headers");
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let header_end = header_end + 4;
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                        .expect("query RPC content length");
+                    break (header_end, content_length);
+                }
+            };
+            while bytes.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).expect("read query RPC body");
+                assert!(read != 0, "query RPC request ended before body");
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            let request: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                    .expect("query RPC JSON");
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            let response = match result {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+            };
+            let response = serde_json::to_string(&response).expect("serialize query RPC response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .expect("write query RPC response");
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn sponsored_payer_mismatch_fails_through_active_query_rpc_pool() {
+        let (url, task) = spawn_query_rpc_response(Ok(json!("0x")));
+        let http = HttpContext::direct_for_tests();
+        let pool = query_rpc_pool_with_http_client(vec![url], &http);
+        let result = sponsored_code_preflight_from_rpc_pool(
+            &pool,
+            Address::from([0x13; 20]),
+            Address::from([0x14; 20]),
+        )
+        .await;
+        task.join().expect("query RPC task");
+        assert!(matches!(
+            result,
+            Err(SponsorshipError::PayerRuntimeMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sponsored_final_payer_call_revert_blocks_preparation() {
+        let reflected = "0x1234 https://user:password@example.invalid/private?token=secret";
+        let (url, task) = spawn_query_rpc_response(Err(json!({
+            "code": -32000,
+            "message": reflected,
+            "data": reflected,
+        })));
+        let http = HttpContext::direct_for_tests();
+        let pool = query_rpc_pool_with_http_client(vec![url], &http);
+        let provider_handle = pool
+            .available_providers()
+            .into_iter()
+            .next()
+            .expect("query RPC provider");
+        let result = sponsored_exact_gas_estimate(
+            &provider_handle,
+            Address::from([0x15; 20]),
+            Bytes::from_static(&[0x12, 0x34]),
+        )
+        .await;
+        task.join().expect("query RPC task");
+        let error = result.expect_err("payer call revert blocks preparation");
+        let formatted = format!("{error} {error:?}");
+        assert!(!formatted.contains(reflected));
+    }
+
+    struct MockSponsoredBackend {
+        state: Mutex<MockSponsoredBackendState>,
+        active_submissions: AtomicUsize,
+        max_active_submissions: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct MockSponsoredBackendState {
+        submit_results: VecDeque<bool>,
+        submissions: Vec<String>,
+        heads: VecDeque<Option<u64>>,
+        fallback_head: Option<u64>,
+        receipt: Option<TxReceiptOutput>,
+        receipt_after_submissions: Option<usize>,
+        marked_hashes: Vec<FixedBytes<32>>,
+        submission_delay: Option<Duration>,
+        canonical_never_completes: bool,
+        mark_delay: Option<Duration>,
+    }
+
+    impl MockSponsoredBackend {
+        fn new(state: MockSponsoredBackendState) -> Self {
+            Self {
+                state: Mutex::new(state),
+                active_submissions: AtomicUsize::new(0),
+                max_active_submissions: AtomicUsize::new(0),
+            }
+        }
+
+        fn submission_count(&self) -> usize {
+            self.state.lock().expect("mock state").submissions.len()
+        }
+
+        fn marked_hashes(&self) -> Vec<FixedBytes<32>> {
+            self.state.lock().expect("mock state").marked_hashes.clone()
+        }
+
+        fn submissions(&self) -> Vec<String> {
+            self.state.lock().expect("mock state").submissions.clone()
+        }
+    }
+
+    #[async_trait]
+    impl SponsoredSelfBroadcastBackend for MockSponsoredBackend {
+        async fn submit_bundle(
+            &self,
+            signed_raw_transaction: &str,
+            _tx_hash: FixedBytes<32>,
+        ) -> bool {
+            let active = self.active_submissions.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_submissions
+                .fetch_max(active, Ordering::SeqCst);
+            let submission_delay = self.state.lock().expect("mock state").submission_delay;
+            if let Some(submission_delay) = submission_delay {
+                tokio::time::sleep(submission_delay).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            let result = {
+                let mut state = self.state.lock().expect("mock state");
+                state.submissions.push(signed_raw_transaction.to_owned());
+                state.submit_results.pop_front().unwrap_or(false)
+            };
+            self.active_submissions.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        async fn canonical_state(&self, _tx_hash: FixedBytes<32>) -> SponsoredCanonicalState {
+            if self
+                .state
+                .lock()
+                .expect("mock state")
+                .canonical_never_completes
+            {
+                std::future::pending::<()>().await;
+            }
+            let mut state = self.state.lock().expect("mock state");
+            let ready = state
+                .receipt_after_submissions
+                .is_some_and(|required| state.submissions.len() >= required);
+            let receipt = ready.then(|| state.receipt.take()).flatten();
+            let head = state
+                .heads
+                .pop_front()
+                .unwrap_or(state.fallback_head)
+                .map(|head| (0, head));
+            SponsoredCanonicalState { receipt, head }
+        }
+
+        async fn mark_inputs_pending_spent(&self, tx_hash: FixedBytes<32>) -> Result<()> {
+            let delay = self.state.lock().expect("mock state").mark_delay;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.state
+                .lock()
+                .expect("mock state")
+                .marked_hashes
+                .push(tx_hash);
+            Ok(())
+        }
+    }
+
+    async fn wait_for_submission_count(backend: &MockSponsoredBackend, expected: usize) {
+        for _ in 0..100 {
+            if backend.submission_count() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "expected {expected} submissions, observed {}",
+            backend.submission_count()
+        );
+    }
+
+    async fn wait_for_active_submission(backend: &MockSponsoredBackend) {
+        for _ in 0..100 {
+            if backend.active_submissions.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected an active submission");
+    }
+
+    async fn advance_and_yield(duration: Duration) {
+        tokio::time::advance(duration).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn receipt(status: bool, block_number: u64) -> TxReceiptOutput {
+        TxReceiptOutput {
+            tx_hash: format!("0x{}", "11".repeat(32)),
+            status,
+            block_number,
+            gas_used: 21_000,
+            contract_address: None,
+        }
+    }
 
     #[test]
     fn trezor_app_passphrase_self_broadcast_error_adds_restart_guidance() {
@@ -1243,5 +2303,452 @@ mod tests {
 
         assert!(is_trezor_app_passphrase_required_error(&error));
         assert!(message.contains(TREZOR_SELF_BROADCAST_RESTART_GUIDANCE));
+    }
+
+    #[test]
+    fn sponsored_head_poll_interval_clamps_sub_second_and_slow_chains() {
+        assert_eq!(
+            sponsored_self_broadcast_head_poll_interval(Duration::from_millis(450)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            sponsored_self_broadcast_head_poll_interval(Duration::from_secs(4)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            sponsored_self_broadcast_head_poll_interval(Duration::from_secs(20)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn sponsored_cancel_grace_clamps_fast_and_slow_chains() {
+        assert_eq!(
+            sponsored_self_broadcast_cancel_grace(Duration::from_millis(500)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            sponsored_self_broadcast_cancel_grace(Duration::from_secs(12)),
+            Duration::from_secs(24)
+        );
+        assert_eq!(
+            sponsored_self_broadcast_cancel_grace(Duration::from_mins(1)),
+            Duration::from_mins(1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_session_retries_on_heads_and_missed_slot_heartbeat_without_overlap() {
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([false, false, false, false]),
+            heads: VecDeque::from([Some(10), Some(11), Some(12)]),
+            fallback_head: Some(12),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (_command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                FixedBytes::from([0x11; 32]),
+                "0xidentical-signed-transaction",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        advance_and_yield(Duration::from_secs(1)).await;
+        wait_for_submission_count(&backend, 2).await;
+        advance_and_yield(Duration::from_secs(1)).await;
+        wait_for_submission_count(&backend, 3).await;
+        advance_and_yield(Duration::from_secs(4)).await;
+        wait_for_submission_count(&backend, 4).await;
+
+        assert_eq!(backend.submission_count(), 4);
+        assert_eq!(backend.max_active_submissions.load(Ordering::SeqCst), 1);
+        assert!(
+            backend
+                .submissions()
+                .iter()
+                .all(|raw| raw == "0xidentical-signed-transaction")
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_cancellation_waits_for_head_newer_than_last_acceptance() {
+        let tx_hash = FixedBytes::from([0x22; 32]);
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            heads: VecDeque::from([Some(20), Some(20), Some(21)]),
+            fallback_head: Some(21),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                tx_hash,
+                "0xaccepted",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        tokio::task::yield_now().await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Cancel)
+            .expect("cancel session");
+        advance_and_yield(Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+        advance_and_yield(Duration::from_secs(1)).await;
+
+        let outcome = task.await.expect("session task").expect("session outcome");
+        assert_eq!(
+            outcome,
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Cancelled,
+                bundle_was_accepted: true,
+            }
+        );
+        assert_eq!(backend.submission_count(), 1);
+        assert_eq!(backend.marked_hashes(), vec![tx_hash]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_cancellation_during_fanout_is_latched_while_submission_drains() {
+        let tx_hash = FixedBytes::from([0x23; 32]);
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            heads: VecDeque::from([Some(20), Some(20), Some(21)]),
+            fallback_head: Some(21),
+            submission_delay: Some(Duration::from_secs(1)),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                tx_hash,
+                "0xaccepted-during-cancel",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_active_submission(&backend).await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Cancel)
+            .expect("cancel session");
+        advance_and_yield(Duration::from_secs(3)).await;
+
+        let outcome = task.await.expect("session task").expect("session outcome");
+        assert_eq!(
+            outcome,
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Cancelled,
+                bundle_was_accepted: true,
+            }
+        );
+        assert_eq!(backend.submission_count(), 1);
+        assert_eq!(backend.marked_hashes(), vec![tx_hash]);
+        assert_eq!(backend.active_submissions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_retry_acceptance_requires_a_fresh_post_acceptance_head() {
+        let tx_hash = FixedBytes::from([0x25; 32]);
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([false, true]),
+            heads: VecDeque::from([Some(100), Some(101), Some(101), Some(102)]),
+            fallback_head: Some(102),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                tx_hash,
+                "0xaccepted-retry",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        advance_and_yield(Duration::from_secs(1)).await;
+        wait_for_submission_count(&backend, 2).await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Cancel)
+            .expect("cancel session");
+        advance_and_yield(Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+        advance_and_yield(Duration::from_secs(1)).await;
+
+        let outcome = task.await.expect("session task").expect("session outcome");
+        assert_eq!(
+            outcome,
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Cancelled,
+                bundle_was_accepted: true,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_session_renews_pending_spent_locks_while_waiting_for_receipt() {
+        let tx_hash = FixedBytes::from([0x24; 32]);
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            fallback_head: Some(20),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (_command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_mins(10),
+                tx_hash,
+                "0xaccepted",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        assert_eq!(backend.marked_hashes(), vec![tx_hash]);
+        advance_and_yield(SPONSORED_PENDING_LOCK_RENEW_INTERVAL).await;
+        assert_eq!(backend.marked_hashes(), vec![tx_hash, tx_hash]);
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_canonical_revert_is_authoritative_after_relay_acceptance() {
+        let tx_hash = FixedBytes::from([0x33; 32]);
+        let backend = MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            fallback_head: Some(30),
+            receipt: Some(receipt(false, 31)),
+            receipt_after_submissions: Some(1),
+            ..MockSponsoredBackendState::default()
+        });
+        let (_command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+
+        let outcome = run_sponsored_self_broadcast_session_with_backend(
+            &backend,
+            Duration::from_secs(4),
+            tx_hash,
+            "0xreverting",
+            command_rx,
+        )
+        .await
+        .expect("session outcome");
+
+        let SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(receipt) = outcome else {
+            panic!("expected canonical receipt");
+        };
+        assert!(!receipt.status);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_shutdown_reports_accepted_session_stopped() {
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            heads: VecDeque::from([Some(50), Some(51)]),
+            fallback_head: Some(51),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                FixedBytes::from([0x55; 32]),
+                "0xsession-only",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        tokio::task::yield_now().await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Shutdown)
+            .expect("shutdown session");
+        advance_and_yield(Duration::from_secs(1)).await;
+
+        let outcome = task.await.expect("session task").expect("session outcome");
+        assert_eq!(
+            outcome,
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Shutdown,
+                bundle_was_accepted: true,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_cancel_stops_at_grace_deadline_when_rpcs_never_advance() {
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            canonical_never_completes: true,
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                FixedBytes::from([0x56; 32]),
+                "0xstale-rpc",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Cancel)
+            .expect("cancel session");
+        drop(command_tx);
+        advance_and_yield(Duration::from_secs(14)).await;
+        assert!(!task.is_finished());
+        advance_and_yield(Duration::from_secs(1)).await;
+
+        assert_eq!(
+            task.await.expect("session task").expect("session outcome"),
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Cancelled,
+                bundle_was_accepted: true,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_shutdown_interrupts_a_pending_canonical_poll() {
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            canonical_never_completes: true,
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                FixedBytes::from([0x57; 32]),
+                "0xhung-rpc",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        tokio::task::yield_now().await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Shutdown)
+            .expect("shutdown session");
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            task.await.expect("session task").expect("session outcome"),
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Shutdown,
+                bundle_was_accepted: true,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_shutdown_overrides_an_active_cancel_grace() {
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            fallback_head: Some(50),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                FixedBytes::from([0x59; 32]),
+                "0xcancel-then-shutdown",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Cancel)
+            .expect("cancel session");
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Shutdown)
+            .expect("shutdown session");
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            task.await.expect("session task").expect("session outcome"),
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Shutdown,
+                bundle_was_accepted: true,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sponsored_shutdown_interrupts_pending_spend_bookkeeping() {
+        let backend = Arc::new(MockSponsoredBackend::new(MockSponsoredBackendState {
+            submit_results: VecDeque::from([true]),
+            mark_delay: Some(Duration::from_mins(1)),
+            ..MockSponsoredBackendState::default()
+        }));
+        let (command_tx, command_rx) = watch::channel(SponsoredSelfBroadcastCommand::Running);
+        let task_backend = Arc::clone(&backend);
+        let task = tokio::spawn(async move {
+            run_sponsored_self_broadcast_session_with_backend(
+                task_backend.as_ref(),
+                Duration::from_secs(4),
+                FixedBytes::from([0x58; 32]),
+                "0xhung-actor",
+                command_rx,
+            )
+            .await
+        });
+
+        wait_for_submission_count(&backend, 1).await;
+        tokio::task::yield_now().await;
+        command_tx
+            .send(SponsoredSelfBroadcastCommand::Shutdown)
+            .expect("shutdown session");
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            task.await.expect("session task").expect("session outcome"),
+            SponsoredSelfBroadcastSessionOutcome::Stopped {
+                reason: SponsoredSelfBroadcastStopReason::Shutdown,
+                bundle_was_accepted: true,
+            }
+        );
     }
 }

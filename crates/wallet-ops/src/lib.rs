@@ -40,12 +40,14 @@ use railgun_wallet::tx::{
     BroadcasterFeeOutput, BuildError, CompositePrivateOutputRole, CompositePrivateOutputRoleKind,
     CompositeRelayAction, CompositeRelayActionToken, CompositeRelayActions, CompositeUnshieldLeg,
     CompositeUnshieldLegRole, CompositeUnshieldPlan, CompositeUnshieldRecipient,
-    CompositeUnshieldRequest, MAX_BATCH_TRANSACTIONS, PoiMerkleProofSource,
-    PreTransactionPoiGenerationRequest, PreTransactionPoiMap, SendPlan,
-    SendRequest as RailgunSendRequest, TransactionPlanChunk, UnshieldMode, UnshieldPlan,
-    UnshieldRequest as RailgunUnshieldRequest, generate_pre_transaction_pois,
-    max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
-    send_selection_info, send_selection_info_with_broadcaster_fee_token,
+    CompositeUnshieldRequest, MAX_BATCH_TRANSACTIONS, MixedPrivateActionPlan,
+    MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest, MixedPrivateOutputRole,
+    MixedPrivatePlannedOutput, MixedPrivateSend, MixedPrivateSendRole, MixedPublicPlannedOutput,
+    PoiMerkleProofSource, PreTransactionPoiGenerationRequest, PreTransactionPoiMap,
+    SelectedInputIdentity, SendPlan, SendRequest as RailgunSendRequest, TransactionPlanChunk,
+    UnshieldMode, UnshieldPlan, UnshieldRequest as RailgunUnshieldRequest,
+    generate_pre_transaction_pois, max_broadcaster_fee_token_spendable, max_send_spendable,
+    max_unshield_spendable, send_selection_info, send_selection_info_with_broadcaster_fee_token,
     send_selection_info_with_separate_broadcaster_fee_seed, unshield_selection_info,
     unshield_selection_info_with_broadcaster_fee_token,
     unshield_selection_info_with_separate_broadcaster_fee_seed,
@@ -101,6 +103,8 @@ mod poi_contexts;
 mod protocol_fee;
 mod public_wallet;
 mod signer;
+mod sponsored_bundle;
+mod sponsorship;
 mod utxos;
 pub mod walletconnect;
 
@@ -131,6 +135,7 @@ pub use native_topup::{
     native_top_up_primary_recipient_amount_for_fee_mode,
     native_top_up_required_wrapped_native_amount,
     native_top_up_required_wrapped_native_amount_for_fee_mode, native_top_up_wrapped_native_amount,
+    sponsored_unshield_additional_wrapped_native_spend,
 };
 pub(crate) use native_topup::{
     native_top_up_net_after_protocol_fee, native_top_up_wrapped_native_amount_for_net,
@@ -166,6 +171,8 @@ pub use public_wallet::{
     walletconnect_sign_typed_data_v4,
 };
 use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
+pub use sponsored_bundle::*;
+pub use sponsorship::*;
 use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
     ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,

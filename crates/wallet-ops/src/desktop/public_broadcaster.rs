@@ -419,6 +419,30 @@ pub struct PreparedSendCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSponsoredCall {
+    pub chain_id: u64,
+    pub action: SponsoredActionKind,
+    pub authorization: SponsoredAuthorization,
+    pub transaction_count: usize,
+    pub input_count: usize,
+    pub private_output_count: usize,
+    pub public_output_count: usize,
+    pub relay_call_count: usize,
+    pub uses_relay_adapt: bool,
+    pub selected_inputs: Vec<SelectedInputIdentity>,
+    pub native_top_up: Option<DesktopNativeTopUpPlan>,
+    pub total_wrapped_native_spend: U256,
+    pub to: Address,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSponsoredSelfBroadcastResult {
+    pub prepared: PreparedSponsoredCall,
+    pub outcome: SponsoredSelfBroadcastSessionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopSelfBroadcastResult {
     pub chain_id: u64,
     pub public_account_uuid: String,
@@ -694,14 +718,24 @@ impl WalletSession {
         }
     }
 
+    pub(crate) async fn renew_pending_spent_utxos(
+        &self,
+        utxos: &[Utxo],
+        tx_hash: FixedBytes<32>,
+    ) -> Result<()> {
+        self.handle
+            .mark_pending_spent_utxos(utxos, Some(tx_hash))
+            .await
+            .map(|_| ())
+            .map_err(Report::new)
+            .wrap_err("renew local pending-spend protection")
+    }
+
     pub async fn clear_local_pending_spent(&self) -> bool {
-        match self.handle.clear_all_local_pending_spent().await {
-            Ok(changed) => changed,
-            Err(error) => {
-                tracing::warn!(%error, "wallet actor rejected local pending-spend clear");
-                false
-            }
-        }
+        self.handle.clear_all_local_pending_spent().await.unwrap_or_else(|error| {
+            tracing::warn!(%error, "wallet actor rejected local pending-spend clear");
+            false
+        })
     }
 
     pub async fn refresh_poi_statuses(&self) -> bool {
@@ -1234,7 +1268,7 @@ pub(crate) struct ApproximateTransactionShape {
     pub(crate) max_receiver_amount: U256,
     pub(crate) relay_call_count: usize,
     pub(crate) uses_relay_adapt: bool,
-    pub(crate) unwrap: bool,
+    pub(crate) unwrap_count: usize,
     pub(crate) send: bool,
 }
 
@@ -1404,7 +1438,7 @@ pub(crate) fn railgun_protocol_gross_amount_for_recipient(
     )
 }
 
-pub(crate) fn unshield_receiver_amount_for_fee_mode(
+pub fn unshield_receiver_amount_for_fee_mode(
     entered_amount: U256,
     fee_mode: FeeHandlingMode,
 ) -> Result<U256> {
@@ -1713,11 +1747,7 @@ pub(crate) const fn approximate_public_broadcaster_gas(shape: ApproximateTransac
         + APPROX_GAS_PER_PRIVATE_OUTPUT * shape.private_output_count as u64
         + APPROX_GAS_PER_PUBLIC_OUTPUT * shape.public_output_count as u64
         + if shape.send { APPROX_SEND_EXTRA_GAS } else { 0 }
-        + if shape.unwrap {
-            APPROX_UNWRAP_EXTRA_GAS
-        } else {
-            0
-        }
+        + APPROX_UNWRAP_EXTRA_GAS * shape.unwrap_count as u64
         + APPROX_SAFETY_GAS;
     raw.saturating_mul(APPROX_GAS_UPLIFT_NUMERATOR)
         .saturating_add(APPROX_GAS_UPLIFT_DENOMINATOR - 1)
@@ -1934,7 +1964,7 @@ pub(crate) const fn send_approximate_shape(
         max_receiver_amount,
         relay_call_count: 0,
         uses_relay_adapt: false,
-        unwrap: false,
+        unwrap_count: 0,
         send: true,
     }
 }
@@ -1952,7 +1982,7 @@ pub(crate) const fn unshield_approximate_shape(
         max_receiver_amount,
         relay_call_count: if unwrap { 1 } else { 0 },
         uses_relay_adapt: unwrap,
-        unwrap,
+        unwrap_count: if unwrap { 1 } else { 0 },
         send: false,
     }
 }
@@ -1992,7 +2022,7 @@ pub(crate) fn native_top_up_approximate_shape(
             max_receiver_amount,
             relay_call_count: 3,
             uses_relay_adapt: true,
-            unwrap: true,
+            unwrap_count: 1,
             send: false,
         });
     }
@@ -2044,7 +2074,7 @@ pub(crate) fn native_top_up_approximate_shape(
         max_receiver_amount: primary_selection.max_spendable,
         relay_call_count: 2,
         uses_relay_adapt: true,
-        unwrap: true,
+        unwrap_count: 1,
         send: false,
     })
 }

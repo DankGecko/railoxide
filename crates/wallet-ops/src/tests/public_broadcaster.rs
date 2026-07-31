@@ -913,7 +913,7 @@ fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
         max_receiver_amount: max_receiver,
         relay_call_count: 0,
         uses_relay_adapt: false,
-        unwrap: false,
+        unwrap_count: 0,
         send: true,
     };
     let initial_fee_amount =
@@ -1015,7 +1015,7 @@ fn approximate_public_broadcaster_gas_tracks_transaction_shape() {
         max_receiver_amount: U256::ZERO,
         relay_call_count: 0,
         uses_relay_adapt: false,
-        unwrap: false,
+        unwrap_count: 0,
         send: true,
     });
     let larger = approximate_public_broadcaster_gas(ApproximateTransactionShape {
@@ -1026,7 +1026,7 @@ fn approximate_public_broadcaster_gas_tracks_transaction_shape() {
         max_receiver_amount: U256::ZERO,
         relay_call_count: 1,
         uses_relay_adapt: true,
-        unwrap: true,
+        unwrap_count: 1,
         send: false,
     });
 
@@ -1043,7 +1043,7 @@ fn approximate_public_broadcaster_gas_applies_safety_uplift() {
         max_receiver_amount: U256::ZERO,
         relay_call_count: 0,
         uses_relay_adapt: false,
-        unwrap: false,
+        unwrap_count: 0,
         send: true,
     });
 
@@ -1091,7 +1091,29 @@ fn approximate_shapes_include_broadcaster_fee_output_and_change() {
     assert_eq!(unshield.public_output_count, 1);
     assert_eq!(unshield.relay_call_count, 1);
     assert!(unshield.uses_relay_adapt);
-    assert!(unshield.unwrap);
+    assert_eq!(unshield.unwrap_count, 1);
+}
+
+#[test]
+fn approximate_public_broadcaster_gas_counts_each_unwrap_workflow() {
+    let shape = ApproximateTransactionShape {
+        transaction_count: 2,
+        input_count: 2,
+        private_output_count: 2,
+        public_output_count: 2,
+        max_receiver_amount: U256::ZERO,
+        relay_call_count: 4,
+        uses_relay_adapt: true,
+        unwrap_count: 1,
+        send: false,
+    };
+    let one_unwrap = approximate_public_broadcaster_gas(shape);
+    let two_unwraps = approximate_public_broadcaster_gas(ApproximateTransactionShape {
+        unwrap_count: 2,
+        ..shape
+    });
+
+    assert!(two_unwraps > one_unwrap);
 }
 
 #[test]

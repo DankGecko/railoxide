@@ -1,9 +1,85 @@
 use super::helpers::*;
+use railgun_wallet::tx::{
+    MixedPrivateOutputRole, MixedPrivateOutputSource, MixedPrivatePlannedOutput,
+    MixedPrivateSendRole,
+};
 
 fn wallet_cache_key(label: &str) -> String {
     local_db::WalletCacheKey::from_opaque_bytes(label.as_bytes())
         .expect("non-empty test wallet cache key")
         .to_string()
+}
+
+#[test]
+fn mixed_pending_output_contexts_follow_planned_chunk_and_role_metadata() {
+    let token = address(0x32);
+    let recipient_note = sample_note(19, token, 5);
+    let change_note = sample_note(20, token, 3);
+    let recipient_chunk = sample_chunk(3, 0x19, vec![recipient_note.clone()], false);
+    let change_chunk = sample_chunk(4, 0x20, vec![change_note.clone()], false);
+    let chunks = vec![recipient_chunk, change_chunk];
+    let outputs = vec![
+        MixedPrivatePlannedOutput {
+            source: MixedPrivateOutputSource::Send(0),
+            transaction_index: 0,
+            output_index: 0,
+            token_address: token,
+            amount: recipient_note.value,
+            role: MixedPrivateOutputRole::Recipient(MixedPrivateSendRole::Primary),
+            note: recipient_note.clone(),
+        },
+        MixedPrivatePlannedOutput {
+            source: MixedPrivateOutputSource::Send(0),
+            transaction_index: 1,
+            output_index: 0,
+            token_address: token,
+            amount: change_note.value,
+            role: MixedPrivateOutputRole::Change,
+            note: change_note.clone(),
+        },
+    ];
+    let poi_list_keys = default_active_poi_list_keys();
+    let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, &chunks);
+
+    let records = crate::poi_contexts::build_pending_mixed_output_poi_context_records(
+        1,
+        "wallet-1",
+        123,
+        &chunks,
+        &outputs,
+        &pre_transaction_pois,
+        &poi_list_keys,
+    )
+    .expect("build mixed pending output contexts");
+
+    assert_eq!(records.len(), 2);
+    let recipient = records
+        .iter()
+        .find(|record| record.output_role == PendingOutputPoiRole::Recipient)
+        .expect("recipient record");
+    assert_eq!(recipient.chain_id, 1);
+    assert_eq!(recipient.wallet_id, "wallet-1");
+    assert_eq!(recipient.created_at, 123);
+    assert_eq!(recipient.utxo_tree_in, u64::from(chunks[0].tree_number));
+    assert_eq!(recipient.required_poi_list_keys, poi_list_keys);
+    assert_eq!(
+        recipient.output_commitment,
+        FixedBytes::from(recipient_note.commitment().to_be_bytes::<32>())
+    );
+    assert_eq!(
+        recipient.output_npk,
+        FixedBytes::from(recipient_note.npk.to_be_bytes::<32>())
+    );
+    let change = records
+        .iter()
+        .find(|record| record.output_role == PendingOutputPoiRole::Change)
+        .expect("change record");
+    assert_eq!(change.utxo_tree_in, u64::from(chunks[1].tree_number));
+    assert_ne!(change.railgun_txid, recipient.railgun_txid);
+    assert_eq!(
+        change.output_commitment,
+        FixedBytes::from(change_note.commitment().to_be_bytes::<32>())
+    );
 }
 
 #[test]

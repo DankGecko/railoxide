@@ -81,6 +81,28 @@ pub fn native_top_up_required_wrapped_native_amount_for_fee_mode(
     )
 }
 
+pub fn sponsored_unshield_additional_wrapped_native_spend(
+    selected_token: Address,
+    wrapped_native_token: Address,
+    entered_amount: U256,
+    fee_mode: FeeHandlingMode,
+    native_top_up_amount: Option<U256>,
+) -> Result<U256> {
+    if let Some(native_amount) = native_top_up_amount {
+        return Ok(native_top_up_required_wrapped_native_amount_for_fee_mode(
+            selected_token,
+            wrapped_native_token,
+            entered_amount,
+            fee_mode,
+            native_amount,
+        ));
+    }
+    if selected_token == wrapped_native_token {
+        return unshield_receiver_amount_for_fee_mode(entered_amount, fee_mode);
+    }
+    Ok(U256::ZERO)
+}
+
 #[must_use]
 fn native_top_up_primary_recipient_amount(
     selected_token: Address,

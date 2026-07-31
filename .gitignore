@@ -1,6 +1,8 @@
 # Build artifacts
 /target/
 /result
+/out/
+/cache/
 
 /*.heap
 /heap*.svg
