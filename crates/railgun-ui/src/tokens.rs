@@ -359,6 +359,21 @@ pub fn format_token_amount(amount: U256, decimals: u8) -> String {
     format_token_amount_with_precision(amount, decimals, display_precision(amount, decimals))
 }
 
+/// Format an upper-bound token amount without rendering below the raw value.
+#[must_use]
+pub fn format_token_amount_ceiling(amount: U256, decimals: u8) -> String {
+    let precision = display_precision(amount, decimals);
+    if precision == decimals {
+        return format_scaled_amount(amount, decimals);
+    }
+    let rounding_divisor = pow10(decimals - precision);
+    let mut rounded = amount / rounding_divisor;
+    if amount % rounding_divisor != U256::ZERO {
+        rounded += uint!(1_U256);
+    }
+    format_scaled_amount(rounded, precision)
+}
+
 #[must_use]
 pub fn token_usd_micro_value(
     amount: U256,
@@ -488,6 +503,14 @@ mod tests {
     fn format_zero_amount() {
         assert_eq!(format_token_amount(U256::ZERO, 18), "0");
         assert_eq!(format_token_amount(U256::ZERO, 0), "0");
+    }
+
+    #[test]
+    fn format_upper_bound_never_rounds_below_raw_value() {
+        assert_eq!(format_token_amount_ceiling(uint!(1_004_U256), 1), "101");
+        assert_eq!(format_token_amount_ceiling(uint!(12_341_U256), 3), "12.35");
+        assert_eq!(format_token_amount_ceiling(uint!(12_340_U256), 3), "12.34");
+        assert_eq!(format_token_amount_ceiling(uint!(123_U256), 0), "123");
     }
 
     #[test]
