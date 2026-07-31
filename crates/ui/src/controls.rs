@@ -1,8 +1,9 @@
 use gpui::{
-    Div, ElementId, Entity, FontWeight, ParentElement, SharedString, Styled, div, px, relative, rgb,
+    AnyElement, Div, ElementId, Entity, FontWeight, IntoElement, ParentElement, SharedString,
+    Styled, div, px, relative, rgb,
 };
-use gpui_component::button::Button;
 use gpui_component::input::{Input, InputState};
+use gpui_component::{Selectable, button::Button};
 
 use crate::theme::{self, APP_TEXT_SIZE};
 
@@ -19,6 +20,35 @@ pub fn app_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> B
 #[must_use]
 pub fn app_button_base(id: impl Into<ElementId>) -> Button {
     Button::new(id)
+}
+
+#[must_use]
+pub fn app_segment_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    accessory: Option<AnyElement>,
+) -> Button {
+    app_button_base(id).selected(selected).child(
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(app_button_label(label))
+            .children(accessory),
+    )
+}
+
+#[must_use]
+pub fn app_inline_control_row(label: impl Into<SharedString>, control: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(div().min_w(px(0.0)).child(app_muted_text(label)))
+        .child(div().flex_none().child(control))
 }
 
 #[must_use]

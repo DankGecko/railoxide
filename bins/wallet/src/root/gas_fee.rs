@@ -5,11 +5,11 @@ use gpui::{
     div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, Icon, Selectable, Sizable, Size, StyleSized,
+    Disableable, Icon, Sizable, Size, StyleSized,
     button::{Button, ButtonGroup, ButtonVariants},
     input::{InputEvent, InputState},
 };
-use ui::controls::{app_input, app_muted_text};
+use ui::controls::{app_inline_control_row, app_input, app_muted_text, app_segment_button};
 use ui::theme;
 use wallet_ops::{SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection};
 
@@ -282,79 +282,50 @@ pub(super) fn render_eip1559_gas_fee_editor(
         .flex()
         .flex_col()
         .gap_2()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(div().min_w(px(0.0)).child(app_muted_text("Gas fee")))
-                .child(
-                    div().flex_none().child(
-                        ButtonGroup::new(SharedString::from(format!(
-                            "wallet-eip1559-gas-mode-{target_id}"
-                        )))
-                        .outline()
-                        .compact()
-                        .disabled(disabled)
-                        .child(gas_fee_mode_segment_button(
-                            SharedString::from(format!("wallet-eip1559-gas-auto-{target_id}")),
-                            "Auto",
-                            auto_selected,
-                            Some(render_auto_refresh_button(
-                                refresh_root,
-                                SharedString::from(format!(
-                                    "wallet-eip1559-gas-refresh-{target_id}"
-                                )),
-                                target,
-                                auto_selected && state.refreshing,
-                                auto_selected && !disabled && !state.refreshing,
-                            )),
-                        ))
-                        .child(gas_fee_mode_segment_button(
-                            SharedString::from(format!("wallet-eip1559-gas-custom-{target_id}")),
-                            "Custom",
-                            custom_selected,
-                            None,
-                        ))
-                        .on_click(move |selected, window, cx| {
-                            let Some(index) = selected.first() else {
-                                return;
-                            };
-                            let mode = if *index == 0 {
-                                Eip1559GasFeeMode::Auto
-                            } else {
-                                Eip1559GasFeeMode::Custom
-                            };
-                            mode_root.update(cx, |root, cx| {
-                                root.set_eip1559_gas_fee_mode(target, mode, window, cx);
-                            });
-                        }),
-                    ),
-                ),
-        )
+        .child(app_inline_control_row(
+            "Gas fee",
+            ButtonGroup::new(SharedString::from(format!(
+                "wallet-eip1559-gas-mode-{target_id}"
+            )))
+            .outline()
+            .compact()
+            .disabled(disabled)
+            .child(app_segment_button(
+                SharedString::from(format!("wallet-eip1559-gas-auto-{target_id}")),
+                "Auto",
+                auto_selected,
+                Some(render_auto_refresh_button(
+                    refresh_root,
+                    SharedString::from(format!("wallet-eip1559-gas-refresh-{target_id}")),
+                    target,
+                    auto_selected && state.refreshing,
+                    auto_selected && !disabled && !state.refreshing,
+                )),
+            ))
+            .child(app_segment_button(
+                SharedString::from(format!("wallet-eip1559-gas-custom-{target_id}")),
+                "Custom",
+                custom_selected,
+                None,
+            ))
+            .on_click(move |selected, window, cx| {
+                let Some(index) = selected.first() else {
+                    return;
+                };
+                let mode = if *index == 0 {
+                    Eip1559GasFeeMode::Auto
+                } else {
+                    Eip1559GasFeeMode::Custom
+                };
+                mode_root.update(cx, |root, cx| {
+                    root.set_eip1559_gas_fee_mode(target, mode, window, cx);
+                });
+            }),
+        ))
         .child(render_gas_fee_inputs(root, target, state, disabled))
         .when_some(state.error.as_ref(), |this, error| {
             this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
         })
-}
-
-fn gas_fee_mode_segment_button(
-    id: SharedString,
-    label: &'static str,
-    selected: bool,
-    accessory: Option<gpui::AnyElement>,
-) -> Button {
-    Button::new(id).selected(selected).child(
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .text_size(theme::APP_TEXT_SIZE)
-            .child(label)
-            .children(accessory),
-    )
 }
 
 fn render_auto_refresh_button(
