@@ -22,13 +22,6 @@ pub(in crate::root) const UNSHIELD_AUTHORIZATION_FAILED_ERROR: &str =
 pub(in crate::root) const SELF_BROADCAST_PRIVACY_WARNING: &str = "Self-broadcast links the selected Public account, RPC metadata, and transaction timing to this private action.";
 pub(in crate::root) const SELF_BROADCAST_ZERO_GAS_PAYER_WARNING: &str = "Selected gas payer has 0 native balance on this chain. Choose another Public account or fund this account before self-broadcasting.";
 
-pub(in crate::root) fn native_top_up_privacy_warning(chain_id: u64) -> String {
-    format!(
-        "Sending two currencies together can reveal a stronger linkage signal and demonstrates spendable private balances in both assets. The {} top-up goes to the recipient wallet. It does not pay the transaction or broadcaster fee.",
-        native_token_display_label(chain_id)
-    )
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::root) enum DeliveryMode {
     ManualCalldata,

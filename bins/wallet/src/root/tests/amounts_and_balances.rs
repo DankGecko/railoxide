@@ -359,20 +359,6 @@ fn native_top_up_passive_eligibility_refresh_does_not_cancel_estimate() {
 }
 
 #[test]
-fn native_top_up_privacy_warning_names_linkage_and_remittance() {
-    let ethereum = native_top_up_privacy_warning(1);
-    let polygon = native_top_up_privacy_warning(137);
-
-    assert!(ethereum.contains("linkage signal"));
-    assert!(ethereum.contains("spendable private balances"));
-    assert!(ethereum.contains("ETH top-up"));
-    assert!(ethereum.contains("recipient wallet"));
-    assert!(ethereum.contains("transaction or broadcaster fee"));
-    assert!(polygon.contains("MATIC top-up"));
-    assert!(!polygon.contains("ETH top-up"));
-}
-
-#[test]
 fn max_unshield_amount_from_snapshot_uses_batched_top_chunks() {
     let token = Address::from([0x11; 20]);
     let other = Address::from([0x22; 20]);

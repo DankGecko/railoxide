@@ -506,14 +506,7 @@ pub(in crate::root) fn render_unshield_native_top_up_control(
                             });
                         },
                     )),
-            )
-            .children(enabled.then(|| {
-                Alert::warning(
-                    unshield_element_id(key, "native-top-up-privacy"),
-                    native_top_up_privacy_warning(key.chain_id),
-                )
-                .small()
-            }));
+            );
     }
 
     div()
