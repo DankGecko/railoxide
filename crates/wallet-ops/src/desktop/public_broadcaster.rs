@@ -1591,7 +1591,7 @@ pub(crate) fn query_rpc_pool_with_http_client(
     Arc::new(QueryRpcPool::with_http_client(
         rpc_urls,
         DEFAULT_QUERY_RPC_COOLDOWN,
-        http.client.clone(),
+        http.rpc_client.clone(),
     ))
 }
 

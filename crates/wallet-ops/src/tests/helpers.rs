@@ -160,6 +160,7 @@ pub(super) fn effective_chain_config_with_rpc_endpoints(
             .map(|token| token.to_string()),
         multicall_contract: defaults.multicall_contract.to_string(),
         finality_depth: defaults.finality_depth,
+        block_time: defaults.block_time,
         block_range: None,
         poll_interval_secs: None,
         gas: crate::settings::EffectiveChainGasSettings {

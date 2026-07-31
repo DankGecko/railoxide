@@ -750,6 +750,7 @@ fn effective_public_chain_config_uses_settings_overrides() {
         wrapped_native_token: Some("0x0000000000000000000000000000000000000002".to_string()),
         multicall_contract: "0x0000000000000000000000000000000000000003".to_string(),
         finality_depth: defaults.finality_depth,
+        block_time: defaults.block_time,
         block_range: None,
         poll_interval_secs: None,
         gas: EffectiveChainGasSettings {
@@ -805,6 +806,7 @@ fn walletconnect_effective_public_chain_config_rejects_disabled_chain() {
         wrapped_native_token: None,
         multicall_contract: defaults.multicall_contract.to_string(),
         finality_depth: defaults.finality_depth,
+        block_time: defaults.block_time,
         block_range: None,
         poll_interval_secs: None,
         gas: EffectiveChainGasSettings {

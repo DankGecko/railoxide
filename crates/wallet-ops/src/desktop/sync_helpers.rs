@@ -416,7 +416,7 @@ pub(super) async fn setup_synced_view_wallet_with_store(
     )?;
     let wallet_quick_sync_endpoint = chain_cfg.quick_sync_endpoint.clone();
     let chain_service = sync_manager
-        .add_chain(chain_cfg)
+        .add_chain_with_rpc_http_client(chain_cfg, http.rpc_client.clone())
         .await
         .wrap_err("register chain sync service")?;
 
@@ -612,7 +612,7 @@ pub(crate) fn chain_config(
     let query_rpc_pool = Arc::new(QueryRpcPool::with_http_client(
         rpc_urls,
         DEFAULT_QUERY_RPC_COOLDOWN,
-        http.client.clone(),
+        http.rpc_client.clone(),
     ));
 
     Ok(ChainConfig {
@@ -637,6 +637,7 @@ pub(crate) fn chain_config(
             .map_or(defaults.indexed_wallet_block_range, |chain| {
                 chain.indexed_wallet_block_range
             }),
+        block_time: effective_chain.map_or(defaults.block_time, |chain| chain.block_time),
         poll_interval: effective_chain
             .and_then(|chain| chain.poll_interval_secs)
             .map_or(DEFAULT_POLL_INTERVAL, Duration::from_secs),
@@ -820,6 +821,7 @@ mod tests {
                         legacy_shield_block: 0,
                         block_range: 100,
                         indexed_wallet_block_range: 100,
+                        block_time: Duration::from_secs(12),
                         poll_interval: Duration::from_mins(1),
                         finality_depth: 0,
                         quick_sync_endpoint: None,

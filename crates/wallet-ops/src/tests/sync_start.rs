@@ -374,6 +374,7 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
         wrapped_native_token: wrapped_native_token_for_chain(1).map(|token| token.to_string()),
         multicall_contract: defaults.multicall_contract.to_string(),
         finality_depth: 99,
+        block_time: Duration::from_secs(7),
         block_range: Some(2_000),
         poll_interval_secs: Some(30),
         gas: crate::settings::EffectiveChainGasSettings {
@@ -396,6 +397,7 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
     assert!(cfg.indexed_artifact_source.is_none());
     assert_eq!(cfg.indexed_wallet_block_range, 12_345);
     assert_eq!(cfg.finality_depth, 99);
+    assert_eq!(cfg.block_time, Duration::from_secs(7));
     assert_eq!(cfg.block_range, 2_000);
     assert_eq!(cfg.poll_interval, Duration::from_secs(30));
     assert_eq!(

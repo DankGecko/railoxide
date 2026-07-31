@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::{
     Address, BTreeMap, DEFAULT_WAKU_CLUSTER_ID, DEFAULT_WAKU_MAX_PEERS,
     DEFAULT_WAKU_PEER_CONNECTION_TIMEOUT_SECS, DEFAULT_WAKU_SHARD_ID, Deserialize,
@@ -338,6 +340,7 @@ pub struct EffectiveChainConfig {
     pub wrapped_native_token: Option<String>,
     pub multicall_contract: String,
     pub finality_depth: u64,
+    pub block_time: Duration,
     pub block_range: Option<u64>,
     pub poll_interval_secs: Option<u64>,
     pub gas: EffectiveChainGasSettings,

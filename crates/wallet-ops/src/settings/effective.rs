@@ -92,6 +92,7 @@ pub fn build_effective_chain_configs(
                 finality_depth: override_settings
                     .and_then(|settings| settings.finality_depth)
                     .unwrap_or(defaults.finality_depth),
+                block_time: defaults.block_time,
                 block_range: override_settings.and_then(|settings| settings.block_range),
                 poll_interval_secs: override_settings
                     .and_then(|settings| settings.poll_interval_secs),

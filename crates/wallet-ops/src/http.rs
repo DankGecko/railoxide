@@ -36,6 +36,8 @@ const SOCKS_REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS_REPLY_ADDR_NOT_SUPPORTED: u8 = 0x08;
 const TOR_BOOTSTRAP_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const SOCKS_ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const DIRECT_PROXY_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TOR_RPC_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub type WalletTorClient = Arc<TorClient<PreferredRuntime>>;
 pub type WalletTorClientProvider = Arc<dyn Fn() -> Option<WalletTorClient> + Send + Sync>;
@@ -197,8 +199,10 @@ impl WalletNetworkHealth {
 /// passed into wallet operations that issue network requests.
 #[derive(Clone)]
 pub struct HttpContext {
-    /// Async HTTP client for reqwest and alloy usage.
+    /// Async HTTP client for non-chain HTTP traffic.
     pub client: reqwest::Client,
+    /// Async HTTP client for bounded EVM JSON-RPC requests.
+    pub rpc_client: reqwest::Client,
     /// Proxy URL for components that build their own client, such as the
     /// blocking artifact downloader. In Tor mode this is the internal SOCKS
     /// bridge URL, not a user-supplied external proxy.
@@ -364,6 +368,7 @@ impl HttpContext {
     pub(crate) fn direct_for_tests() -> Self {
         Self {
             client: reqwest::Client::new(),
+            rpc_client: reqwest::Client::new(),
             proxy_url: None,
             user_proxy_url: None,
             mode: WalletNetworkMode::Direct,
@@ -685,25 +690,25 @@ fn build_reqwest_context(
     arti_cache_dir: Option<PathBuf>,
     socks_bridge: Option<Arc<ArtiSocksBridge>>,
 ) -> Result<HttpContext> {
-    let mut builder = reqwest::Client::builder();
     if let Some(proxy_url) = &proxy_url {
         let display_proxy_url = redact_url_for_display(proxy_url);
         tracing::info!(network_mode = %mode, proxy_url = %display_proxy_url, "routing wallet HTTP traffic through proxy");
-        let proxy = reqwest::Proxy::all(proxy_url.as_str())
-            .wrap_err_with(|| format!("invalid proxy URL {display_proxy_url}"))?;
-        builder = builder.proxy(proxy);
-    }
-    if mode == WalletNetworkMode::Tor {
-        builder = builder.pool_max_idle_per_host(0);
     }
     if mode == WalletNetworkMode::Direct {
         tracing::warn!(
             "wallet direct network mode selected; outbound requests are not Tor-protected"
         );
     }
-    let client = builder.build().wrap_err("build HTTP client")?;
+    let client = wallet_reqwest_client_builder(mode, proxy_url.as_ref())?
+        .build()
+        .wrap_err("build HTTP client")?;
+    let rpc_client = wallet_reqwest_client_builder(mode, proxy_url.as_ref())?
+        .timeout(rpc_request_timeout(mode))
+        .build()
+        .wrap_err("build RPC HTTP client")?;
     Ok(HttpContext {
         client,
+        rpc_client,
         proxy_url,
         user_proxy_url,
         mode,
@@ -713,6 +718,30 @@ fn build_reqwest_context(
         socks_bridge,
         fail_closed: mode != WalletNetworkMode::Direct,
     })
+}
+
+fn wallet_reqwest_client_builder(
+    mode: WalletNetworkMode,
+    proxy_url: Option<&Url>,
+) -> Result<reqwest::ClientBuilder> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy_url) = proxy_url {
+        let display_proxy_url = redact_url_for_display(proxy_url);
+        let proxy = reqwest::Proxy::all(proxy_url.as_str())
+            .wrap_err_with(|| format!("invalid proxy URL {display_proxy_url}"))?;
+        builder = builder.proxy(proxy);
+    }
+    if mode == WalletNetworkMode::Tor {
+        builder = builder.pool_max_idle_per_host(0);
+    }
+    Ok(builder)
+}
+
+const fn rpc_request_timeout(mode: WalletNetworkMode) -> Duration {
+    match mode {
+        WalletNetworkMode::Tor => TOR_RPC_REQUEST_TIMEOUT,
+        WalletNetworkMode::Proxy | WalletNetworkMode::Direct => DIRECT_PROXY_RPC_REQUEST_TIMEOUT,
+    }
 }
 
 pub(crate) fn redact_url_for_display(url: &Url) -> String {
