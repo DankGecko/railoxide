@@ -112,6 +112,8 @@ impl ChainSettings {
 pub struct ChainSettingsOverride {
     pub enabled: bool,
     pub rpc_endpoints: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sponsored_bundle_relays: Option<Vec<String>>,
     pub quick_sync: QuickSyncSettings,
     pub contracts: ChainContractSettings,
     pub deployment: ChainDeploymentSettings,
@@ -127,6 +129,7 @@ impl Default for ChainSettingsOverride {
         Self {
             enabled: true,
             rpc_endpoints: Vec::new(),
+            sponsored_bundle_relays: None,
             quick_sync: QuickSyncSettings::default(),
             contracts: ChainContractSettings::default(),
             deployment: ChainDeploymentSettings::default(),
@@ -148,6 +151,16 @@ impl ChainSettingsOverride {
                 &["http", "https"],
                 errors,
             );
+        }
+        if let Some(relays) = self.sponsored_bundle_relays.as_ref() {
+            for (index, relay) in relays.iter().enumerate() {
+                validate_url_scheme(
+                    &format!("chains.per_chain.{chain_id}.sponsored_bundle_relays[{index}]"),
+                    relay,
+                    &["http", "https"],
+                    errors,
+                );
+            }
         }
         self.quick_sync.validate(chain_id, errors);
         self.contracts.validate(chain_id, errors);
@@ -236,6 +249,8 @@ pub struct ChainContractSettings {
     pub relay_adapt_7702_contract: Option<String>,
     pub wrapped_native_token: Option<String>,
     pub multicall_contract: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coinbase_payer: Option<String>,
 }
 
 impl ChainContractSettings {
@@ -282,6 +297,11 @@ impl ChainContractSettings {
         validate_optional_address(
             &format!("chains.per_chain.{chain_id}.contracts.multicall_contract"),
             self.multicall_contract.as_deref(),
+            errors,
+        );
+        validate_optional_address(
+            &format!("chains.per_chain.{chain_id}.contracts.coinbase_payer"),
+            self.coinbase_payer.as_deref(),
             errors,
         );
     }

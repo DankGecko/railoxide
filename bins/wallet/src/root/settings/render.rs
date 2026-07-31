@@ -376,6 +376,12 @@ impl Render for WalletSettingsEditor {
             };
             let endpoints = rpc_kind.endpoints(&self.draft);
             let rpc_editor = editor.clone();
+            let sponsored_relay_kind = SettingsUrlListKind::SponsoredRelay {
+                chain_id,
+                chain_label: label.clone(),
+            };
+            let sponsored_relay_endpoints = sponsored_relay_kind.endpoints(&self.draft);
+            let sponsored_relay_editor = editor.clone();
             let group = settings_group()
                 .item(settings_chain_section_header(
                     chain_id,
@@ -393,6 +399,12 @@ impl Render for WalletSettingsEditor {
                     rpc_editor,
                     rpc_kind,
                     endpoints,
+                ))
+                .item(Self::settings_url_list_item(
+                    format!("{label} sponsored bundle relays"),
+                    sponsored_relay_editor,
+                    sponsored_relay_kind,
+                    sponsored_relay_endpoints,
                 ));
             chains_page = chains_page.group(group);
         }
@@ -470,6 +482,19 @@ impl Render for WalletSettingsEditor {
                                 chain_id,
                                 |contracts| contracts.multicall_contract.as_ref(),
                                 |chain, value| chain.contracts.multicall_contract = value,
+                            ),
+                        )
+                        .layout(Axis::Vertical),
+                    )
+                    .item(
+                        SettingItem::new(
+                            "Coinbase payer",
+                            Self::chain_contract_field(
+                                format!("chain-{chain_id}-coinbase-payer"),
+                                editor.clone(),
+                                chain_id,
+                                |contracts| contracts.coinbase_payer.as_ref(),
+                                |chain, value| chain.contracts.coinbase_payer = value,
                             ),
                         )
                         .layout(Axis::Vertical),

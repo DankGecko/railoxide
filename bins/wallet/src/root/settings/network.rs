@@ -15,6 +15,18 @@ pub(in crate::root) fn display_chain_rpc_endpoints(
         )
 }
 
+pub(in crate::root) fn display_sponsored_bundle_relays(
+    settings: &WalletSettings,
+    chain_id: u64,
+) -> Vec<String> {
+    settings
+        .chains
+        .per_chain
+        .get(&chain_id)
+        .and_then(|chain| chain.sponsored_bundle_relays.clone())
+        .unwrap_or_else(|| default_sponsored_bundle_relay_endpoints(chain_id))
+}
+
 pub(in crate::root) fn display_chain_quick_sync_endpoint(
     settings: &WalletSettings,
     chain_id: u64,
@@ -47,6 +59,9 @@ pub(in crate::root) fn display_chain_contract_settings(
         }
         if let Some(value) = overrides.contracts.multicall_contract.as_ref() {
             contracts.multicall_contract = Some(value.clone());
+        }
+        if let Some(value) = overrides.contracts.coinbase_payer.as_ref() {
+            contracts.coinbase_payer = Some(value.clone());
         }
     }
     contracts
@@ -115,6 +130,20 @@ pub(in crate::root) fn materialize_chain_rpc_endpoints(
     &mut chain.rpc_endpoints
 }
 
+pub(in crate::root) fn materialize_sponsored_bundle_relays(
+    settings: &mut WalletSettings,
+    chain_id: u64,
+) -> &mut Vec<String> {
+    let chain = settings.chains.per_chain.entry(chain_id).or_default();
+    if chain.sponsored_bundle_relays.is_none() {
+        chain.sponsored_bundle_relays = Some(default_sponsored_bundle_relay_endpoints(chain_id));
+    }
+    chain
+        .sponsored_bundle_relays
+        .as_mut()
+        .expect("sponsored relay overrides were just initialized")
+}
+
 pub(in crate::root) fn materialize_waku_doh_fallback_endpoints(
     settings: &mut WalletSettings,
 ) -> &mut Vec<String> {
@@ -168,6 +197,19 @@ pub(in crate::root) fn set_chain_rpc_endpoint(
     endpoints[index] = value.trim().to_string();
 }
 
+pub(in crate::root) fn set_sponsored_bundle_relay(
+    settings: &mut WalletSettings,
+    chain_id: u64,
+    index: usize,
+    value: &str,
+) {
+    let relays = materialize_sponsored_bundle_relays(settings, chain_id);
+    if relays.len() <= index {
+        relays.resize(index + 1, String::new());
+    }
+    relays[index] = value.trim().to_string();
+}
+
 pub(in crate::root) fn set_waku_doh_fallback_endpoint(
     settings: &mut WalletSettings,
     index: usize,
@@ -200,6 +242,14 @@ pub(in crate::root) fn add_chain_rpc_endpoint(
     materialize_chain_rpc_endpoints(settings, chain_id).push(value.trim().to_string());
 }
 
+pub(in crate::root) fn add_sponsored_bundle_relay(
+    settings: &mut WalletSettings,
+    chain_id: u64,
+    value: &str,
+) {
+    materialize_sponsored_bundle_relays(settings, chain_id).push(value.trim().to_string());
+}
+
 pub(in crate::root) fn add_waku_doh_fallback_endpoint(settings: &mut WalletSettings, value: &str) {
     materialize_waku_doh_fallback_endpoints(settings).push(value.trim().to_string());
 }
@@ -216,6 +266,17 @@ pub(in crate::root) fn remove_chain_rpc_endpoint(
     let endpoints = materialize_chain_rpc_endpoints(settings, chain_id);
     if index < endpoints.len() {
         endpoints.remove(index);
+    }
+}
+
+pub(in crate::root) fn remove_sponsored_bundle_relay(
+    settings: &mut WalletSettings,
+    chain_id: u64,
+    index: usize,
+) {
+    let relays = materialize_sponsored_bundle_relays(settings, chain_id);
+    if index < relays.len() {
+        relays.remove(index);
     }
 }
 

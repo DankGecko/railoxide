@@ -140,6 +140,7 @@ pub(super) fn effective_chain_config_with_rpc_endpoints(
         chain_id,
         enabled: true,
         rpc_endpoints,
+        sponsored_bundle_relays: crate::settings::default_sponsored_bundle_relays(chain_id),
         archive_rpc_url: None,
         quick_sync_enabled: true,
         quick_sync_endpoint: defaults
@@ -159,6 +160,7 @@ pub(super) fn effective_chain_config_with_rpc_endpoints(
         wrapped_native_token: wrapped_native_token_for_chain(chain_id)
             .map(|token| token.to_string()),
         multicall_contract: defaults.multicall_contract.to_string(),
+        coinbase_payer: crate::settings::default_coinbase_payer(chain_id),
         finality_depth: defaults.finality_depth,
         block_time: defaults.block_time,
         block_range: None,

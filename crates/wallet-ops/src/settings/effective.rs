@@ -2,10 +2,21 @@ use super::{
     Address, BTreeMap, ChainConfigDefaults, ChainContractSettings, ChainDeploymentSettings,
     ChainGasSettings, DEFAULT_WAKU_DIRECT_PEER_ADDR, DEFAULT_WAKU_DIRECT_PEER_ID,
     EffectiveChainConfig, EffectiveChainGasSettings, EffectiveTokenInfo, EffectiveTokenRegistry,
-    FromStr, PriceAnchorSettings, QuickSyncSettings, RAILGUN_TREE, TokenAnchorSource, TokenKey,
-    TokenPriceAnchorOverride, WakuDirectPeerSetting, WalletSettings, WalletSettingsValidationError,
+    FromStr, PriceAnchorSettings, QuickSyncSettings, RAILGUN_TREE, SensitiveUrl, TokenAnchorSource,
+    TokenKey, TokenPriceAnchorOverride, Url, WakuDirectPeerSetting, WalletSettings,
+    WalletSettingsValidationError,
 };
 
+pub const ETHEREUM_SPONSORED_BUNDLE_RELAYS: &[&str] =
+    &["https://rpc.titanbuilder.xyz", "https://rpc.quasar.win"];
+pub const ETHEREUM_COINBASE_PAYER: Address =
+    alloy::primitives::address!("0x381787eBFD112E742fc965289c59630B2e7ce0A4");
+
+/// Builds validated runtime chain configuration.
+///
+/// # Panics
+///
+/// Panics only if a value accepted by settings validation cannot be parsed identically here.
 pub fn build_effective_chain_configs(
     settings: &WalletSettings,
 ) -> Result<BTreeMap<u64, EffectiveChainConfig>, WalletSettingsValidationError> {
@@ -25,6 +36,21 @@ pub fn build_effective_chain_configs(
                 || defaults.rpc_urls.iter().map(ToString::to_string).collect(),
                 |settings| settings.rpc_endpoints.clone(),
             );
+        let sponsored_bundle_relays = override_settings
+            .and_then(|settings| settings.sponsored_bundle_relays.as_ref())
+            .map_or_else(
+                || default_sponsored_bundle_relays(*chain_id),
+                |relays| {
+                    relays
+                        .iter()
+                        .map(|relay| {
+                            SensitiveUrl::from(
+                                Url::parse(relay).expect("validated sponsored relay URL"),
+                            )
+                        })
+                        .collect()
+                },
+            );
         let quick_sync_default = QuickSyncSettings::default();
         let quick_sync =
             override_settings.map_or(&quick_sync_default, |settings| &settings.quick_sync);
@@ -43,6 +69,7 @@ pub fn build_effective_chain_configs(
                 chain_id: *chain_id,
                 enabled,
                 rpc_endpoints,
+                sponsored_bundle_relays,
                 archive_rpc_url: deployment.archive_rpc_url.clone(),
                 quick_sync_enabled: quick_sync.enabled,
                 quick_sync_endpoint: quick_sync.endpoint.clone().or_else(|| {
@@ -89,6 +116,11 @@ pub fn build_effective_chain_configs(
                     .multicall_contract
                     .clone()
                     .unwrap_or_else(|| defaults.multicall_contract.to_string()),
+                coinbase_payer: contracts
+                    .coinbase_payer
+                    .as_deref()
+                    .map(|payer| Address::from_str(payer).expect("validated coinbase payer"))
+                    .or_else(|| default_coinbase_payer(*chain_id)),
                 finality_depth: override_settings
                     .and_then(|settings| settings.finality_depth)
                     .unwrap_or(defaults.finality_depth),
@@ -117,6 +149,42 @@ pub fn build_effective_chain_configs(
 pub fn default_chain_rpc_endpoints(chain_id: u64) -> Option<Vec<String>> {
     ChainConfigDefaults::for_chain(chain_id)
         .map(|defaults| defaults.rpc_urls.iter().map(ToString::to_string).collect())
+}
+
+#[must_use]
+pub fn default_sponsored_bundle_relay_endpoints(chain_id: u64) -> Vec<String> {
+    if chain_id == 1 {
+        ETHEREUM_SPONSORED_BUNDLE_RELAYS
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+#[must_use]
+/// Returns built-in sponsored relays within redacted runtime URL boundaries.
+///
+/// # Panics
+///
+/// Panics if a compiled-in sponsored relay URL is invalid.
+pub fn default_sponsored_bundle_relays(chain_id: u64) -> Vec<SensitiveUrl> {
+    default_sponsored_bundle_relay_endpoints(chain_id)
+        .into_iter()
+        .map(|relay| {
+            SensitiveUrl::from(Url::parse(&relay).expect("built-in sponsored relay URL is valid"))
+        })
+        .collect()
+}
+
+#[must_use]
+/// Returns the reviewed built-in coinbase payer for a supported deployment.
+pub const fn default_coinbase_payer(chain_id: u64) -> Option<Address> {
+    match chain_id {
+        1 => Some(ETHEREUM_COINBASE_PAYER),
+        _ => None,
+    }
 }
 
 #[must_use]
@@ -149,6 +217,7 @@ pub fn default_chain_contract_settings(chain_id: u64) -> Option<ChainContractSet
         wrapped_native_token: crate::amounts::wrapped_native_token_for_chain(chain_id)
             .map(|token| token.to_string()),
         multicall_contract: Some(defaults.multicall_contract.to_string()),
+        coinbase_payer: default_coinbase_payer(chain_id).map(|payer| payer.to_string()),
     })
 }
 

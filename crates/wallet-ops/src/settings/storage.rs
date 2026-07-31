@@ -83,6 +83,10 @@ fn decode_wallet_settings_with_migration(
             settings.runtime.auto_lock_timeout_secs = Some(DEFAULT_AUTO_LOCK_TIMEOUT_SECS);
             true
         }
+        2 => {
+            settings.version = WALLET_SETTINGS_VERSION;
+            true
+        }
         version => return Err(WalletSettingsError::UnsupportedVersion { version }),
     };
     Ok((settings, migrated))

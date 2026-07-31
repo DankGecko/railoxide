@@ -132,6 +132,7 @@ pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables Wak
 #[derive(Clone)]
 pub(in crate::root) enum SettingsUrlListKind {
     ChainRpc { chain_id: u64, chain_label: String },
+    SponsoredRelay { chain_id: u64, chain_label: String },
     IndexedArtifactGateway,
     PoiGateway,
     WakuDnsEnrTree,
@@ -142,6 +143,9 @@ impl SettingsUrlListKind {
     pub(in crate::root) const fn empty_text(&self) -> &'static str {
         match self {
             Self::ChainRpc { .. } => "No RPC endpoints configured.",
+            Self::SponsoredRelay { .. } => {
+                "No sponsored relays configured. Sponsored self-broadcast is disabled."
+            }
             Self::IndexedArtifactGateway => "No indexed artifact gateways configured.",
             Self::PoiGateway => "No artifact gateways configured.",
             Self::WakuDnsEnrTree => "No DNS ENR trees configured. DNS bootstrap is disabled.",
@@ -152,6 +156,9 @@ impl SettingsUrlListKind {
     pub(in crate::root) const fn dialog_help(&self) -> &'static str {
         match self {
             Self::ChainRpc { .. } => "Enter an HTTP(S) RPC endpoint for this chain.",
+            Self::SponsoredRelay { .. } => {
+                "Enter a compatible HTTP(S) pending-block eth_sendBundle relay."
+            }
             Self::IndexedArtifactGateway => {
                 "Enter an HTTP(S) gateway URL for chain-indexed artifact reads."
             }
@@ -164,6 +171,9 @@ impl SettingsUrlListKind {
     pub(in crate::root) fn add_id(&self) -> SharedString {
         SharedString::from(match self {
             Self::ChainRpc { chain_id, .. } => format!("wallet-settings-rpc-add-{chain_id}"),
+            Self::SponsoredRelay { chain_id, .. } => {
+                format!("wallet-settings-sponsored-relay-add-{chain_id}")
+            }
             Self::IndexedArtifactGateway => {
                 "wallet-settings-indexed-artifact-gateway-add".to_string()
             }
@@ -177,6 +187,9 @@ impl SettingsUrlListKind {
         SharedString::from(match self {
             Self::ChainRpc { chain_id, .. } => {
                 format!("wallet-settings-rpc-row-{chain_id}-{index}")
+            }
+            Self::SponsoredRelay { chain_id, .. } => {
+                format!("wallet-settings-sponsored-relay-row-{chain_id}-{index}")
             }
             Self::IndexedArtifactGateway => {
                 format!("wallet-settings-indexed-artifact-gateway-row-{index}")
@@ -192,6 +205,9 @@ impl SettingsUrlListKind {
             Self::ChainRpc { chain_id, .. } => {
                 format!("wallet-settings-rpc-edit-{chain_id}-{index}")
             }
+            Self::SponsoredRelay { chain_id, .. } => {
+                format!("wallet-settings-sponsored-relay-edit-{chain_id}-{index}")
+            }
             Self::IndexedArtifactGateway => {
                 format!("wallet-settings-indexed-artifact-gateway-edit-{index}")
             }
@@ -205,6 +221,9 @@ impl SettingsUrlListKind {
         SharedString::from(match self {
             Self::ChainRpc { chain_id, .. } => {
                 format!("wallet-settings-rpc-remove-{chain_id}-{index}")
+            }
+            Self::SponsoredRelay { chain_id, .. } => {
+                format!("wallet-settings-sponsored-relay-remove-{chain_id}-{index}")
             }
             Self::IndexedArtifactGateway => {
                 format!("wallet-settings-indexed-artifact-gateway-remove-{index}")
@@ -222,6 +241,13 @@ impl SettingsUrlListKind {
                     format!("Edit {chain_label} RPC")
                 } else {
                     format!("Add {chain_label} RPC")
+                }
+            }
+            Self::SponsoredRelay { chain_label, .. } => {
+                if is_edit {
+                    format!("Edit {chain_label} sponsored relay")
+                } else {
+                    format!("Add {chain_label} sponsored relay")
                 }
             }
             Self::IndexedArtifactGateway => {
@@ -258,6 +284,9 @@ impl SettingsUrlListKind {
     pub(in crate::root) fn endpoints(&self, settings: &WalletSettings) -> Vec<String> {
         match self {
             Self::ChainRpc { chain_id, .. } => display_chain_rpc_endpoints(settings, *chain_id),
+            Self::SponsoredRelay { chain_id, .. } => {
+                display_sponsored_bundle_relays(settings, *chain_id)
+            }
             Self::IndexedArtifactGateway => settings.indexed_artifacts.gateway_urls.clone(),
             Self::PoiGateway => settings.poi.artifact.gateway_urls.clone(),
             Self::WakuDnsEnrTree => display_waku_dns_enr_trees(settings),
@@ -275,6 +304,9 @@ impl SettingsUrlListKind {
             Self::ChainRpc { chain_id, .. } => {
                 set_chain_rpc_endpoint(settings, *chain_id, index, value);
             }
+            Self::SponsoredRelay { chain_id, .. } => {
+                set_sponsored_bundle_relay(settings, *chain_id, index, value);
+            }
             Self::IndexedArtifactGateway => {
                 set_indexed_artifact_gateway_url(settings, index, value);
             }
@@ -287,6 +319,9 @@ impl SettingsUrlListKind {
     pub(in crate::root) fn add_endpoint(&self, settings: &mut WalletSettings, value: &str) {
         match self {
             Self::ChainRpc { chain_id, .. } => add_chain_rpc_endpoint(settings, *chain_id, value),
+            Self::SponsoredRelay { chain_id, .. } => {
+                add_sponsored_bundle_relay(settings, *chain_id, value);
+            }
             Self::IndexedArtifactGateway => add_indexed_artifact_gateway_url(settings, value),
             Self::PoiGateway => add_poi_gateway_url(settings, value),
             Self::WakuDnsEnrTree => add_waku_dns_enr_tree(settings, value),
@@ -298,6 +333,9 @@ impl SettingsUrlListKind {
         match self {
             Self::ChainRpc { chain_id, .. } => {
                 remove_chain_rpc_endpoint(settings, *chain_id, index);
+            }
+            Self::SponsoredRelay { chain_id, .. } => {
+                remove_sponsored_bundle_relay(settings, *chain_id, index);
             }
             Self::IndexedArtifactGateway => remove_indexed_artifact_gateway_url(settings, index),
             Self::PoiGateway => remove_poi_gateway_url(settings, index),

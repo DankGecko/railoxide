@@ -73,6 +73,57 @@ struct ReleasedV1RuntimeSettingsWire {
     public_balance_refresh_interval_secs: u64,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictV2WalletSettingsWire {
+    version: u32,
+    network: super::NetworkSettings,
+    chains: StrictV2ChainSettingsWire,
+    indexed_artifacts: super::IndexedArtifactSettings,
+    poi: super::PoiSettings,
+    broadcaster: super::PublicBroadcasterSettings,
+    tokens: super::TokenSettings,
+    gas: super::GasSettings,
+    runtime: super::RuntimeSettings,
+    waku: super::WakuSettings,
+    walletconnect: super::WalletConnectSettings,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StrictV2ChainSettingsWire {
+    per_chain: std::collections::BTreeMap<u64, StrictV2ChainSettingsOverrideWire>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StrictV2ChainSettingsOverrideWire {
+    enabled: bool,
+    rpc_endpoints: Vec<String>,
+    quick_sync: super::QuickSyncSettings,
+    contracts: StrictV2ChainContractSettingsWire,
+    deployment: super::ChainDeploymentSettings,
+    finality_depth: Option<u64>,
+    block_range: Option<u64>,
+    poll_interval_secs: Option<u64>,
+    indexed_wallet_block_range: Option<u64>,
+    gas: super::ChainGasSettings,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StrictV2ChainContractSettingsWire {
+    railgun_contract: Option<String>,
+    relay_adapt_contract: Option<String>,
+    relay_adapt_7702_contract: Option<String>,
+    wrapped_native_token: Option<String>,
+    multicall_contract: Option<String>,
+}
+
 impl Default for ReleasedV1RuntimeSettingsWire {
     fn default() -> Self {
         Self {
@@ -87,6 +138,61 @@ fn released_v1_settings_payload() -> Vec<u8> {
         ..ReleasedV1WalletSettingsWire::default()
     };
     rmp_serde::to_vec_named(&settings).expect("encode released v1 settings")
+}
+
+fn released_v2_settings_payload() -> Vec<u8> {
+    let mut settings = WalletSettings::default();
+    let ethereum = settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings");
+    ethereum.rpc_endpoints = vec!["https://existing-rpc.example".to_string()];
+    ethereum.contracts.wrapped_native_token =
+        Some("0x0000000000000000000000000000000000000001".to_string());
+    let chains = settings
+        .chains
+        .per_chain
+        .into_iter()
+        .map(|(chain_id, chain)| {
+            let contracts = StrictV2ChainContractSettingsWire {
+                railgun_contract: chain.contracts.railgun_contract,
+                relay_adapt_contract: chain.contracts.relay_adapt_contract,
+                relay_adapt_7702_contract: chain.contracts.relay_adapt_7702_contract,
+                wrapped_native_token: chain.contracts.wrapped_native_token,
+                multicall_contract: chain.contracts.multicall_contract,
+            };
+            (
+                chain_id,
+                StrictV2ChainSettingsOverrideWire {
+                    enabled: chain.enabled,
+                    rpc_endpoints: chain.rpc_endpoints,
+                    quick_sync: chain.quick_sync,
+                    contracts,
+                    deployment: chain.deployment,
+                    finality_depth: chain.finality_depth,
+                    block_range: chain.block_range,
+                    poll_interval_secs: chain.poll_interval_secs,
+                    indexed_wallet_block_range: chain.indexed_wallet_block_range,
+                    gas: chain.gas,
+                },
+            )
+        })
+        .collect();
+    let wire = StrictV2WalletSettingsWire {
+        version: 2,
+        network: settings.network,
+        chains: StrictV2ChainSettingsWire { per_chain: chains },
+        indexed_artifacts: settings.indexed_artifacts,
+        poi: settings.poi,
+        broadcaster: settings.broadcaster,
+        tokens: settings.tokens,
+        gas: settings.gas,
+        runtime: settings.runtime,
+        waku: settings.waku,
+        walletconnect: settings.walletconnect,
+    };
+    rmp_serde::to_vec_named(&wire).expect("encode released v2 settings")
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -449,6 +555,62 @@ fn version_1_settings_migrate_and_rewrite_with_auto_lock_default() {
 }
 
 #[test]
+fn version_2_settings_migrate_with_sponsored_fields_unset() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let released_payload = released_v2_settings_payload();
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &released_payload)
+        .expect("store version 2 settings");
+
+    let migrated = load_wallet_settings(&store).expect("migrate version 2 settings");
+    let ethereum = migrated
+        .chains
+        .per_chain
+        .get(&1)
+        .expect("migrated ethereum settings");
+    assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
+    assert_eq!(ethereum.rpc_endpoints, vec!["https://existing-rpc.example"]);
+    assert_eq!(ethereum.sponsored_bundle_relays, None);
+    assert_eq!(ethereum.contracts.coinbase_payer, None);
+    let effective = build_effective_chain_configs(&migrated).expect("effective migrated settings");
+    let ethereum = effective.get(&1).expect("effective ethereum");
+    assert_eq!(ethereum.sponsored_bundle_relays.len(), 2);
+    assert_eq!(ethereum.coinbase_payer, super::default_coinbase_payer(1));
+    let rewritten = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read rewritten settings")
+        .expect("rewritten settings record");
+    assert_ne!(rewritten, released_payload);
+    assert_eq!(
+        decode_wallet_settings(&rewritten).expect("decode rewritten settings"),
+        migrated
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn version_3_sponsored_fields_are_not_strict_version_2_readable() {
+    let mut settings = WalletSettings::default();
+    let ethereum = settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings");
+    ethereum.sponsored_bundle_relays = Some(vec!["https://relay.example".to_string()]);
+    ethereum.contracts.coinbase_payer =
+        Some("0x381787eBFD112E742fc965289c59630B2e7ce0A4".to_string());
+    let encoded = encode_wallet_settings(&settings).expect("encode version 3 settings");
+
+    assert!(rmp_serde::from_slice::<StrictV2WalletSettingsWire>(&encoded).is_err());
+}
+
+#[test]
 fn current_auto_lock_timeout_and_disabled_policy_are_preserved() {
     for policy in [Some(30 * 60), None] {
         let root_dir = temp_db_root();
@@ -778,6 +940,13 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
     );
     assert!(ethereum.rpc_endpoints.len() > 1);
     assert_eq!(ethereum.finality_depth, defaults.finality_depth);
+    assert!(ethereum.has_sponsorship_prerequisites());
+    for chain_id in [56, 137, 42161] {
+        let chain = configs.get(&chain_id).expect("supported chain config");
+        assert!(chain.sponsored_bundle_relays.is_empty());
+        assert_eq!(chain.coinbase_payer, None);
+        assert!(!chain.has_sponsorship_prerequisites());
+    }
     assert_eq!(ethereum.deployment_block, defaults.deployment_block);
     assert_eq!(ethereum.v2_start_block, defaults.v2_start_block);
     assert_eq!(ethereum.legacy_shield_block, defaults.legacy_shield_block);
@@ -811,6 +980,123 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
     assert_eq!(
         source.gateway_urls.len(),
         OFFICIAL_INDEXED_ARTIFACT_GATEWAYS.len()
+    );
+}
+
+#[test]
+fn sponsored_relay_overrides_preserve_order_and_explicit_empty_disables() {
+    let mut settings = WalletSettings::default();
+    let inherited = build_effective_chain_configs(&settings).expect("inherited sponsored relays");
+    assert!(
+        !inherited
+            .get(&1)
+            .expect("ethereum config")
+            .sponsored_bundle_relays
+            .is_empty()
+    );
+    settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings")
+        .sponsored_bundle_relays = Some(vec![
+        "https://user:secret@relay-a.example/path".to_string(),
+        "http://relay-b.example".to_string(),
+    ]);
+    let configs = build_effective_chain_configs(&settings).expect("effective sponsored relays");
+    let ethereum = configs.get(&1).expect("ethereum config");
+    assert_eq!(ethereum.sponsored_bundle_relays.len(), 2);
+    assert_eq!(
+        ethereum.sponsored_bundle_relays[1].expose_url().as_str(),
+        "http://relay-b.example/"
+    );
+    let debug = format!("{:?}", ethereum.sponsored_bundle_relays);
+    assert!(!debug.contains("user"));
+    assert!(!debug.contains("secret"));
+
+    settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings")
+        .sponsored_bundle_relays = Some(Vec::new());
+    let disabled = build_effective_chain_configs(&settings).expect("disabled sponsored relays");
+    assert!(
+        disabled
+            .get(&1)
+            .expect("ethereum config")
+            .sponsored_bundle_relays
+            .is_empty()
+    );
+}
+
+#[test]
+fn sponsored_settings_validate_relay_schemes_and_payer_addresses() {
+    let mut settings = WalletSettings::default();
+    let ethereum = settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings");
+    ethereum.sponsored_bundle_relays = Some(vec!["ws://relay.example".to_string()]);
+    ethereum.contracts.coinbase_payer = Some("not-an-address".to_string());
+
+    let error = settings.validate().expect_err("invalid sponsored settings");
+    assert!(error.messages.iter().any(|message| {
+        message.contains("sponsored_bundle_relays") && message.contains("http, https")
+    }));
+    assert!(
+        error.messages.iter().any(|message| {
+            message.contains("coinbase_payer") && message.contains("EVM address")
+        })
+    );
+}
+
+#[test]
+fn sponsored_settings_roundtrip_all_override_states() {
+    for relays in [
+        None,
+        Some(Vec::new()),
+        Some(vec!["https://relay.example".to_string()]),
+    ] {
+        let mut settings = WalletSettings::default();
+        let ethereum = settings
+            .chains
+            .per_chain
+            .get_mut(&1)
+            .expect("ethereum settings");
+        ethereum.sponsored_bundle_relays = relays.clone();
+
+        let encoded = encode_wallet_settings(&settings).expect("encode sponsored settings");
+        let decoded = decode_wallet_settings(&encoded).expect("decode sponsored settings");
+        let decoded = decoded
+            .chains
+            .per_chain
+            .get(&1)
+            .expect("decoded ethereum settings");
+        assert_eq!(decoded.sponsored_bundle_relays, relays);
+    }
+
+    let mut settings = WalletSettings::default();
+    settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings")
+        .contracts
+        .coinbase_payer = Some("0x0000000000000000000000000000000000000001".to_string());
+    let encoded = encode_wallet_settings(&settings).expect("encode payer override");
+    let decoded = decode_wallet_settings(&encoded).expect("decode payer override");
+    assert_eq!(
+        decoded
+            .chains
+            .per_chain
+            .get(&1)
+            .expect("decoded ethereum settings")
+            .contracts
+            .coinbase_payer
+            .as_deref(),
+        Some("0x0000000000000000000000000000000000000001")
     );
 }
 

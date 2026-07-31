@@ -4,10 +4,10 @@ use super::{
     Address, BTreeMap, DEFAULT_WAKU_CLUSTER_ID, DEFAULT_WAKU_MAX_PEERS,
     DEFAULT_WAKU_PEER_CONNECTION_TIMEOUT_SECS, DEFAULT_WAKU_SHARD_ID, Deserialize,
     GAS_LIMIT_BUFFER, GAS_PRICE_BUFFER_DENOMINATOR, GAS_PRICE_BUFFER_NUMERATOR,
-    IndexedArtifactSourceConfig, IndexedArtifactSourceModeSetting, MAX_INTERVAL_SECS, Serialize,
-    U256, normalize_address_string, public_balance_refresh_interval_secs, supported_chain_id,
-    validate_address, validate_enr_tree, validate_optional_non_empty, validate_optional_range,
-    validate_range, validate_url_scheme, validate_waku_direct_peer,
+    IndexedArtifactSourceConfig, IndexedArtifactSourceModeSetting, MAX_INTERVAL_SECS, SensitiveUrl,
+    Serialize, U256, normalize_address_string, public_balance_refresh_interval_secs,
+    supported_chain_id, validate_address, validate_enr_tree, validate_optional_non_empty,
+    validate_optional_range, validate_range, validate_url_scheme, validate_waku_direct_peer,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -324,6 +324,7 @@ pub struct EffectiveChainConfig {
     pub chain_id: u64,
     pub enabled: bool,
     pub rpc_endpoints: Vec<String>,
+    pub sponsored_bundle_relays: Vec<SensitiveUrl>,
     pub archive_rpc_url: Option<String>,
     pub quick_sync_enabled: bool,
     pub quick_sync_endpoint: Option<String>,
@@ -339,11 +340,21 @@ pub struct EffectiveChainConfig {
     pub relay_adapt_7702_contract: String,
     pub wrapped_native_token: Option<String>,
     pub multicall_contract: String,
+    pub coinbase_payer: Option<Address>,
     pub finality_depth: u64,
     pub block_time: Duration,
     pub block_range: Option<u64>,
     pub poll_interval_secs: Option<u64>,
     pub gas: EffectiveChainGasSettings,
+}
+
+impl EffectiveChainConfig {
+    #[must_use]
+    pub const fn has_sponsorship_prerequisites(&self) -> bool {
+        !self.sponsored_bundle_relays.is_empty()
+            && self.wrapped_native_token.is_some()
+            && self.coinbase_payer.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

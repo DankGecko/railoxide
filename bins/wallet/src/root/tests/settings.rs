@@ -11,7 +11,10 @@ use crate::root::settings::{
 };
 use crate::root::startup::tor_bootstrap_recovery_is_current;
 use wallet_ops::WalletNetworkProgressStage;
-use wallet_ops::settings::{IndexedArtifactSettings, IndexedArtifactSourceModeSetting};
+use wallet_ops::settings::{
+    IndexedArtifactSettings, IndexedArtifactSourceModeSetting,
+    default_sponsored_bundle_relay_endpoints,
+};
 
 #[test]
 fn private_tab_is_default_wallet_tab() {
@@ -683,6 +686,44 @@ fn chain_rpc_settings_remove_default_creates_custom_override() {
 }
 
 #[test]
+fn sponsored_relay_settings_preserve_default_override_and_disabled_states() {
+    let mut settings = WalletSettings::default();
+    let defaults = default_sponsored_bundle_relay_endpoints(1);
+    assert_eq!(display_sponsored_bundle_relays(&settings, 1), defaults);
+    assert_eq!(
+        settings
+            .chains
+            .per_chain
+            .get(&1)
+            .expect("ethereum settings")
+            .sponsored_bundle_relays,
+        None
+    );
+
+    set_sponsored_bundle_relay(&mut settings, 1, 0, " https://custom-relay.example ");
+    assert_eq!(
+        display_sponsored_bundle_relays(&settings, 1)[0],
+        "https://custom-relay.example"
+    );
+    while !display_sponsored_bundle_relays(&settings, 1).is_empty() {
+        remove_sponsored_bundle_relay(&mut settings, 1, 0);
+    }
+    assert_eq!(
+        display_sponsored_bundle_relays(&settings, 1),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        settings
+            .chains
+            .per_chain
+            .get(&1)
+            .expect("ethereum settings")
+            .sponsored_bundle_relays,
+        Some(Vec::new())
+    );
+}
+
+#[test]
 fn poi_gateway_settings_mutations_update_direct_list() {
     let mut settings = WalletSettings::default();
     settings.poi.artifact.gateway_urls = vec![
@@ -830,6 +871,7 @@ fn chain_contract_settings_display_presets_until_customized() {
     let displayed = display_chain_contract_settings(&custom, 1);
     let defaults = default_chain_contract_settings(1).expect("ethereum preset");
     assert_eq!(displayed.railgun_contract, defaults.railgun_contract);
+    assert_eq!(displayed.coinbase_payer, defaults.coinbase_payer);
     assert_eq!(
         displayed.multicall_contract.as_deref(),
         Some("0x0000000000000000000000000000000000000001")
