@@ -61,6 +61,7 @@ impl WalletRoot {
         let root = cx.entity();
         window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
+            let content_width = secondary_dialog_content_width(dialog_width);
             let max_height = window.viewport_size().height * 0.88;
             let content_max_height = dialog_content_max_height(window);
             let close_root = root.clone();
@@ -77,9 +78,11 @@ impl WalletRoot {
             let (asset_select, asset_select_disabled) =
                 content.private_action_dialog_asset_select(kind, key);
             let child = match kind {
-                DeliveryFormKind::Send => content.render_send_form(content_root.clone(), key),
+                DeliveryFormKind::Send => {
+                    content.render_send_form(content_root.clone(), key, content_width)
+                }
                 DeliveryFormKind::Unshield => {
-                    content.render_unshield_form(content_root.clone(), key)
+                    content.render_unshield_form(content_root.clone(), key, content_width)
                 }
             };
             dialog

@@ -21,6 +21,7 @@ impl WalletRoot {
         &self,
         root: Entity<Self>,
         key: UnshieldAssetKey,
+        content_width: Pixels,
     ) -> gpui::Div {
         let Some(form) = self.send_forms.get(&key) else {
             return div();
@@ -54,7 +55,7 @@ impl WalletRoot {
 
         let mut card =
             div()
-                .w_full()
+                .w(content_width)
                 .flex()
                 .flex_col()
                 .gap_3()
@@ -64,6 +65,7 @@ impl WalletRoot {
                     DeliveryFormKind::Send,
                     asset,
                     form.generating,
+                    content_width,
                 ));
 
         if asset.total > asset.max_batched {
@@ -344,6 +346,7 @@ impl WalletRoot {
         &self,
         root: Entity<Self>,
         key: UnshieldAssetKey,
+        content_width: Pixels,
     ) -> gpui::Div {
         let Some(form) = self.unshield_forms.get(&key) else {
             return div();
@@ -385,7 +388,7 @@ impl WalletRoot {
 
         let mut card =
             div()
-                .w_full()
+                .w(content_width)
                 .flex()
                 .flex_col()
                 .gap_3()
@@ -395,6 +398,7 @@ impl WalletRoot {
                     DeliveryFormKind::Unshield,
                     asset,
                     form.generating,
+                    content_width,
                 ));
 
         if asset.total > asset.max_batched {

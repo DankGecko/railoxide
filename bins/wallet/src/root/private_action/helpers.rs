@@ -721,29 +721,51 @@ pub(in crate::root) fn amount_adjustment_for_max_change(
     Some(format_send_amount_input(adjusted_amount, asset.decimals))
 }
 
+const PRIVATE_ACTION_METRIC_MIN_WIDTH: Pixels = px(280.0);
+const PRIVATE_ACTION_METRIC_GAP: Pixels = px(8.0);
+
 pub(in crate::root) fn render_private_action_metrics(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
     asset: &UnshieldAsset,
     disabled: bool,
+    content_width: Pixels,
 ) -> gpui::Div {
     let decimals = asset.decimals;
-    div().w_full().flex().flex_wrap().gap_2().children(
-        private_action_metrics(asset)
-            .into_iter()
-            .map(move |metric| {
-                render_private_action_metric(
-                    root.clone(),
-                    key,
-                    kind,
-                    delivery_element_id(key, kind, private_action_metric_id_suffix(metric.label)),
-                    metric,
-                    decimals,
-                    disabled,
-                )
-            }),
-    )
+    let metrics = private_action_metrics(asset);
+    let metric_width = private_action_metric_width(content_width, metrics.len());
+    div()
+        .w(content_width)
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .children(metrics.into_iter().map(move |metric| {
+            render_private_action_metric(
+                root.clone(),
+                key,
+                kind,
+                delivery_element_id(key, kind, private_action_metric_id_suffix(metric.label)),
+                metric,
+                decimals,
+                disabled,
+                metric_width,
+            )
+        }))
+}
+
+fn private_action_metric_width(content_width: Pixels, metric_count: usize) -> Pixels {
+    match metric_count {
+        2 if content_width >= PRIVATE_ACTION_METRIC_MIN_WIDTH * 2.0 + PRIVATE_ACTION_METRIC_GAP => {
+            (content_width - PRIVATE_ACTION_METRIC_GAP) * 0.5
+        }
+        3 if content_width
+            >= PRIVATE_ACTION_METRIC_MIN_WIDTH * 3.0 + PRIVATE_ACTION_METRIC_GAP * 2.0 =>
+        {
+            (content_width - PRIVATE_ACTION_METRIC_GAP * 2.0) / 3.0
+        }
+        _ => content_width,
+    }
 }
 
 pub(in crate::root) fn render_private_action_metric(
@@ -754,12 +776,14 @@ pub(in crate::root) fn render_private_action_metric(
     metric: PrivateActionMetric,
     decimals: Option<u8>,
     disabled: bool,
+    width: Pixels,
 ) -> impl IntoElement {
     let value = private_action_metric_display_amount(metric.amount, decimals);
     div()
         .id(id)
-        .flex_1()
-        .min_w(px(280.0))
+        .w(width)
+        .flex_none()
+        .min_w(PRIVATE_ACTION_METRIC_MIN_WIDTH)
         .px(px(12.0))
         .py(px(10.0))
         .rounded_md()
