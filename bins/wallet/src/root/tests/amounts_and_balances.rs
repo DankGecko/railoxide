@@ -159,7 +159,7 @@ fn public_broadcaster_fee_margin_display_is_signed_fee_token_amount() {
             PublicBroadcasterFeeMargin::Positive(uint!(123_456_U256)),
             None,
         ),
-        "0.123456 USDC"
+        "0.12346 USDC"
     );
     assert_eq!(
         format_public_broadcaster_fee_margin(
@@ -174,6 +174,66 @@ fn public_broadcaster_fee_margin_display_is_signed_fee_token_amount() {
         format_public_broadcaster_fee_margin(1, usdc, PublicBroadcasterFeeMargin::Zero, None),
         "0 USDC"
     );
+}
+
+#[test]
+fn public_broadcaster_cost_display_uses_shared_amount_precision() {
+    let dai = address!("0x6B175474E89094C44Da98b954EedeAC495271d0F");
+    let candidate = wallet_ops::public_broadcaster_candidates_for_asset(
+        &[fee_row(1, dai, "formatted-amounts")],
+        1,
+        dai,
+        None,
+        BroadcasterFeePolicy::default(),
+        None,
+    )
+    .expect("candidate")
+    .remove(0);
+    let mut estimate = public_broadcaster_cost_estimate(candidate);
+    estimate.action_token = dai;
+    estimate.fee_token = dai;
+    estimate.recipient_amount = uint!(3_217_175_912_188_463_386_625_U256);
+    estimate.fee_amount = uint!(163_340_146_818_210_787_U256);
+    estimate.protocol_fee_amount = uint!(8_063_097_524_281_863_124_U256);
+    estimate.protocol_fee_bps = uint!(25_U256);
+
+    let display = PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, None);
+    assert_eq!(display.action_amount(display.recipient_amount), "3217 DAI");
+    assert_eq!(display.fee_amount(), "0.16334 DAI");
+    assert_eq!(display.protocol_fee_value(), "8.06 DAI (25 bps)");
+}
+
+#[test]
+fn public_broadcaster_cost_display_uses_effective_token_metadata() {
+    let token = Address::from([0x88; 20]);
+    let mut settings = WalletSettings::default();
+    settings.tokens.custom_tokens.push(CustomTokenSettings {
+        chain_id: 1,
+        token_address: token.to_string(),
+        symbol: "TST".to_string(),
+        decimals: 4,
+        icon_path: None,
+        price_anchor: None,
+    });
+    let registry = build_effective_token_registry(&settings).expect("effective registry");
+    let candidate = wallet_ops::public_broadcaster_candidates_for_asset(
+        &[fee_row(1, token, "custom-token-formatting")],
+        1,
+        token,
+        None,
+        BroadcasterFeePolicy::default(),
+        None,
+    )
+    .expect("candidate")
+    .remove(0);
+    let mut estimate = public_broadcaster_cost_estimate(candidate);
+    estimate.action_token = token;
+    estimate.fee_token = token;
+    estimate.entered_amount = uint!(123_456_U256);
+
+    let display =
+        PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, Some(&registry));
+    assert_eq!(display.action_amount(display.entered_amount), "12.35 TST");
 }
 
 #[test]

@@ -6,13 +6,13 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{Icon, IconName, Sizable, collapsible::Collapsible, spinner::Spinner};
-use railgun_ui::{format_token_amount, lookup_token};
+use railgun_ui::format_token_amount;
 use ui::controls::{app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
     DesktopSendPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
-    FeeHandlingMode, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterFeeBreakdown, PublicBroadcasterFeeMargin, PublicBroadcasterSubmissionResult,
+    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown,
+    PublicBroadcasterFeeMargin, PublicBroadcasterSubmissionResult,
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, fixed_token_anchor_rate, parse_send_amount,
     parse_unshield_amount, public_broadcaster_fee_breakdown, public_broadcaster_service_gas_price,
@@ -29,9 +29,9 @@ use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     COST_ESTIMATE_DEBOUNCE, ChainUtxoState, DeliveryFormKind, DeliveryMode, UnshieldAsset,
     UnshieldAssetKey, WalletRoot, app_panel, app_refresh_button, broadcaster_candidate_anchor_rate,
-    copyable_mono_field, effective_fee_handling_mode, format_exact_token_amount_for_display,
-    format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
-    format_report_chain, format_send_amount_input, should_show_distinct_amount,
+    copyable_mono_field, effective_fee_handling_mode, format_native_token_amount_for_display,
+    format_native_top_up_recipient_suffix, format_report_chain, format_token_amount_for_display,
+    should_show_distinct_amount,
 };
 
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: gpui::Pixels = px(12.0);
@@ -48,13 +48,11 @@ pub(super) struct PublicBroadcasterCostDisplay<'a> {
     pub(super) action_token: Address,
     fee_token: Address,
     pub(super) entered_amount: U256,
-    receiver_amount: U256,
     pub(super) recipient_amount: U256,
     pub(super) total_private_spend: U256,
     fee_amount: U256,
     protocol_fee_amount: U256,
     pub(super) protocol_fee_bps: U256,
-    fee_mode: FeeHandlingMode,
     gas_limit: u64,
     min_gas_price: u128,
     fee_anchor_rate: Option<U256>,
@@ -73,15 +71,15 @@ pub(super) fn format_public_broadcaster_fee_margin(
 ) -> String {
     match margin {
         PublicBroadcasterFeeMargin::Zero => {
-            format_exact_token_amount_for_display(chain_id, fee_token, U256::ZERO, registry)
+            format_token_amount_for_display(chain_id, fee_token, U256::ZERO, registry)
         }
         PublicBroadcasterFeeMargin::Positive(amount) => {
-            format_exact_token_amount_for_display(chain_id, fee_token, amount, registry)
+            format_token_amount_for_display(chain_id, fee_token, amount, registry)
         }
         PublicBroadcasterFeeMargin::Negative(amount) => {
             format!(
                 "-{}",
-                format_exact_token_amount_for_display(chain_id, fee_token, amount, registry)
+                format_token_amount_for_display(chain_id, fee_token, amount, registry)
             )
         }
     }
@@ -99,93 +97,6 @@ fn format_gwei(wei: u128) -> String {
     format_token_amount(U256::from(wei), 9)
 }
 
-fn fee_handling_mode_summary(
-    chain_id: u64,
-    action_token: Address,
-    fee_token: Address,
-    fee_mode: FeeHandlingMode,
-    entered_amount: U256,
-    receiver_amount: U256,
-    protocol_fee_amount: U256,
-    fee_amount: U256,
-    broadcaster: &PublicBroadcasterCandidate,
-    registry: Option<&EffectiveTokenRegistry>,
-) -> String {
-    if action_token != fee_token {
-        let fee_text =
-            format_exact_token_amount_for_display(chain_id, fee_token, fee_amount, registry);
-        if protocol_fee_amount.is_zero() {
-            return format!(
-                "Recipient receives the full entered amount; transaction fee is paid separately as {fee_text}."
-            );
-        }
-        let protocol_text = format_exact_token_amount_for_display(
-            chain_id,
-            action_token,
-            protocol_fee_amount,
-            registry,
-        );
-        return match fee_mode {
-            FeeHandlingMode::AddToAmount => format!(
-                "Recipient receives the entered amount; {protocol_text} RAILGUN protocol fee is added to spend. Transaction fee is paid separately as {fee_text}."
-            ),
-            FeeHandlingMode::DeductFromAmount => format!(
-                "Recipient receives the entered amount minus {protocol_text} RAILGUN protocol fee; transaction fee is paid separately as {fee_text}."
-            ),
-        };
-    }
-    match fee_mode {
-        FeeHandlingMode::AddToAmount => {
-            if protocol_fee_amount.is_zero() {
-                "Recipient receives the full entered amount; transaction fee is added to spend."
-                    .to_string()
-            } else {
-                "Recipient receives the entered amount; transaction fee and RAILGUN protocol fee are added to spend."
-                    .to_string()
-            }
-        }
-        FeeHandlingMode::DeductFromAmount => {
-            let reduction = entered_amount.saturating_sub(receiver_amount);
-            if reduction.is_zero() && protocol_fee_amount.is_zero() {
-                "Recipient receives the entered amount because the transaction fee is zero."
-                    .to_string()
-            } else if protocol_fee_amount.is_zero() {
-                format!(
-                    "Recipient amount is reduced by {} because transaction fee is paid from the entered amount.",
-                    format_exact_candidate_token_amount(broadcaster, reduction)
-                )
-            } else if reduction.is_zero() {
-                format!(
-                    "Recipient amount is reduced by {} RAILGUN protocol fee.",
-                    format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
-                )
-            } else {
-                format!(
-                    "Recipient amount is reduced by {} transaction fee and {} RAILGUN protocol fee.",
-                    format_exact_candidate_token_amount(broadcaster, reduction),
-                    format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
-                )
-            }
-        }
-    }
-}
-
-fn format_exact_candidate_token_amount(
-    candidate: &PublicBroadcasterCandidate,
-    amount: U256,
-) -> String {
-    lookup_token(candidate.chain_id, &candidate.token).map_or_else(
-        || format!("{amount} raw token units"),
-        |info| {
-            format!(
-                "{} {}",
-                format_send_amount_input(amount, Some(info.decimals)),
-                info.symbol
-            )
-        },
-    )
-}
-
 impl<'a> PublicBroadcasterCostDisplay<'a> {
     pub(super) const fn from_result(
         result: &'a PublicBroadcasterSubmissionResult,
@@ -199,13 +110,11 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
             action_token: result.action_token,
             fee_token: result.fee_token,
             entered_amount: result.entered_amount,
-            receiver_amount: result.receiver_amount,
             recipient_amount: result.recipient_amount,
             total_private_spend: result.total_private_spend,
             fee_amount: result.fee_amount,
             protocol_fee_amount: result.protocol_fee_amount,
             protocol_fee_bps: result.protocol_fee_bps,
-            fee_mode: result.fee_mode,
             gas_limit: result.gas_limit,
             min_gas_price: result.min_gas_price,
             fee_anchor_rate,
@@ -235,13 +144,11 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
             action_token: estimate.action_token,
             fee_token: estimate.fee_token,
             entered_amount: estimate.entered_amount,
-            receiver_amount: estimate.receiver_amount,
             recipient_amount: estimate.recipient_amount,
             total_private_spend: estimate.total_private_spend,
             fee_amount: estimate.fee_amount,
             protocol_fee_amount: estimate.protocol_fee_amount,
             protocol_fee_bps: estimate.protocol_fee_bps,
-            fee_mode: estimate.fee_mode,
             gas_limit: estimate.gas_limit,
             min_gas_price: estimate.min_gas_price,
             fee_anchor_rate,
@@ -258,16 +165,11 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
     }
 
     pub(super) fn action_amount(&self, amount: U256) -> String {
-        format_exact_token_amount_for_display(
-            self.chain_id,
-            self.action_token,
-            amount,
-            self.registry,
-        )
+        format_token_amount_for_display(self.chain_id, self.action_token, amount, self.registry)
     }
 
     pub(super) fn fee_amount(&self) -> String {
-        format_exact_token_amount_for_display(
+        format_token_amount_for_display(
             self.chain_id,
             self.fee_token,
             self.fee_amount,
@@ -334,21 +236,6 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         self.native_top_up.as_ref().map(|top_up| {
             format_native_top_up_recipient_suffix(self.chain_id, top_up.native_amount)
         })
-    }
-
-    pub(super) fn fee_mode_summary(&self) -> String {
-        fee_handling_mode_summary(
-            self.chain_id,
-            self.action_token,
-            self.fee_token,
-            self.fee_mode,
-            self.entered_amount,
-            self.receiver_amount,
-            self.protocol_fee_amount,
-            self.fee_amount,
-            self.broadcaster,
-            self.registry,
-        )
     }
 }
 
@@ -509,8 +396,14 @@ impl WalletRoot {
             .filter_map(|(key, form)| {
                 (key.chain_id == chain_id
                     && form.delivery_mode == DeliveryMode::PublicBroadcaster
-                    && !form.generating)
-                    .then_some(*key)
+                    && !form.generating
+                    && public_broadcaster_estimate_needs_ready_retry(
+                        form.cost_estimate.is_some()
+                            || form.result.is_some()
+                            || form.error.is_some(),
+                        form.cost_estimate_pending || form.estimating_cost,
+                    ))
+                .then_some(*key)
             })
             .collect::<Vec<_>>();
         let unshield_keys = self
@@ -519,8 +412,14 @@ impl WalletRoot {
             .filter_map(|(key, form)| {
                 (key.chain_id == chain_id
                     && form.delivery_mode == DeliveryMode::PublicBroadcaster
-                    && !form.generating)
-                    .then_some(*key)
+                    && !form.generating
+                    && public_broadcaster_estimate_needs_ready_retry(
+                        form.cost_estimate.is_some()
+                            || form.result.is_some()
+                            || form.error.is_some(),
+                        form.cost_estimate_pending || form.estimating_cost,
+                    ))
+                .then_some(*key)
             })
             .collect::<Vec<_>>();
 
@@ -866,6 +765,13 @@ impl WalletRoot {
     }
 }
 
+pub(super) const fn public_broadcaster_estimate_needs_ready_retry(
+    has_completed_state: bool,
+    in_flight: bool,
+) -> bool {
+    !has_completed_state && !in_flight
+}
+
 struct PublicBroadcasterCostRowsOptions {
     show_broadcaster: bool,
     show_entered_amount: bool,
@@ -1075,7 +981,6 @@ pub(super) fn render_public_broadcaster_cost_estimate(
         estimate.relay_call_count,
         if estimate.uses_relay_adapt { " · RelayAdapt" } else { "" }
     )))
-    .child(cost_estimate_detail_text(display.fee_mode_summary()))
 }
 
 fn render_public_broadcaster_estimate_refresh_button(
