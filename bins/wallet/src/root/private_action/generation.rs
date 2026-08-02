@@ -489,6 +489,8 @@ impl WalletRoot {
         }
         cx.notify();
 
+        let self_broadcast_requires_device_approval =
+            self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived);
         match delivery_mode {
             DeliveryMode::PublicBroadcaster => {
                 self.start_private_broadcaster_progress(
@@ -516,6 +518,7 @@ impl WalletRoot {
                         recipient.clone(),
                         None,
                         signer,
+                        self_broadcast_requires_device_approval,
                         None,
                         None,
                     );
@@ -533,6 +536,7 @@ impl WalletRoot {
                         recipient.clone(),
                         None,
                         signer,
+                        self_broadcast_requires_device_approval,
                         self_broadcast_command_tx,
                         self_broadcast_initial_gas_fee,
                     );
@@ -1345,6 +1349,8 @@ impl WalletRoot {
             private_amount_label(recipient_amount, &asset, false)
         });
 
+        let self_broadcast_requires_device_approval =
+            self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived);
         match delivery_mode {
             DeliveryMode::PublicBroadcaster => {
                 self.start_private_broadcaster_progress(
@@ -1372,6 +1378,7 @@ impl WalletRoot {
                         recipient.to_checksum(None),
                         recipient_output,
                         signer,
+                        self_broadcast_requires_device_approval,
                         None,
                         None,
                     );
@@ -1389,6 +1396,7 @@ impl WalletRoot {
                         recipient.to_checksum(None),
                         recipient_output,
                         signer,
+                        self_broadcast_requires_device_approval,
                         self_broadcast_command_tx,
                         self_broadcast_initial_gas_fee,
                     );

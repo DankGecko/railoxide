@@ -208,6 +208,7 @@ pub(super) fn private_progress_state(
         recipient: Arc::from("0zk"),
         recipient_output: None,
         gas_payer: None,
+        requires_device_approval: false,
         sponsored_funding: false,
         steps: match flow {
             PrivateSubmissionProgressFlow::PublicBroadcaster => {

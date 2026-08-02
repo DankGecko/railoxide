@@ -117,6 +117,7 @@ pub(in crate::root) fn private_broadcaster_closed_active_progress(
     Some(PrivateBroadcasterClosedActiveProgress {
         flow: progress.flow,
         generation_id: progress.generation_id,
+        requires_device_approval: progress.requires_device_approval,
         step: step.clone(),
     })
 }
@@ -432,7 +433,8 @@ pub(super) fn private_broadcaster_step_detail(
     {
         return detail;
     }
-    private_broadcaster_stage_detail(step.stage, step.status).to_string()
+    private_broadcaster_stage_detail(step.stage, step.status, progress.requires_device_approval)
+        .to_string()
 }
 
 pub(in crate::root) fn public_broadcaster_wait_status_detail(
@@ -492,9 +494,22 @@ pub(in crate::root) fn format_public_broadcaster_wait_remaining(duration: Durati
     }
 }
 
+pub(super) const fn private_broadcaster_stage_label(
+    stage: TransactionGenerationStage,
+    requires_device_approval: bool,
+) -> &'static str {
+    if requires_device_approval && matches!(stage, TransactionGenerationStage::SigningSelfBroadcast)
+    {
+        "Approve self-broadcast transaction"
+    } else {
+        stage.label()
+    }
+}
+
 pub(super) const fn private_broadcaster_stage_detail(
     stage: TransactionGenerationStage,
     status: PublicActionStepStatus,
+    requires_device_approval: bool,
 ) -> &'static str {
     match status {
         PublicActionStepStatus::NotStarted => match stage {
@@ -511,11 +526,20 @@ pub(super) const fn private_broadcaster_stage_detail(
                 "Waiting to listen for broadcaster response."
             }
             TransactionGenerationStage::EstimatingSelfBroadcastGas => "Waiting to estimate gas.",
+            TransactionGenerationStage::SigningSelfBroadcast if requires_device_approval => {
+                "Waiting for approval on your hardware device."
+            }
             TransactionGenerationStage::SigningSelfBroadcast => "Waiting to sign transaction.",
             TransactionGenerationStage::WaitingForSelfBroadcastReceipt => {
                 "Waiting for self-broadcast receipt."
             }
         },
+        PublicActionStepStatus::Pending
+            if requires_device_approval
+                && matches!(stage, TransactionGenerationStage::SigningSelfBroadcast) =>
+        {
+            "Review and approve the transaction on your hardware device."
+        }
         PublicActionStepStatus::Pending => stage.detail(),
         PublicActionStepStatus::Done => "Complete.",
         PublicActionStepStatus::Error => "Failed.",

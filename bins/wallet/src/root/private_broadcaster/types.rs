@@ -58,6 +58,7 @@ pub(in crate::root) struct PrivateBroadcasterProgressStepState {
 pub(in crate::root) struct PrivateBroadcasterClosedActiveProgress {
     pub(in crate::root) flow: PrivateSubmissionProgressFlow,
     pub(in crate::root) generation_id: u64,
+    pub(in crate::root) requires_device_approval: bool,
     pub(in crate::root) step: PrivateBroadcasterProgressStepState,
 }
 
@@ -71,6 +72,7 @@ pub(in crate::root) struct PrivateBroadcasterProgressState {
     pub(in crate::root) recipient: Arc<str>,
     pub(in crate::root) recipient_output: Option<Arc<str>>,
     pub(in crate::root) gas_payer: Option<Arc<str>>,
+    pub(in crate::root) requires_device_approval: bool,
     pub(in crate::root) sponsored_funding: bool,
     pub(in crate::root) steps: Vec<PrivateBroadcasterProgressStepState>,
     pub(in crate::root) estimate: Option<PublicBroadcasterCostEstimate>,

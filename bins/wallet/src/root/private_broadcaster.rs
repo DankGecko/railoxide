@@ -66,7 +66,7 @@ pub(super) use progress::{
 use progress::{
     ensure_private_broadcaster_progress_stage, private_broadcaster_progress_stop_available,
     private_broadcaster_retry_button_id, private_broadcaster_stage_detail,
-    private_broadcaster_stage_id, private_broadcaster_step_detail,
+    private_broadcaster_stage_id, private_broadcaster_stage_label, private_broadcaster_step_detail,
     public_broadcaster_waiting_can_stop,
 };
 #[cfg(test)]
@@ -273,6 +273,7 @@ impl WalletRoot {
             recipient: Arc::from(recipient),
             recipient_output: None,
             gas_payer: None,
+            requires_device_approval: false,
             sponsored_funding: false,
             steps: private_broadcaster_progress_steps(),
             estimate,
@@ -306,6 +307,7 @@ impl WalletRoot {
         recipient: String,
         recipient_output: Option<String>,
         gas_payer: String,
+        requires_device_approval: bool,
         command_tx: Option<SelfBroadcastCommandSender>,
         current_gas_fee: Option<(u128, u128)>,
     ) {
@@ -324,6 +326,7 @@ impl WalletRoot {
             recipient: Arc::from(recipient),
             recipient_output: recipient_output.map(Arc::from),
             gas_payer: Some(Arc::from(gas_payer)),
+            requires_device_approval,
             sponsored_funding: false,
             steps: self_broadcast_progress_steps(kind),
             estimate: None,
@@ -1463,9 +1466,12 @@ fn render_private_broadcaster_progress_step(
         .gap_1()
         .pb(if is_last { px(0.0) } else { px(12.0) })
         .child(
-            app_strong_text(step.stage.label())
-                .text_color(rgb(color))
-                .line_height(gpui::relative(1.0)),
+            app_strong_text(private_broadcaster_stage_label(
+                step.stage,
+                progress.requires_device_approval,
+            ))
+            .text_color(rgb(color))
+            .line_height(gpui::relative(1.0)),
         );
     if step.status == PublicActionStepStatus::Error {
         let message = step
@@ -1666,9 +1672,17 @@ fn private_submission_active_status_detail(
             || "This private submission step failed.".to_string(),
             private_submission_error_summary,
         ),
-        _ => private_broadcaster_stage_detail(stage, active.step.status).to_string(),
+        _ => private_broadcaster_stage_detail(
+            stage,
+            active.step.status,
+            active.requires_device_approval,
+        )
+        .to_string(),
     };
-    format!("{}: {detail}", stage.label())
+    format!(
+        "{}: {detail}",
+        private_broadcaster_stage_label(stage, active.requires_device_approval)
+    )
 }
 
 fn private_submission_error_summary(message: &str) -> String {

@@ -748,6 +748,7 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         recipient: Arc::from("0zk"),
         recipient_output: None,
         gas_payer: None,
+        requires_device_approval: false,
         sponsored_funding: false,
         steps: private_broadcaster_progress_steps(),
         estimate: None,
