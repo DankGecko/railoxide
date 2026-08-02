@@ -553,6 +553,10 @@ fn unshield_amount_input_formats_exact_token_units() {
         "1"
     );
     assert_eq!(format_unshield_amount_input(uint!(42_U256), None), "42");
+    assert_eq!(
+        format_unshield_amount_input(uint!(3_225_402_349_859_634_605_360_U256), Some(18),),
+        "3225.40234985963460536"
+    );
 }
 
 #[test]

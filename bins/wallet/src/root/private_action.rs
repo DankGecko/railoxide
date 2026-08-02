@@ -15,7 +15,7 @@ use gpui_component::{
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     dialog::DialogButtonProps,
-    input::{Escape as InputEscape, Input, InputEvent, InputState},
+    input::{Escape as InputEscape, Input, InputEvent, InputState, Position},
     popover::Popover,
     scroll::ScrollableElement,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},

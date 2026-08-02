@@ -4,6 +4,30 @@ pub(in crate::root) fn private_action_input(state: &Entity<InputState>) -> Input
     Input::new(state).px(px(12.0)).py(px(8.0))
 }
 
+pub(in crate::root) fn new_prefilled_amount_input(
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<'_, WalletRoot>,
+) -> Entity<InputState> {
+    let input = new_prefilled_input(window, cx, "amount", value);
+    input.update(cx, |input, cx| {
+        input.set_cursor_position(Position::new(0, 0), window, cx);
+    });
+    input
+}
+
+pub(in crate::root) fn set_programmatic_amount_input_value(
+    input: &Entity<InputState>,
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<'_, WalletRoot>,
+) {
+    input.update(cx, |input, cx| {
+        input.set_value(value, window, cx);
+        input.set_cursor_position(Position::new(0, 0), window, cx);
+    });
+}
+
 pub(in crate::root) fn private_action_title_row(
     action: &'static str,
     label: &str,
@@ -320,8 +344,7 @@ impl WalletRoot {
                 cx,
             ) {
                 form.pending_programmatic_amount_input = Some(adjusted.clone());
-                form.amount_input
-                    .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+                set_programmatic_amount_input_value(&form.amount_input, adjusted, window, cx);
                 form.error = None;
                 form.estimate_id = 0;
                 form.cost_estimate_pending = false;
@@ -349,8 +372,7 @@ impl WalletRoot {
                 cx,
             ) {
                 form.pending_programmatic_amount_input = Some(adjusted.clone());
-                form.amount_input
-                    .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+                set_programmatic_amount_input_value(&form.amount_input, adjusted, window, cx);
                 form.error = None;
                 form.estimate_id = 0;
                 form.cost_estimate_pending = false;

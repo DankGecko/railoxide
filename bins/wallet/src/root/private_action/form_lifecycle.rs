@@ -159,7 +159,7 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
         let amount = format_send_amount_input(asset.max_batched, asset.decimals);
-        let amount_input = new_prefilled_input(window, cx, "amount", amount);
+        let amount_input = new_prefilled_amount_input(amount, window, cx);
         let recipient_input = new_text_input(window, cx, "0zk recipient");
         let focus_recipient_input = recipient_input.clone();
         let (asset_select, asset_select_items) = self.new_private_action_asset_select(
@@ -446,8 +446,7 @@ impl WalletRoot {
                 form.estimate_id = 0;
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
-                form.amount_input
-                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                set_programmatic_amount_input_value(&form.amount_input, value, window, cx);
                 true
             }),
             DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
@@ -461,8 +460,7 @@ impl WalletRoot {
                 form.estimate_id = 0;
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
-                form.amount_input
-                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                set_programmatic_amount_input_value(&form.amount_input, value, window, cx);
                 true
             }),
         }
@@ -587,8 +585,7 @@ impl WalletRoot {
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
-        form.amount_input
-            .update(cx, |input, cx| input.set_value(amount, window, cx));
+        set_programmatic_amount_input_value(&form.amount_input, amount, window, cx);
         form.asset_select_items = private_action_asset_select_items(&asset_options);
         sync_private_action_asset_select_entity(
             &form.asset_select,
@@ -701,8 +698,7 @@ impl WalletRoot {
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
-        form.amount_input
-            .update(cx, |input, cx| input.set_value(amount, window, cx));
+        set_programmatic_amount_input_value(&form.amount_input, amount, window, cx);
         form.asset_select_items = private_action_asset_select_items(&asset_options);
         sync_private_action_asset_select_entity(
             &form.asset_select,
@@ -760,8 +756,7 @@ impl WalletRoot {
         }
         if let Some(adjusted) = adjusted {
             form.pending_programmatic_amount_input = Some(adjusted.clone());
-            form.amount_input
-                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+            set_programmatic_amount_input_value(&form.amount_input, adjusted, window, cx);
         }
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
@@ -1054,8 +1049,7 @@ impl WalletRoot {
         form.estimating_cost = false;
         if let Some(adjusted) = adjusted {
             form.pending_programmatic_amount_input = Some(adjusted.clone());
-            form.amount_input
-                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+            set_programmatic_amount_input_value(&form.amount_input, adjusted, window, cx);
         }
         cx.notify();
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
@@ -1396,7 +1390,7 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
         let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
-        let amount_input = new_prefilled_input(window, cx, "amount", amount);
+        let amount_input = new_prefilled_amount_input(amount, window, cx);
         let recipient_input = new_text_input(window, cx, "0x recipient");
         let focus_recipient_input = recipient_input.clone();
         let (asset_select, asset_select_items) = self.new_private_action_asset_select(
@@ -1655,8 +1649,7 @@ impl WalletRoot {
         form.estimating_cost = false;
         if let Some(adjusted) = adjusted {
             form.pending_programmatic_amount_input = Some(adjusted.clone());
-            form.amount_input
-                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+            set_programmatic_amount_input_value(&form.amount_input, adjusted, window, cx);
         }
         let delivery_mode = form.delivery_mode;
         cx.notify();
@@ -1731,8 +1724,7 @@ impl WalletRoot {
         }
         if let Some(adjusted) = adjusted {
             form.pending_programmatic_amount_input = Some(adjusted.clone());
-            form.amount_input
-                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+            set_programmatic_amount_input_value(&form.amount_input, adjusted, window, cx);
         }
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
