@@ -237,6 +237,16 @@ impl WalletRoot {
         } else {
             (None, None, None, None)
         };
+        let signer_native_balance_snapshot =
+            self_broadcast_public_account_uuid
+                .as_deref()
+                .map_or(U256::ZERO, |uuid| {
+                    self_broadcast_native_balance_amount(
+                        self.public_balance_snapshot.as_deref(),
+                        asset.chain_id,
+                        uuid,
+                    )
+                });
 
         let sponsored_authorization_limit = if self_broadcast_funding
             == SelfBroadcastFundingMode::PrivateSponsorship
@@ -263,6 +273,7 @@ impl WalletRoot {
                 &recipient_data,
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
+                signer_native_balance_snapshot,
                 sponsored_incentive,
                 self_broadcast_gas_payer_address.expect("self-broadcast signer was validated"),
             ) {
@@ -1055,6 +1066,16 @@ impl WalletRoot {
         } else {
             (None, None, None, None)
         };
+        let signer_native_balance_snapshot =
+            self_broadcast_public_account_uuid
+                .as_deref()
+                .map_or(U256::ZERO, |uuid| {
+                    self_broadcast_native_balance_amount(
+                        self.public_balance_snapshot.as_deref(),
+                        asset.chain_id,
+                        uuid,
+                    )
+                });
 
         let sponsored_authorization_limit = if self_broadcast_funding
             == SelfBroadcastFundingMode::PrivateSponsorship
@@ -1084,6 +1105,7 @@ impl WalletRoot {
                 native_top_up.as_ref(),
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
+                signer_native_balance_snapshot,
                 sponsored_incentive,
                 self_broadcast_gas_payer_address.expect("self-broadcast signer was validated"),
             ) {

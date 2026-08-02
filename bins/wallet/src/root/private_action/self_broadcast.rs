@@ -371,6 +371,16 @@ pub(in crate::root) fn self_broadcast_native_balance_entry(
     )
 }
 
+pub(in crate::root) fn self_broadcast_native_balance_amount(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+) -> U256 {
+    self_broadcast_native_balance_entry(snapshot, chain_id, public_account_uuid)
+        .and_then(|entry| entry.amount.amount())
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::root) enum SelfBroadcastNativeBalanceState {
     Unknown,

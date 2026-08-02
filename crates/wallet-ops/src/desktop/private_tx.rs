@@ -896,16 +896,20 @@ impl SponsoredPrivateIntent {
             Self::Unshield { .. } => Vec::new(),
         };
         let mut public_unshields = Vec::new();
-        let mut calls = vec![
-            CompositeRelayAction::UnwrapBase {
-                amount: authorization.builder_payment,
-            },
-            CompositeRelayAction::Transfer {
-                token: CompositeRelayActionToken::BaseNative,
-                recipient: authorization.coinbase_payer,
-                amount: authorization.builder_payment,
-            },
-        ];
+        let mut calls = if authorization.builder_payment.is_zero() {
+            Vec::new()
+        } else {
+            vec![
+                CompositeRelayAction::UnwrapBase {
+                    amount: authorization.builder_payment,
+                },
+                CompositeRelayAction::Transfer {
+                    token: CompositeRelayActionToken::BaseNative,
+                    recipient: authorization.coinbase_payer,
+                    amount: authorization.builder_payment,
+                },
+            ]
+        };
         if let Self::Unshield {
             token,
             amount,
@@ -931,8 +935,9 @@ impl SponsoredPrivateIntent {
                         .calls,
                 );
             } else {
-                let route_wrapped_native_output =
-                    !unwrap && token == authorization.wrapped_native_token;
+                let route_wrapped_native_output = !authorization.builder_payment.is_zero()
+                    && !unwrap
+                    && token == authorization.wrapped_native_token;
                 public_unshields.push(CompositeUnshieldLeg {
                     token_address: token,
                     amount,
@@ -964,18 +969,21 @@ impl SponsoredPrivateIntent {
                 }
             }
         }
-        coalesce_sponsored_wrapped_native_leg(
-            &mut public_unshields,
-            &calls,
-            authorization.wrapped_native_token,
-        )?;
+        if !calls.is_empty() {
+            coalesce_sponsored_wrapped_native_leg(
+                &mut public_unshields,
+                &calls,
+                authorization.wrapped_native_token,
+            )?;
+        }
+        let relay_actions = (!calls.is_empty()).then_some(CompositeRelayActions {
+            min_gas_limit: U256::ZERO,
+            calls,
+        });
         Ok(MixedPrivateActionRequest {
             private_sends,
             public_unshields,
-            relay_actions: Some(CompositeRelayActions {
-                min_gas_limit: U256::ZERO,
-                calls,
-            }),
+            relay_actions,
             min_gas_price: 0,
             verify_proof,
             spend_up_to: false,
@@ -1118,6 +1126,7 @@ fn sponsored_provisional_payment_for_intent(
     native_top_up: Option<&DesktopNativeTopUpPlan>,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
 ) -> Result<SponsorshipPayment> {
     let tx_builder = TransactionBuilder {
@@ -1139,6 +1148,18 @@ fn sponsored_provisional_payment_for_intent(
             signer,
         );
         let request = intent.mixed_request(&authorization, native_top_up, false, None)?;
+        let public_wrapped_native_spend = request_public_token_spend(&request, wrapped_native)?;
+        let required_wrapped_native = sponsored_total_wrapped_native_spend(
+            intent,
+            public_wrapped_native_spend,
+            wrapped_native,
+        )?;
+        if poi_spendable_wrapped_native < required_wrapped_native {
+            return Err(SponsorshipError::InsufficientWrappedNativeForQuote {
+                available: poi_spendable_wrapped_native,
+            }
+            .into());
+        }
         let preview = tx_builder.preview_mixed_private_action_plan(utxos, &request)?;
         Ok(sponsored_approximate_gas(
             &request,
@@ -1146,33 +1167,23 @@ fn sponsored_provisional_payment_for_intent(
             matches!(intent, SponsoredPrivateIntent::Send { .. }),
         ))
     };
-    let initial_payment = SponsorshipPayment {
-        outer_gas_limit: 0,
-        outer_gas_cap: U256::ZERO,
-        funding_gas_cap: U256::ZERO,
-        reimbursement_base: U256::ONE,
-        builder_payment: U256::ONE,
-        gross_wrapped_native_spend: U256::ONE,
-        protocol_fee: U256::ZERO,
+    let initial_payment = sponsorship_payment(
+        0,
+        max_fee_per_gas,
+        signer_native_balance_snapshot,
         incentive,
-    };
+    )?;
     let mut estimated_gas = preview_gas(initial_payment)?;
     for _ in 0..SPONSORED_PROVISIONAL_MAX_STEPS {
         let payment = sponsorship_payment_from_estimate(
             estimated_gas,
             chain.gas.gas_limit_buffer,
             max_fee_per_gas,
+            signer_native_balance_snapshot,
             incentive,
         )?;
         let next_estimated_gas = preview_gas(payment)?;
         if next_estimated_gas <= estimated_gas {
-            if poi_spendable_wrapped_native < payment.gross_wrapped_native_spend {
-                return Err(SponsorshipError::InsufficientWrappedNative {
-                    available: poi_spendable_wrapped_native,
-                    required: payment.gross_wrapped_native_spend,
-                }
-                .into());
-            }
             return Ok(payment);
         }
         estimated_gas = next_estimated_gas;
@@ -1189,6 +1200,7 @@ fn quote_sponsored_authorization_limit(
     native_top_up: Option<&DesktopNativeTopUpPlan>,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
     signer: Address,
 ) -> Result<SponsoredAuthorizationLimit> {
@@ -1219,6 +1231,7 @@ fn quote_sponsored_authorization_limit(
         native_top_up,
         max_fee_per_gas,
         max_priority_fee_per_gas,
+        signer_native_balance_snapshot,
         incentive,
     )?;
     let action_fingerprint = match intent {
@@ -1253,7 +1266,15 @@ fn quote_sponsored_authorization_limit(
     );
     let maximum_request =
         intent.mixed_request(&maximum_authorization, native_top_up, false, None)?;
-    let (_, public_wrapped_native_spend) = sponsored_wrapped_native_leg_amount(&maximum_request)?;
+    let public_wrapped_native_spend = maximum_request
+        .public_unshields
+        .iter()
+        .filter(|leg| leg.token_address == wrapped_native)
+        .try_fold(U256::ZERO, |total, leg| {
+            total
+                .checked_add(leg.amount)
+                .ok_or(SponsorshipError::ArithmeticOverflow)
+        })?;
     let max_total_wrapped_native_spend =
         sponsored_total_wrapped_native_spend(intent, public_wrapped_native_spend, wrapped_native)?;
     sponsored_authorization_limit(
@@ -1265,6 +1286,7 @@ fn quote_sponsored_authorization_limit(
         chain.relay_adapt_contract,
         max_fee_per_gas,
         max_priority_fee_per_gas,
+        signer_native_balance_snapshot,
         incentive,
         signer,
         max_total_wrapped_native_spend,
@@ -1282,6 +1304,7 @@ pub fn quote_sponsored_send_authorization_limit(
     recipient: &AddressData,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
     signer: Address,
 ) -> Result<SponsoredAuthorizationLimit> {
@@ -1297,6 +1320,7 @@ pub fn quote_sponsored_send_authorization_limit(
         None,
         max_fee_per_gas,
         max_priority_fee_per_gas,
+        signer_native_balance_snapshot,
         incentive,
         signer,
     )
@@ -1315,6 +1339,7 @@ pub fn quote_sponsored_unshield_authorization_limit(
     native_top_up: Option<&DesktopNativeTopUpPlan>,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
     signer: Address,
 ) -> Result<SponsoredAuthorizationLimit> {
@@ -1332,6 +1357,7 @@ pub fn quote_sponsored_unshield_authorization_limit(
         native_top_up,
         max_fee_per_gas,
         max_priority_fee_per_gas,
+        signer_native_balance_snapshot,
         incentive,
         signer,
     )
@@ -1340,37 +1366,50 @@ pub fn quote_sponsored_unshield_authorization_limit(
 fn validate_sponsorship_plan_output(
     plan: &MixedPrivateActionPlan,
     authorization: &SponsoredAuthorization,
-    expected_unshield_index: usize,
-    expected_wrapped_native_amount: U256,
-    expected_actions: &CompositeRelayActions,
+    expected_wrapped_native_output: Option<(usize, U256)>,
+    expected_actions: Option<&CompositeRelayActions>,
 ) -> std::result::Result<(), SponsorshipError> {
-    let actual_wrapped_native_amount = sponsored_wrapped_native_output_total(
-        &plan.public_outputs,
-        expected_unshield_index,
-        authorization.wrapped_native_token,
-    )?;
-    let expected_action_data = expected_actions
-        .action_data(authorization.relay_adapt_contract, FixedBytes::<31>::ZERO)
-        .map_err(|_| SponsorshipError::SponsoredPlanShapeChangeRequired)?;
-    let Some(action_data) = plan.action_data.as_ref() else {
-        return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
-    };
-    if plan.call.to != authorization.relay_adapt_contract
-        || actual_wrapped_native_amount != expected_wrapped_native_amount
-        || !action_data.requireSuccess
-        || action_data.minGasLimit != expected_action_data.minGasLimit
-        || action_data.calls.len() != expected_action_data.calls.len()
-        || action_data
-            .calls
-            .iter()
-            .zip(&expected_action_data.calls)
-            .any(|(actual, expected)| {
-                actual.to != expected.to
-                    || actual.value != expected.value
-                    || actual.data != expected.data
-            })
+    if let Some((expected_unshield_index, expected_wrapped_native_amount)) =
+        expected_wrapped_native_output
     {
-        return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
+        let actual_wrapped_native_amount = sponsored_wrapped_native_output_total(
+            &plan.public_outputs,
+            expected_unshield_index,
+            authorization.wrapped_native_token,
+        )?;
+        if actual_wrapped_native_amount != expected_wrapped_native_amount {
+            return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
+        }
+    }
+    match expected_actions {
+        Some(expected_actions) => {
+            let expected_action_data = expected_actions
+                .action_data(authorization.relay_adapt_contract, FixedBytes::<31>::ZERO)
+                .map_err(|_| SponsorshipError::SponsoredPlanShapeChangeRequired)?;
+            let Some(action_data) = plan.action_data.as_ref() else {
+                return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
+            };
+            if plan.call.to != authorization.relay_adapt_contract
+                || !action_data.requireSuccess
+                || action_data.minGasLimit != expected_action_data.minGasLimit
+                || action_data.calls.len() != expected_action_data.calls.len()
+                || action_data
+                    .calls
+                    .iter()
+                    .zip(&expected_action_data.calls)
+                    .any(|(actual, expected)| {
+                        actual.to != expected.to
+                            || actual.value != expected.value
+                            || actual.data != expected.data
+                    })
+            {
+                return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
+            }
+        }
+        None if plan.action_data.is_some() || plan.shape.uses_relay_adapt => {
+            return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
+        }
+        None => {}
     }
     Ok(())
 }
@@ -1404,21 +1443,36 @@ fn sponsored_wrapped_native_output_total(
     Ok(total)
 }
 
-fn sponsored_wrapped_native_leg_amount(
+fn optional_sponsored_wrapped_native_leg_amount(
     request: &MixedPrivateActionRequest,
-) -> std::result::Result<(usize, U256), SponsorshipError> {
+) -> std::result::Result<Option<(usize, U256)>, SponsorshipError> {
     let mut legs = request
         .public_unshields
         .iter()
         .enumerate()
         .filter(|(_, leg)| leg.role == CompositeUnshieldLegRole::SponsoredWrappedNative);
     let Some((index, leg)) = legs.next() else {
-        return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
+        return Ok(None);
     };
     if legs.next().is_some() || leg.recipient != CompositeUnshieldRecipient::RelayAdapt {
         return Err(SponsorshipError::SponsoredPlanShapeChangeRequired);
     }
-    Ok((index, leg.amount))
+    Ok(Some((index, leg.amount)))
+}
+
+fn request_public_token_spend(
+    request: &MixedPrivateActionRequest,
+    token: Address,
+) -> std::result::Result<U256, SponsorshipError> {
+    request
+        .public_unshields
+        .iter()
+        .filter(|leg| leg.token_address == token)
+        .try_fold(U256::ZERO, |total, leg| {
+            total
+                .checked_add(leg.amount)
+                .ok_or(SponsorshipError::ArithmeticOverflow)
+        })
 }
 
 fn sponsored_total_wrapped_native_spend(
@@ -1528,7 +1582,7 @@ async fn prepare_desktop_sponsored_calldata(
         payer_verified: true,
         signer_eligible: true,
         poi_spendable_wrapped_native,
-        required_wrapped_native: U256::ONE,
+        required_wrapped_native: authorization_limit.max_total_wrapped_native_spend,
     })?;
 
     let quote = self_broadcast_gas_fee_quote_from_rpc_pool(&query_rpc_pool, http.network_mode())
@@ -1579,6 +1633,7 @@ async fn prepare_desktop_sponsored_calldata(
         native_top_up.as_ref(),
         resolved_fee.max_fee_per_gas,
         resolved_fee.max_priority_fee_per_gas,
+        authorization_limit.signer_native_balance_snapshot,
         incentive,
     )?;
     let provisional_authorization = sponsored_authorization(
@@ -1622,12 +1677,9 @@ async fn prepare_desktop_sponsored_calldata(
         verify_proof,
         None,
     )?;
-    let (first_expected_unshield_index, first_expected_wrapped_native) =
-        sponsored_wrapped_native_leg_amount(&first_request)?;
-    let first_expected_actions = first_request
-        .relay_actions
-        .clone()
-        .ok_or(SponsorshipError::SponsoredPlanShapeChangeRequired)?;
+    let first_expected_wrapped_native_output =
+        optional_sponsored_wrapped_native_leg_amount(&first_request)?;
+    let first_expected_actions = first_request.relay_actions.clone();
     let first_plan = tx_builder
         .build_mixed_private_action_plan_with_signer(
             &view_session.scan_keys(),
@@ -1642,9 +1694,8 @@ async fn prepare_desktop_sponsored_calldata(
     validate_sponsorship_plan_output(
         &first_plan,
         &provisional_authorization,
-        first_expected_unshield_index,
-        first_expected_wrapped_native,
-        &first_expected_actions,
+        first_expected_wrapped_native_output,
+        first_expected_actions.as_ref(),
     )?;
     let first_estimated_gas = sponsored_exact_gas_estimate(
         &provider_handle,
@@ -1654,8 +1705,12 @@ async fn prepare_desktop_sponsored_calldata(
     .await?;
     let first_gas_limit =
         sponsored_gas_limit_with_buffer(first_estimated_gas, chain.gas.gas_limit_buffer)?;
-    let first_required_payment =
-        sponsorship_payment(first_gas_limit, resolved_fee.max_fee_per_gas, incentive)?;
+    let first_required_payment = sponsorship_payment(
+        first_gas_limit,
+        resolved_fee.max_fee_per_gas,
+        authorization_limit.signer_native_balance_snapshot,
+        incentive,
+    )?;
 
     let (plan, authorization) =
         if sponsored_payment_requires_rebuild(provisional_payment, first_required_payment) {
@@ -1679,12 +1734,9 @@ async fn prepare_desktop_sponsored_calldata(
                 verify_proof,
                 Some(rebuild),
             )?;
-            let (rebuilt_expected_unshield_index, rebuilt_expected_wrapped_native) =
-                sponsored_wrapped_native_leg_amount(&rebuilt_request)?;
-            let rebuilt_expected_actions = rebuilt_request
-                .relay_actions
-                .clone()
-                .ok_or(SponsorshipError::SponsoredPlanShapeChangeRequired)?;
+            let rebuilt_expected_wrapped_native_output =
+                optional_sponsored_wrapped_native_leg_amount(&rebuilt_request)?;
+            let rebuilt_expected_actions = rebuilt_request.relay_actions.clone();
             let rebuilt_plan = tx_builder
                 .build_mixed_private_action_plan_with_signer(
                     &view_session.scan_keys(),
@@ -1699,9 +1751,8 @@ async fn prepare_desktop_sponsored_calldata(
             validate_sponsorship_plan_output(
                 &rebuilt_plan,
                 &required_authorization,
-                rebuilt_expected_unshield_index,
-                rebuilt_expected_wrapped_native,
-                &rebuilt_expected_actions,
+                rebuilt_expected_wrapped_native_output,
+                rebuilt_expected_actions.as_ref(),
             )?;
             let rebuilt_estimated_gas = sponsored_exact_gas_estimate(
                 &provider_handle,
@@ -1711,8 +1762,12 @@ async fn prepare_desktop_sponsored_calldata(
             .await?;
             let rebuilt_gas_limit =
                 sponsored_gas_limit_with_buffer(rebuilt_estimated_gas, chain.gas.gas_limit_buffer)?;
-            let final_required_payment =
-                sponsorship_payment(rebuilt_gas_limit, resolved_fee.max_fee_per_gas, incentive)?;
+            let final_required_payment = sponsorship_payment(
+                rebuilt_gas_limit,
+                resolved_fee.max_fee_per_gas,
+                authorization_limit.signer_native_balance_snapshot,
+                incentive,
+            )?;
             validate_final_sponsorship_payment(first_required_payment, final_required_payment)?;
             (rebuilt_plan, required_authorization)
         } else {
@@ -2525,7 +2580,25 @@ mod tests {
             wrapped_native,
             payer,
             Address::from([0x30; 20]),
-            sponsorship_payment(100, 2, SponsoredIncentive::Standard).expect("payment"),
+            sponsorship_payment(100, 2, U256::ZERO, SponsoredIncentive::Standard).expect("payment"),
+            2,
+            1,
+            Address::from([0x31; 20]),
+        )
+    }
+
+    fn test_zero_payment_authorization(
+        action: SponsoredActionKind,
+        wrapped_native: Address,
+        payer: Address,
+    ) -> SponsoredAuthorization {
+        sponsored_authorization(
+            action,
+            wrapped_native,
+            payer,
+            Address::from([0x30; 20]),
+            sponsorship_payment(100, 2, U256::from(200_u16), SponsoredIncentive::Standard)
+                .expect("zero-delta payment"),
             2,
             1,
             Address::from([0x31; 20]),
@@ -2643,6 +2716,30 @@ mod tests {
     }
 
     #[test]
+    fn zero_delta_send_omits_sponsorship_output_and_payer_calls() {
+        let wrapped_native = Address::from([0x21; 20]);
+        let authorization = test_zero_payment_authorization(
+            SponsoredActionKind::Send,
+            wrapped_native,
+            Address::from([0x22; 20]),
+        );
+        let request = SponsoredPrivateIntent::Send {
+            token: Address::from([0x23; 20]),
+            amount: U256::from(7_u8),
+            recipient: AddressData {
+                master_public_key: U256::from(8_u8),
+                viewing_public_key: [9; 32],
+            },
+        }
+        .mixed_request(&authorization, None, false, None)
+        .expect("zero-delta send request");
+
+        assert_eq!(request.private_sends.len(), 1);
+        assert!(request.public_unshields.is_empty());
+        assert!(request.relay_actions.is_none());
+    }
+
+    #[test]
     fn sponsored_wrapped_native_send_total_includes_private_recipient_amount() {
         let wrapped_native = Address::from([0x21; 20]);
         let recipient = AddressData {
@@ -2721,6 +2818,103 @@ mod tests {
                 amount: primary_native_amount,
             }
         );
+    }
+
+    #[test]
+    fn zero_delta_direct_unshield_omits_payer_calls() {
+        let wrapped_native = Address::from([0x24; 20]);
+        let token = Address::from([0x25; 20]);
+        let recipient = Address::from([0x26; 20]);
+        let authorization = test_zero_payment_authorization(
+            SponsoredActionKind::Unshield,
+            wrapped_native,
+            Address::from([0x27; 20]),
+        );
+        let request = SponsoredPrivateIntent::Unshield {
+            token,
+            amount: U256::from(10_000_u64),
+            recipient,
+            unwrap: false,
+        }
+        .mixed_request(&authorization, None, false, None)
+        .expect("zero-delta direct unshield request");
+
+        assert!(request.private_sends.is_empty());
+        assert_eq!(request.public_unshields.len(), 1);
+        assert_eq!(
+            request.public_unshields[0].recipient,
+            CompositeUnshieldRecipient::Public(recipient)
+        );
+        assert!(request.relay_actions.is_none());
+    }
+
+    #[test]
+    fn zero_delta_unwrap_retains_recipient_calls_without_payer_calls() {
+        let wrapped_native = Address::from([0x24; 20]);
+        let recipient = Address::from([0x26; 20]);
+        let authorization = test_zero_payment_authorization(
+            SponsoredActionKind::Unshield,
+            wrapped_native,
+            Address::from([0x27; 20]),
+        );
+        let amount = U256::from(10_000_u64);
+        let request = SponsoredPrivateIntent::Unshield {
+            token: wrapped_native,
+            amount,
+            recipient,
+            unwrap: true,
+        }
+        .mixed_request(&authorization, None, false, None)
+        .expect("zero-delta unwrap request");
+
+        let recipient_amount = native_top_up_net_after_protocol_fee(amount);
+        assert_eq!(request.public_unshields.len(), 1);
+        assert_eq!(
+            request
+                .relay_actions
+                .expect("recipient relay actions")
+                .calls,
+            vec![
+                CompositeRelayAction::UnwrapBase {
+                    amount: recipient_amount,
+                },
+                CompositeRelayAction::Transfer {
+                    token: CompositeRelayActionToken::BaseNative,
+                    recipient,
+                    amount: recipient_amount,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_delta_wrapped_native_unshield_stays_direct() {
+        let wrapped_native = Address::from([0x24; 20]);
+        let recipient = Address::from([0x26; 20]);
+        let authorization = test_zero_payment_authorization(
+            SponsoredActionKind::Unshield,
+            wrapped_native,
+            Address::from([0x27; 20]),
+        );
+        let request = SponsoredPrivateIntent::Unshield {
+            token: wrapped_native,
+            amount: U256::from(10_000_u64),
+            recipient,
+            unwrap: false,
+        }
+        .mixed_request(&authorization, None, false, None)
+        .expect("zero-delta wrapped-native unshield request");
+
+        assert_eq!(request.public_unshields.len(), 1);
+        assert_eq!(
+            request.public_unshields[0].role,
+            CompositeUnshieldLegRole::Primary
+        );
+        assert_eq!(
+            request.public_unshields[0].recipient,
+            CompositeUnshieldRecipient::Public(recipient)
+        );
+        assert!(request.relay_actions.is_none());
     }
 
     #[test]
@@ -3032,6 +3226,7 @@ mod tests {
             None,
             150_000_000,
             10_000_000,
+            U256::ZERO,
             SponsoredIncentive::Economy,
         )
         .expect("provisional payment");
@@ -3048,12 +3243,126 @@ mod tests {
             None,
             150_000_000,
             10_000_000,
+            U256::ZERO,
             SponsoredIncentive::Economy,
             signer,
         )
         .expect("sponsored quote");
 
         assert_eq!(quote.max_transaction_gas_limit, expected.outer_gas_limit);
+    }
+
+    #[test]
+    fn sponsored_quote_credits_snapshot_balance_against_builder_funding() {
+        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let effective_chain =
+            settings::build_effective_chain_configs(&settings::WalletSettings::default())
+                .expect("effective chains")
+                .remove(&1)
+                .expect("ethereum config");
+        let amount = U256::from(20_000_000_000_000_000_u128);
+        let recipient = Address::from([0x34; 20]);
+        let signer = Address::from([0x33; 20]);
+        let utxos = vec![test_utxo_at(
+            wrapped_native,
+            U256::from(10_000_000_000_000_000_000_u128),
+            0,
+        )];
+        let signer_balance = U256::from(100_000_000_000_000_u128);
+
+        let zero_balance = quote_sponsored_unshield_authorization_limit(
+            1,
+            &effective_chain,
+            &utxos,
+            wrapped_native,
+            amount,
+            FeeHandlingMode::DeductFromAmount,
+            recipient,
+            false,
+            None,
+            150_000_000,
+            10_000_000,
+            U256::ZERO,
+            SponsoredIncentive::Economy,
+            signer,
+        )
+        .expect("zero-balance quote");
+        let credited = quote_sponsored_unshield_authorization_limit(
+            1,
+            &effective_chain,
+            &utxos,
+            wrapped_native,
+            amount,
+            FeeHandlingMode::DeductFromAmount,
+            recipient,
+            false,
+            None,
+            150_000_000,
+            10_000_000,
+            signer_balance,
+            SponsoredIncentive::Economy,
+            signer,
+        )
+        .expect("balance-aware quote");
+
+        assert_eq!(credited.signer_native_balance_snapshot, signer_balance);
+        assert!(
+            credited
+                .maximum_payment()
+                .expect("credited payment")
+                .gross_wrapped_native_spend
+                < zero_balance
+                    .maximum_payment()
+                    .expect("zero-balance payment")
+                    .gross_wrapped_native_spend
+        );
+    }
+
+    #[test]
+    fn sponsored_quote_does_not_report_an_intermediate_required_balance() {
+        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let effective_chain =
+            settings::build_effective_chain_configs(&settings::WalletSettings::default())
+                .expect("effective chains")
+                .remove(&1)
+                .expect("ethereum config");
+        let token = Address::from([0x81; 20]);
+        let signer = Address::from([0x82; 20]);
+        let recipient = Address::from([0x83; 20]);
+        for available in [U256::ZERO, U256::from(1_000_000_u64)] {
+            let mut utxos = vec![test_utxo_at(
+                token,
+                U256::from(10_000_000_000_000_000_000_u128),
+                0,
+            )];
+            if !available.is_zero() {
+                utxos.push(test_utxo_at(wrapped_native, available, 1));
+            }
+
+            let error = quote_sponsored_unshield_authorization_limit(
+                1,
+                &effective_chain,
+                &utxos,
+                token,
+                U256::from(1_000_000_000_000_000_000_u128),
+                FeeHandlingMode::DeductFromAmount,
+                recipient,
+                false,
+                None,
+                1_000_000_000_000,
+                100_000_000,
+                U256::ZERO,
+                SponsoredIncentive::Standard,
+                signer,
+            )
+            .expect_err("high gas price exceeds wrapped-native balance");
+            assert!(matches!(
+                error.downcast_ref::<SponsorshipError>(),
+                Some(SponsorshipError::InsufficientWrappedNativeForQuote {
+                    available: actual,
+                }) if *actual == available
+            ));
+        }
     }
 
     #[test]
@@ -3093,6 +3402,7 @@ mod tests {
                 None,
                 150_000_000,
                 10_000_000,
+                U256::ZERO,
                 SponsoredIncentive::Economy,
                 signer,
             )
@@ -3119,8 +3429,9 @@ mod tests {
             let request = intent
                 .mixed_request(&authorization, None, false, None)
                 .expect("canonical request");
-            let (_, canonical_total) =
-                sponsored_wrapped_native_leg_amount(&request).expect("sponsored leg");
+            let (_, canonical_total) = optional_sponsored_wrapped_native_leg_amount(&request)
+                .expect("valid sponsored leg")
+                .expect("sponsored leg");
             let fingerprint = sponsored_unshield_action_fingerprint(
                 1,
                 wrapped_native,

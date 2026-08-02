@@ -39,6 +39,10 @@ impl SponsoredIncentive {
 pub struct SponsorshipPayment {
     pub outer_gas_limit: u64,
     pub outer_gas_cap: U256,
+    pub signer_native_balance_snapshot: U256,
+    pub balance_credit: U256,
+    pub funding_principal: U256,
+    pub funding_gas_limit: u64,
     pub funding_gas_cap: U256,
     pub reimbursement_base: U256,
     pub builder_payment: U256,
@@ -85,6 +89,9 @@ pub struct SponsoredAuthorization {
     pub protocol_fee: U256,
     pub transaction_gas_limit: u64,
     pub outer_gas_cap: U256,
+    pub signer_native_balance_snapshot: U256,
+    pub balance_credit: U256,
+    pub funding_principal: U256,
     pub funding_gas_limit: u64,
     pub funding_gas_cap: U256,
     pub reimbursement_base: U256,
@@ -100,6 +107,7 @@ pub struct SponsoredAuthorization {
 pub struct SponsoredAuthorizationLimit {
     pub action_fingerprint: FixedBytes<32>,
     pub max_transaction_gas_limit: u64,
+    pub signer_native_balance_snapshot: U256,
     pub action: SponsoredActionKind,
     pub wrapped_native_token: Address,
     pub coinbase_payer: Address,
@@ -117,6 +125,7 @@ impl SponsoredAuthorizationLimit {
         sponsorship_payment(
             self.max_transaction_gas_limit,
             self.max_fee_per_gas,
+            self.signer_native_balance_snapshot,
             self.incentive,
         )
     }
@@ -169,6 +178,10 @@ pub enum SponsorshipError {
         "insufficient POI-spendable wrapped-native balance: available {available}, required {required}"
     )]
     InsufficientWrappedNative { available: U256, required: U256 },
+    #[error(
+        "insufficient POI-spendable wrapped-native balance to derive the maximum sponsored plan: available {available}"
+    )]
+    InsufficientWrappedNativeForQuote { available: U256 },
 }
 
 pub fn sponsored_gas_limit_with_buffer(
@@ -184,16 +197,23 @@ pub fn sponsorship_payment_from_estimate(
     estimated_gas: u64,
     gas_limit_buffer: u64,
     max_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
 ) -> Result<SponsorshipPayment, SponsorshipError> {
     let gas_limit = sponsored_gas_limit_with_buffer(estimated_gas, gas_limit_buffer)?;
-    sponsorship_payment(gas_limit, max_fee_per_gas, incentive)
+    sponsorship_payment(
+        gas_limit,
+        max_fee_per_gas,
+        signer_native_balance_snapshot,
+        incentive,
+    )
 }
 
 pub fn provisional_sponsorship_payment(
     initial_estimated_gas: u64,
     gas_limit_buffer: u64,
     max_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
     mut estimate_for_gross_spend: impl FnMut(U256) -> Result<u64, SponsorshipError>,
 ) -> Result<SponsorshipPayment, SponsorshipError> {
@@ -203,6 +223,7 @@ pub fn provisional_sponsorship_payment(
             estimated_gas,
             gas_limit_buffer,
             max_fee_per_gas,
+            signer_native_balance_snapshot,
             incentive,
         )?;
         let next_estimated_gas = estimate_for_gross_spend(payment.gross_wrapped_native_spend)?;
@@ -266,7 +287,10 @@ pub const fn sponsored_authorization(
         protocol_fee: payment.protocol_fee,
         transaction_gas_limit: payment.outer_gas_limit,
         outer_gas_cap: payment.outer_gas_cap,
-        funding_gas_limit: SPONSORED_FUNDING_GAS_LIMIT,
+        signer_native_balance_snapshot: payment.signer_native_balance_snapshot,
+        balance_credit: payment.balance_credit,
+        funding_principal: payment.funding_principal,
+        funding_gas_limit: payment.funding_gas_limit,
         funding_gas_cap: payment.funding_gas_cap,
         reimbursement_base: payment.reimbursement_base,
         max_fee_per_gas,
@@ -287,14 +311,21 @@ pub fn sponsored_authorization_limit(
     relay_adapt_contract: Address,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
     signer: Address,
     max_total_wrapped_native_spend: U256,
 ) -> Result<SponsoredAuthorizationLimit, SponsorshipError> {
-    sponsorship_payment(max_transaction_gas_limit, max_fee_per_gas, incentive)?;
+    sponsorship_payment(
+        max_transaction_gas_limit,
+        max_fee_per_gas,
+        signer_native_balance_snapshot,
+        incentive,
+    )?;
     Ok(SponsoredAuthorizationLimit {
         action_fingerprint,
         max_transaction_gas_limit,
+        signer_native_balance_snapshot,
         action,
         wrapped_native_token,
         coinbase_payer,
@@ -321,20 +352,44 @@ pub fn validate_sponsored_authorization_limit(
         || exact.relay_adapt_contract != limit.relay_adapt_contract
         || exact.max_fee_per_gas != limit.max_fee_per_gas
         || exact.max_priority_fee_per_gas != limit.max_priority_fee_per_gas
+        || exact.signer_native_balance_snapshot != limit.signer_native_balance_snapshot
         || exact.incentive != limit.incentive
         || exact.signer != limit.signer
         || exact.delivery != limit.delivery
     {
         return Err(SponsorshipError::AuthorizationMismatch);
     }
+    if !limit.allows_transaction_gas_limit(exact.transaction_gas_limit) {
+        return Err(SponsorshipError::AuthorizationLimitExceeded);
+    }
+    let exact_payment = sponsorship_payment(
+        exact.transaction_gas_limit,
+        exact.max_fee_per_gas,
+        exact.signer_native_balance_snapshot,
+        exact.incentive,
+    )?;
+    if exact.outer_gas_cap != exact_payment.outer_gas_cap
+        || exact.balance_credit != exact_payment.balance_credit
+        || exact.funding_principal != exact_payment.funding_principal
+        || exact.funding_gas_limit != exact_payment.funding_gas_limit
+        || exact.funding_gas_cap != exact_payment.funding_gas_cap
+        || exact.reimbursement_base != exact_payment.reimbursement_base
+    {
+        return Err(SponsorshipError::AuthorizationMismatch);
+    }
     let maximum_payment = limit.maximum_payment()?;
-    if !limit.allows_transaction_gas_limit(exact.transaction_gas_limit)
-        || exact.builder_payment > maximum_payment.builder_payment
+    if exact.builder_payment > maximum_payment.builder_payment
         || exact.gross_wrapped_native_spend > maximum_payment.gross_wrapped_native_spend
         || exact.protocol_fee > maximum_payment.protocol_fee
         || total_wrapped_native_spend > limit.max_total_wrapped_native_spend
     {
         return Err(SponsorshipError::AuthorizationLimitExceeded);
+    }
+    if exact.builder_payment != exact_payment.builder_payment
+        || exact.gross_wrapped_native_spend != exact_payment.gross_wrapped_native_spend
+        || exact.protocol_fee != exact_payment.protocol_fee
+    {
+        return Err(SponsorshipError::AuthorizationMismatch);
     }
     Ok(())
 }
@@ -342,29 +397,46 @@ pub fn validate_sponsored_authorization_limit(
 pub fn sponsorship_payment(
     outer_gas_limit: u64,
     max_fee_per_gas: u128,
+    signer_native_balance_snapshot: U256,
     incentive: SponsoredIncentive,
 ) -> Result<SponsorshipPayment, SponsorshipError> {
     let fee = U256::from(max_fee_per_gas);
     let outer_gas_cap = U256::from(outer_gas_limit)
         .checked_mul(fee)
         .ok_or(SponsorshipError::ArithmeticOverflow)?;
-    let funding_gas_cap = U256::from(SPONSORED_FUNDING_GAS_LIMIT)
+    let balance_credit = signer_native_balance_snapshot.min(outer_gas_cap);
+    let funding_principal = outer_gas_cap - balance_credit;
+    let funding_gas_limit = if funding_principal.is_zero() {
+        0
+    } else {
+        SPONSORED_FUNDING_GAS_LIMIT
+    };
+    let funding_gas_cap = U256::from(funding_gas_limit)
         .checked_mul(fee)
         .ok_or(SponsorshipError::ArithmeticOverflow)?;
-    let reimbursement_base = outer_gas_cap
+    let reimbursement_base = funding_principal
         .checked_add(funding_gas_cap)
         .ok_or(SponsorshipError::ArithmeticOverflow)?;
-    let multiplier = U256::from(100_u8 + incentive.percent()?);
-    let numerator = reimbursement_base
-        .checked_mul(multiplier)
-        .and_then(|value| value.checked_add(U256::from(99_u8)))
-        .ok_or(SponsorshipError::ArithmeticOverflow)?;
-    let builder_payment = numerator / U256::from(100_u8);
+    let incentive_percent = incentive.percent()?;
+    let builder_payment = if reimbursement_base.is_zero() {
+        U256::ZERO
+    } else {
+        let multiplier = U256::from(100_u8 + incentive_percent);
+        reimbursement_base
+            .checked_mul(multiplier)
+            .and_then(|value| value.checked_add(U256::from(99_u8)))
+            .ok_or(SponsorshipError::ArithmeticOverflow)?
+            / U256::from(100_u8)
+    };
     let gross_wrapped_native_spend = gross_up_sponsorship_payment(builder_payment)?;
     let protocol_fee = gross_wrapped_native_spend - builder_payment;
     Ok(SponsorshipPayment {
         outer_gas_limit,
         outer_gas_cap,
+        signer_native_balance_snapshot,
+        balance_credit,
+        funding_principal,
+        funding_gas_limit,
         funding_gas_cap,
         reimbursement_base,
         builder_payment,
@@ -469,7 +541,8 @@ mod tests {
 
     #[test]
     fn payment_rounds_incentive_and_protocol_gross_up_upward() {
-        let payment = sponsorship_payment(1, 1, SponsoredIncentive::Standard).expect("payment");
+        let payment =
+            sponsorship_payment(1, 1, U256::ZERO, SponsoredIncentive::Standard).expect("payment");
         assert_eq!(payment.reimbursement_base, U256::from(21_001_u64));
         assert_eq!(payment.builder_payment, U256::from(22_052_u64));
         assert_eq!(
@@ -480,8 +553,9 @@ mod tests {
 
     #[test]
     fn payment_applies_buffer_outer_funding_and_incentive_rules_in_order() {
-        let payment = sponsorship_payment_from_estimate(100, 20, 2, SponsoredIncentive::Economy)
-            .expect("payment");
+        let payment =
+            sponsorship_payment_from_estimate(100, 20, 2, U256::ZERO, SponsoredIncentive::Economy)
+                .expect("payment");
         assert_eq!(payment.outer_gas_cap, U256::from(240_u64));
         assert_eq!(payment.funding_gas_cap, U256::from(42_000_u64));
         assert_eq!(payment.reimbursement_base, U256::from(42_240_u64));
@@ -489,31 +563,77 @@ mod tests {
     }
 
     #[test]
+    fn payment_credits_partial_balance_and_conditionally_adds_funding_gas() {
+        let payment = sponsorship_payment(100, 2, U256::from(80_u8), SponsoredIncentive::Economy)
+            .expect("payment");
+
+        assert_eq!(payment.outer_gas_cap, U256::from(200_u16));
+        assert_eq!(payment.balance_credit, U256::from(80_u8));
+        assert_eq!(payment.funding_principal, U256::from(120_u8));
+        assert_eq!(payment.funding_gas_limit, SPONSORED_FUNDING_GAS_LIMIT);
+        assert_eq!(payment.funding_gas_cap, U256::from(42_000_u64));
+        assert_eq!(payment.reimbursement_base, U256::from(42_120_u64));
+        assert_eq!(payment.builder_payment, U256::from(42_542_u64));
+    }
+
+    #[test]
+    fn payment_caps_overfunded_balance_credit_and_has_zero_delta() {
+        let snapshot = U256::from(250_u16);
+        let payment =
+            sponsorship_payment(100, 2, snapshot, SponsoredIncentive::Standard).expect("payment");
+
+        assert_eq!(payment.signer_native_balance_snapshot, snapshot);
+        assert_eq!(payment.outer_gas_cap, U256::from(200_u16));
+        assert_eq!(payment.balance_credit, payment.outer_gas_cap);
+        assert_eq!(payment.funding_principal, U256::ZERO);
+        assert_eq!(payment.funding_gas_limit, 0);
+        assert_eq!(payment.funding_gas_cap, U256::ZERO);
+        assert_eq!(payment.reimbursement_base, U256::ZERO);
+        assert_eq!(payment.builder_payment, U256::ZERO);
+        assert_eq!(payment.gross_wrapped_native_spend, U256::ZERO);
+        assert_eq!(payment.protocol_fee, U256::ZERO);
+    }
+
+    #[test]
     fn provisional_payment_is_monotone_and_bounded_to_four_steps() {
         let mut estimates = vec![101_u64, 102, 103, 103].into_iter();
-        let payment =
-            provisional_sponsorship_payment(100, 0, 1, SponsoredIncentive::Economy, |_| {
-                Ok(estimates.next().expect("bounded estimate"))
-            })
-            .expect("converged payment");
+        let payment = provisional_sponsorship_payment(
+            100,
+            0,
+            1,
+            U256::ZERO,
+            SponsoredIncentive::Economy,
+            |_| Ok(estimates.next().expect("bounded estimate")),
+        )
+        .expect("converged payment");
         assert_eq!(payment.outer_gas_cap, U256::from(103_u64));
 
         let mut next = 101_u64;
         assert_eq!(
-            provisional_sponsorship_payment(100, 0, 1, SponsoredIncentive::Economy, |_| {
-                let estimate = next;
-                next += 1;
-                Ok(estimate)
-            },),
+            provisional_sponsorship_payment(
+                100,
+                0,
+                1,
+                U256::ZERO,
+                SponsoredIncentive::Economy,
+                |_| {
+                    let estimate = next;
+                    next += 1;
+                    Ok(estimate)
+                },
+            ),
             Err(SponsorshipError::ProvisionalPaymentDidNotConverge)
         );
     }
 
     #[test]
     fn exact_payment_decision_converges_or_reports_second_estimate_amounts() {
-        let embedded = sponsorship_payment(100, 2, SponsoredIncentive::Standard).expect("payment");
-        let covered = sponsorship_payment(99, 2, SponsoredIncentive::Standard).expect("payment");
-        let required = sponsorship_payment(101, 2, SponsoredIncentive::Standard).expect("payment");
+        let embedded =
+            sponsorship_payment(100, 2, U256::ZERO, SponsoredIncentive::Standard).expect("payment");
+        let covered =
+            sponsorship_payment(99, 2, U256::ZERO, SponsoredIncentive::Standard).expect("payment");
+        let required =
+            sponsorship_payment(101, 2, U256::ZERO, SponsoredIncentive::Standard).expect("payment");
         assert_eq!(
             validate_final_sponsorship_payment(embedded, covered),
             Ok(())
@@ -534,10 +654,16 @@ mod tests {
         let signer = Address::from([6; 20]);
         let relay_adapt = Address::from([7; 20]);
         let additional_spend = U256::from(7_u8);
+        let signer_native_balance_snapshot = U256::from(1_000_000_u64);
         let action_fingerprint = FixedBytes::from([7; 32]);
-        let max_total = sponsorship_payment(2_000_000, 2, SponsoredIncentive::Standard)
-            .expect("maximum payment")
-            .gross_wrapped_native_spend
+        let max_total = sponsorship_payment(
+            2_000_000,
+            2,
+            signer_native_balance_snapshot,
+            SponsoredIncentive::Standard,
+        )
+        .expect("maximum payment")
+        .gross_wrapped_native_spend
             + additional_spend;
         let limit = sponsored_authorization_limit(
             action_fingerprint,
@@ -548,13 +674,19 @@ mod tests {
             relay_adapt,
             2,
             1,
+            signer_native_balance_snapshot,
             SponsoredIncentive::Standard,
             signer,
             max_total,
         )
         .expect("authorization limit");
-        let exact_payment =
-            sponsorship_payment(1_000_000, 2, SponsoredIncentive::Standard).expect("exact payment");
+        let exact_payment = sponsorship_payment(
+            1_000_000,
+            2,
+            signer_native_balance_snapshot,
+            SponsoredIncentive::Standard,
+        )
+        .expect("exact payment");
         let exact = sponsored_authorization(
             SponsoredActionKind::Send,
             wrapped_native,
@@ -566,7 +698,6 @@ mod tests {
             signer,
         );
         let total = additional_spend + exact.gross_wrapped_native_spend;
-
         assert_eq!(
             validate_sponsored_authorization_limit(limit, action_fingerprint, exact, total),
             Ok(())
@@ -601,6 +732,46 @@ mod tests {
                 ..exact
             },
             SponsoredAuthorization {
+                signer_native_balance_snapshot: signer_native_balance_snapshot + U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                outer_gas_cap: exact.outer_gas_cap - U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                balance_credit: U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                funding_principal: exact.funding_principal - U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                funding_gas_limit: exact.funding_gas_limit - 1,
+                ..exact
+            },
+            SponsoredAuthorization {
+                funding_gas_cap: exact.funding_gas_cap - U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                reimbursement_base: exact.reimbursement_base - U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                builder_payment: exact.builder_payment - U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                gross_wrapped_native_spend: exact.gross_wrapped_native_spend - U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
+                protocol_fee: exact.protocol_fee - U256::ONE,
+                ..exact
+            },
+            SponsoredAuthorization {
                 incentive: SponsoredIncentive::Economy,
                 ..exact
             },
@@ -627,7 +798,7 @@ mod tests {
         let signer = Address::from([6; 20]);
         let relay_adapt = Address::from([7; 20]);
         let action_fingerprint = FixedBytes::from([8; 32]);
-        let max_total = sponsorship_payment(1_000_000, 2, SponsoredIncentive::Standard)
+        let max_total = sponsorship_payment(1_000_000, 2, U256::ZERO, SponsoredIncentive::Standard)
             .expect("maximum payment")
             .gross_wrapped_native_spend;
         let limit = sponsored_authorization_limit(
@@ -639,6 +810,7 @@ mod tests {
             relay_adapt,
             2,
             1,
+            U256::ZERO,
             SponsoredIncentive::Standard,
             signer,
             max_total,

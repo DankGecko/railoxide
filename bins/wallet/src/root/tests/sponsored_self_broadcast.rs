@@ -165,6 +165,7 @@ fn sponsorship_display_scales_token_usd_and_gwei_values() {
         Address::from([0x34; 20]),
         1_250_000_000,
         100_000_000,
+        U256::ZERO,
         SponsoredIncentive::Standard,
         Address::from([0x33; 20]),
         U256::ZERO,
