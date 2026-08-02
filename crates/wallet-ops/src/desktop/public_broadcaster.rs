@@ -732,10 +732,13 @@ impl WalletSession {
     }
 
     pub async fn clear_local_pending_spent(&self) -> bool {
-        self.handle.clear_all_local_pending_spent().await.unwrap_or_else(|error| {
-            tracing::warn!(%error, "wallet actor rejected local pending-spend clear");
-            false
-        })
+        self.handle
+            .clear_all_local_pending_spent()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "wallet actor rejected local pending-spend clear");
+                false
+            })
     }
 
     pub async fn refresh_poi_statuses(&self) -> bool {

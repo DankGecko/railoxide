@@ -374,7 +374,14 @@ pub(in crate::root) fn render_self_broadcast_settings(
                             delivery_element_id(key, kind, "funding-private"),
                             BLOCK_BUILDER_SPONSORSHIP_LABEL,
                             funding == SelfBroadcastFundingMode::PrivateSponsorship,
-                            None,
+                            Some(
+                                render_private_action_info_icon(
+                                    delivery_element_id(key, kind, "funding-private-info"),
+                                    BLOCK_BUILDER_SPONSORSHIP_LABEL,
+                                    BLOCK_BUILDER_SPONSORSHIP_TOOLTIP,
+                                )
+                                .into_any_element(),
+                            ),
                         )
                         .disabled(sponsorship_unavailable_reason.is_some()),
                     )

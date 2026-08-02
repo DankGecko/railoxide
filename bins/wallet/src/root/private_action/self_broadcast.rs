@@ -1,6 +1,7 @@
 use super::*;
 
 pub(in crate::root) const BLOCK_BUILDER_SPONSORSHIP_LABEL: &str = "Block builder sponsorship";
+pub(in crate::root) const BLOCK_BUILDER_SPONSORSHIP_TOOLTIP: &str = "Allows self-broadcast from an empty or underfunded Public account. A participating block builder funds the account for gas and is atomically reimbursed, with the selected incentive, by a private WETH unshield.";
 const SPONSORED_FUNDING_ESTIMATE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

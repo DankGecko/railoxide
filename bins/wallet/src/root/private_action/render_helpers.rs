@@ -267,21 +267,85 @@ pub(in crate::root) fn fee_mode_segment_button(
             .gap_1()
             .text_size(APP_TEXT_SIZE)
             .child(label)
-            .child(render_fee_mode_info_icon(info_id, tooltip)),
+            .child(render_private_action_info_icon(info_id, label, tooltip)),
     )
 }
 
-pub(in crate::root) fn render_fee_mode_info_icon(
+const PRIVATE_ACTION_INFO_TOOLTIP_MAX_WIDTH: Pixels = px(360.0);
+
+pub(in crate::root) fn private_action_info_tooltip_width(
+    viewport_width: Pixels,
+    rem_size: Pixels,
+) -> Option<Pixels> {
+    let tooltip_chrome = rem_size * 2.5 + px(2.0);
+    let available_width = viewport_width - tooltip_chrome;
+    (available_width > px(0.0)).then(|| available_width.min(PRIVATE_ACTION_INFO_TOOLTIP_MAX_WIDTH))
+}
+
+pub(in crate::root) fn render_private_action_info_icon(
     id: SharedString,
-    tooltip: &'static str,
-) -> Button {
-    Button::new(id)
-        .text()
-        .xsmall()
-        .compact()
-        .icon(IconName::Info)
-        .text_color(rgb(theme::TEXT_MUTED))
-        .tooltip(tooltip)
+    title: &'static str,
+    detail: &'static str,
+) -> impl IntoElement {
+    render_private_action_tooltip_icon(
+        id,
+        IconName::Info,
+        theme::TEXT_MUTED,
+        theme::TEXT,
+        title,
+        detail,
+    )
+}
+
+fn render_private_action_tooltip_icon(
+    id: SharedString,
+    icon: IconName,
+    icon_color: u32,
+    title_color: u32,
+    title: &'static str,
+    detail: &'static str,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(18.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .text_color(rgb(icon_color))
+        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+        .child(Icon::new(icon).with_size(px(14.0)))
+        .tooltip(move |window: &mut Window, cx: &mut App| {
+            let Some(width) =
+                private_action_info_tooltip_width(window.viewport_size().width, window.rem_size())
+            else {
+                return Tooltip::element(|_window, _cx| div())
+                    .m(px(0.0))
+                    .p(px(0.0))
+                    .border_0()
+                    .build(window, cx);
+            };
+            Tooltip::element(move |_window, _cx| {
+                div()
+                    .w(width)
+                    .p(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .whitespace_normal()
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(rgb(theme::TEXT))
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(title_color))
+                            .child(title),
+                    )
+                    .child(detail)
+            })
+            .build(window, cx)
+        })
 }
 
 pub(in crate::root) fn private_action_segment_button(
@@ -315,14 +379,15 @@ pub(in crate::root) fn private_action_segment_button_with_accessory(
 }
 
 pub(in crate::root) fn render_self_broadcast_privacy_icon(id: SharedString) -> gpui::AnyElement {
-    Button::new(id)
-        .text()
-        .xsmall()
-        .compact()
-        .icon(IconName::TriangleAlert)
-        .text_color(rgb(theme::WARNING))
-        .tooltip(SELF_BROADCAST_PRIVACY_WARNING)
-        .into_any_element()
+    render_private_action_tooltip_icon(
+        id,
+        IconName::TriangleAlert,
+        theme::WARNING,
+        theme::WARNING,
+        "Privacy warning",
+        SELF_BROADCAST_PRIVACY_WARNING,
+    )
+    .into_any_element()
 }
 
 pub(in crate::root) fn render_self_broadcast_gas_payer_warning_icon(
