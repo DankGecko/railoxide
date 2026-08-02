@@ -591,6 +591,16 @@ pub(in crate::root) fn render_sponsored_funding_estimate(
         .border_color(rgb(theme::BORDER))
         .child(app_strong_text("Estimated fees"));
     match display {
+        SponsoredFundingEstimateDisplay::PublicBalance(display) => {
+            render_public_action_fee_estimate(display, false)
+        }
+        SponsoredFundingEstimateDisplay::PublicBalanceError => estimate.child(
+            Alert::error(
+                delivery_element_id(key, kind, "public-funding-estimate-error"),
+                "Fee estimate is unavailable for the current inputs.",
+            )
+            .small(),
+        ),
         SponsoredFundingEstimateDisplay::Ready {
             expected_sponsorship_cost,
             gas_cost,

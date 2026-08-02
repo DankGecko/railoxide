@@ -172,6 +172,129 @@ fn eip1559_projection_falls_back_to_max_fee_without_fee_history() {
 }
 
 #[test]
+fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
+    let token = address(0x42);
+    let utxos = vec![utxo(token, 10_000, 0, 0).utxo];
+    let quote = SelfBroadcastGasFeeQuote {
+        rpc_gas_price: 100,
+        current_base_fee_per_gas: Some(100),
+        suggested_max_fee_per_gas: 120,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+
+    let send = crate::estimate_desktop_send_self_broadcast_cost(
+        &utxos,
+        token,
+        U256::from(1_000_u64),
+        quote,
+        120,
+        2,
+    )
+    .expect("send estimate");
+    let unshield = crate::estimate_desktop_unshield_self_broadcast_cost(
+        &utxos,
+        token,
+        U256::from(1_000_u64),
+        FeeHandlingMode::DeductFromAmount,
+        false,
+        None,
+        quote,
+        120,
+        2,
+    )
+    .expect("unshield estimate");
+
+    assert!(!send.gas_cost.expected_cost.is_zero());
+    assert!(send.gas_cost.maximum_cost > send.gas_cost.expected_cost);
+    assert!(send.protocol_fees.is_empty());
+    assert_eq!(
+        unshield.protocol_fees.as_slice(),
+        &[crate::DesktopSelfBroadcastProtocolFee {
+            token,
+            amount: crate::unshield_protocol_fee_amount_for_fee_mode(
+                U256::from(1_000_u64),
+                FeeHandlingMode::DeductFromAmount,
+            )
+            .expect("protocol fee"),
+        }],
+    );
+    assert_ne!(unshield.gas_limit, 0);
+}
+
+#[test]
+fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
+    let token = address(0x42);
+    let wrapped_native = address(0x43);
+    let native_amount = U256::from(100_u64);
+    let native_top_up = DesktopNativeTopUpPlan {
+        recipient: address(0x44),
+        wrapped_native_token: wrapped_native,
+        native_amount,
+        wrapped_native_amount: crate::native_top_up_wrapped_native_amount(native_amount),
+    };
+    let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(100);
+    let utxos = vec![
+        utxo(token, 10_000, 0, 0).utxo,
+        utxo(wrapped_native, 10_000, 0, 1).utxo,
+    ];
+
+    let separate_tokens = crate::estimate_desktop_unshield_self_broadcast_cost(
+        &utxos,
+        token,
+        U256::from(1_000_u64),
+        FeeHandlingMode::DeductFromAmount,
+        false,
+        Some(&native_top_up),
+        quote,
+        120,
+        1,
+    )
+    .expect("separate-token native top-up estimate");
+    assert_eq!(separate_tokens.protocol_fees.len(), 2);
+    assert_eq!(separate_tokens.protocol_fees[0].token, token);
+    assert_eq!(separate_tokens.protocol_fees[1].token, wrapped_native);
+    assert_eq!(
+        separate_tokens.protocol_fees[1].amount,
+        native_top_up.wrapped_native_amount - native_amount,
+    );
+
+    let wrapped_utxos = vec![utxo(wrapped_native, 10_000, 0, 0).utxo];
+    let entered_amount = U256::from(1_000_u64);
+    let combined_amount = crate::native_top_up_required_wrapped_native_amount_for_fee_mode(
+        wrapped_native,
+        wrapped_native,
+        entered_amount,
+        FeeHandlingMode::DeductFromAmount,
+        native_amount,
+    );
+    let primary_recipient = crate::native_top_up_primary_recipient_amount_for_fee_mode(
+        wrapped_native,
+        wrapped_native,
+        entered_amount,
+        FeeHandlingMode::DeductFromAmount,
+        native_amount,
+    );
+    let combined = crate::estimate_desktop_unshield_self_broadcast_cost(
+        &wrapped_utxos,
+        wrapped_native,
+        entered_amount,
+        FeeHandlingMode::DeductFromAmount,
+        false,
+        Some(&native_top_up),
+        quote,
+        120,
+        1,
+    )
+    .expect("combined wrapped-native top-up estimate");
+    assert_eq!(combined.protocol_fees.len(), 1);
+    assert_eq!(combined.protocol_fees[0].token, wrapped_native);
+    assert_eq!(
+        combined.protocol_fees[0].amount,
+        combined_amount - primary_recipient - native_amount,
+    );
+}
+
+#[test]
 fn self_broadcast_already_known_classifier_excludes_nonce_errors() {
     for message in [
         "already known",

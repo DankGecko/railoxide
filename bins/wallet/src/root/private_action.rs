@@ -33,18 +33,20 @@ use ui::controls::{
 use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     BroadcasterFeePolicy, DesktopNativeTopUpPlan, DesktopNativeTopUpRequest,
-    DesktopPrivateSpendAuthorization, DesktopSelfBroadcastResult, DesktopSendCalldataRequest,
-    DesktopSendPublicBroadcasterRequest, DesktopSendSelfBroadcastRequest,
-    DesktopSponsoredSelfBroadcastResult, DesktopSponsoredSendSelfBroadcastRequest,
-    DesktopSponsoredUnshieldSelfBroadcastRequest, DesktopUnshieldCalldataRequest,
-    DesktopUnshieldPublicBroadcasterRequest, DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode,
-    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceEntry, PublicBalanceSnapshot, PublicBroadcasterCandidate,
-    PublicBroadcasterCostEstimate, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
-    SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent,
-    SponsoredAuthorizationLimit, SponsoredIncentive, SponsoredSelfBroadcastCommand,
-    SponsoredSelfBroadcastSessionOutcome, SponsorshipError, SponsorshipPayment,
-    TokenAnchorRateCache, TransactionGenerationStage, WalletSession, expected_eip1559_fee_per_gas,
+    DesktopPrivateSpendAuthorization, DesktopSelfBroadcastCostEstimate, DesktopSelfBroadcastResult,
+    DesktopSendCalldataRequest, DesktopSendPublicBroadcasterRequest,
+    DesktopSendSelfBroadcastRequest, DesktopSponsoredSelfBroadcastResult,
+    DesktopSponsoredSendSelfBroadcastRequest, DesktopSponsoredUnshieldSelfBroadcastRequest,
+    DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterRequest,
+    DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode, ListUtxosOutput, PreparedSendCall,
+    PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
+    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
+    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
+    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, SponsoredAuthorizationLimit,
+    SponsoredIncentive, SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastSessionOutcome,
+    SponsorshipError, SponsorshipPayment, TokenAnchorRateCache, TransactionGenerationStage,
+    WalletSession, estimate_desktop_send_self_broadcast_cost,
+    estimate_desktop_unshield_self_broadcast_cost, expected_eip1559_fee_per_gas,
     fee_policy_eligible_public_broadcasters, native_top_up_policy_for_chain,
     native_top_up_primary_recipient_amount_for_fee_mode,
     native_top_up_required_wrapped_native_amount_for_fee_mode, native_top_up_wrapped_native_amount,
@@ -82,7 +84,10 @@ use super::private_broadcaster::{
     render_private_self_broadcast_status_notice, render_private_submission_active_status_notice,
 };
 use super::public_account::public_account_display_label;
-use super::public_action::public_action_fee_value_label;
+use super::public_action::{
+    PublicActionFeeDisplay, maximum_gas_cost_is_significant, public_action_fee_value_label,
+    render_public_action_fee_estimate,
+};
 use super::public_balances::public_balance_entry_for_chain;
 use super::public_broadcaster::resolve_selected_public_broadcaster_fee_token;
 use super::public_broadcaster_cost::{

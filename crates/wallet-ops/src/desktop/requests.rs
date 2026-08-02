@@ -224,6 +224,19 @@ pub struct Eip1559GasCostProjection {
     pub maximum_cost: U256,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopSelfBroadcastProtocolFee {
+    pub token: Address,
+    pub amount: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSelfBroadcastCostEstimate {
+    pub gas_limit: u64,
+    pub gas_cost: Eip1559GasCostProjection,
+    pub protocol_fees: Vec<DesktopSelfBroadcastProtocolFee>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SelfBroadcastGasFeeSelection {
     #[default]

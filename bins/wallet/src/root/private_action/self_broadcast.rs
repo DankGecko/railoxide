@@ -32,7 +32,15 @@ pub(in crate::root) struct SponsoredFundingEstimate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct PublicBalanceFundingEstimate {
+    pub(in crate::root) chain_id: u64,
+    pub(in crate::root) cost: DesktopSelfBroadcastCostEstimate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::root) enum SponsoredFundingEstimateState {
+    PublicBalanceReady(Box<PublicBalanceFundingEstimate>),
+    PublicBalanceUnavailable,
     Ready(Box<SponsoredFundingEstimate>),
     InsufficientWrappedNative {
         chain_id: u64,
@@ -110,6 +118,8 @@ fn sponsored_estimate_from_authorization_limit(
 }
 
 pub(in crate::root) enum SponsoredFundingEstimateDisplay {
+    PublicBalance(PublicActionFeeDisplay),
+    PublicBalanceError,
     Ready {
         expected_sponsorship_cost: String,
         gas_cost: String,
@@ -162,6 +172,45 @@ impl WalletRoot {
         state: &SponsoredFundingEstimateState,
     ) -> SponsoredFundingEstimateDisplay {
         match state {
+            SponsoredFundingEstimateState::PublicBalanceReady(estimate) => {
+                let format_gas_cost = |amount| {
+                    let token_value =
+                        format_native_token_amount_for_display(estimate.chain_id, amount);
+                    let usd_value = self
+                        .public_broadcaster_anchor_cache
+                        .cached_native_usd_micro_value(estimate.chain_id, amount)
+                        .map(format_usd_micro_value);
+                    public_action_fee_value_label(&token_value, usd_value)
+                };
+                let gas_cost = estimate.cost.gas_cost;
+                let protocol_fee = (!estimate.cost.protocol_fees.is_empty()).then(|| {
+                    estimate
+                        .cost
+                        .protocol_fees
+                        .iter()
+                        .map(|fee| {
+                            self.sponsored_token_cost_label(
+                                estimate.chain_id,
+                                fee.token,
+                                fee.amount,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                });
+                SponsoredFundingEstimateDisplay::PublicBalance(PublicActionFeeDisplay {
+                    expected_gas_cost: Some(format_gas_cost(gas_cost.expected_cost)),
+                    maximum_gas_cost: Some(format_gas_cost(gas_cost.maximum_cost)),
+                    show_maximum_gas_cost: maximum_gas_cost_is_significant(
+                        gas_cost.expected_cost,
+                        gas_cost.maximum_cost,
+                    ),
+                    protocol_fee,
+                })
+            }
+            SponsoredFundingEstimateState::PublicBalanceUnavailable => {
+                SponsoredFundingEstimateDisplay::PublicBalanceError
+            }
             SponsoredFundingEstimateState::Ready(estimate) => {
                 let expected_excess_deposit = estimate.expected_excess_deposit();
                 let expected_excess_deposit_usd_micro_value = self
@@ -361,36 +410,18 @@ impl WalletRoot {
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
     ) -> bool {
-        let (delivery_mode, funding, generating, chain_id) = match kind {
-            DeliveryFormKind::Send => self.send_forms.get(&key).map(|form| {
-                (
-                    form.delivery_mode,
-                    form.self_broadcast_funding,
-                    form.generating,
-                    form.asset.chain_id,
-                )
-            }),
-            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).map(|form| {
-                (
-                    form.delivery_mode,
-                    form.self_broadcast_funding,
-                    form.generating,
-                    form.asset.chain_id,
-                )
-            }),
+        let (delivery_mode, generating) = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .map(|form| (form.delivery_mode, form.generating)),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .map(|form| (form.delivery_mode, form.generating)),
         }
-        .unwrap_or((
-            DeliveryMode::ManualCalldata,
-            SelfBroadcastFundingMode::PublicBalance,
-            true,
-            key.chain_id,
-        ));
-        !generating
-            && delivery_mode == DeliveryMode::SelfBroadcast
-            && effective_self_broadcast_funding_mode(
-                self.effective_chain_configs.get(&chain_id),
-                funding,
-            ) == SelfBroadcastFundingMode::PrivateSponsorship
+        .unwrap_or((DeliveryMode::ManualCalldata, true));
+        !generating && delivery_mode == DeliveryMode::SelfBroadcast
     }
 
     fn start_sponsored_funding_estimate(
@@ -400,6 +431,31 @@ impl WalletRoot {
         estimate_id: u64,
         cx: &mut Context<'_, Self>,
     ) {
+        let funding = match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).map(|form| {
+                effective_self_broadcast_funding_mode(
+                    self.effective_chain_configs.get(&form.asset.chain_id),
+                    form.self_broadcast_funding,
+                )
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).map(|form| {
+                effective_self_broadcast_funding_mode(
+                    self.effective_chain_configs.get(&form.asset.chain_id),
+                    form.self_broadcast_funding,
+                )
+            }),
+        };
+        if funding == Some(SelfBroadcastFundingMode::PublicBalance) {
+            match kind {
+                DeliveryFormKind::Send => {
+                    self.start_public_balance_send_estimate(key, estimate_id, cx);
+                }
+                DeliveryFormKind::Unshield => {
+                    self.start_public_balance_unshield_estimate(key, estimate_id, cx);
+                }
+            }
+            return;
+        }
         match kind {
             DeliveryFormKind::Send => {
                 self.start_sponsored_send_estimate(key, estimate_id, cx);
@@ -407,6 +463,258 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 self.start_sponsored_unshield_estimate(key, estimate_id, cx);
             }
+        }
+    }
+
+    fn start_public_balance_send_estimate(
+        &mut self,
+        key: UnshieldAssetKey,
+        estimate_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get(&key) else {
+            return;
+        };
+        let asset = form.asset.clone();
+        if parse_railgun_recipient(form.recipient_value.trim()).is_err() {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Send,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        }
+        let Ok(amount) =
+            parse_send_amount(form.amount_input.read(cx).value().as_ref(), asset.decimals)
+        else {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Send,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        };
+        if amount.is_zero() || amount > asset.max_batched {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Send,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        }
+        let Ok(gas_fee) = form.self_broadcast_gas_fee.selection(cx) else {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Send,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        };
+        let Some((max_fee_per_gas, max_priority_fee_per_gas)) =
+            self_broadcast_initial_gas_values(&gas_fee, form.self_broadcast_gas_fee.quote)
+        else {
+            self.set_public_balance_estimate_if_current(
+                DeliveryFormKind::Send,
+                key,
+                estimate_id,
+                SponsoredFundingEstimateState::PublicBalanceUnavailable,
+                cx,
+            );
+            return;
+        };
+        let quote = form
+            .self_broadcast_gas_fee
+            .quote
+            .unwrap_or_else(|| SelfBroadcastGasFeeQuote::from_rpc_gas_price(max_fee_per_gas));
+        let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
+        else {
+            return;
+        };
+        let utxos = session.unspent_utxos();
+        let join = self.runtime.spawn_blocking(move || {
+            estimate_desktop_send_self_broadcast_cost(
+                &utxos,
+                asset.token,
+                amount,
+                quote,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            )
+            .map(|cost| {
+                SponsoredFundingEstimateState::PublicBalanceReady(Box::new(
+                    PublicBalanceFundingEstimate {
+                        chain_id: asset.chain_id,
+                        cost,
+                    },
+                ))
+            })
+            .unwrap_or(SponsoredFundingEstimateState::PublicBalanceUnavailable)
+        });
+        self.finish_public_balance_estimate(DeliveryFormKind::Send, key, estimate_id, join, cx);
+    }
+
+    fn start_public_balance_unshield_estimate(
+        &mut self,
+        key: UnshieldAssetKey,
+        estimate_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.refresh_unshield_native_top_up_state(key, cx);
+        let Some(form) = self.unshield_forms.get(&key) else {
+            return;
+        };
+        let asset = form.asset.clone();
+        if parse_address(form.recipient_value.trim()).is_none() {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Unshield,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        }
+        let Ok(amount) =
+            parse_unshield_amount(form.amount_input.read(cx).value().as_ref(), asset.decimals)
+        else {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Unshield,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        };
+        let fee_mode = effective_fee_handling_mode(
+            DeliveryFormKind::Unshield,
+            asset.token,
+            form.selected_fee_token,
+            form.fee_mode,
+        );
+        let max_entered_amount =
+            unshield_form_max_entered_amount(form, form.delivery_mode, fee_mode)
+                .unwrap_or(asset.max_batched);
+        if amount.is_zero() || amount > max_entered_amount {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Unshield,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        }
+        let Ok(gas_fee) = form.self_broadcast_gas_fee.selection(cx) else {
+            self.clear_sponsored_funding_estimate_if_current(
+                DeliveryFormKind::Unshield,
+                key,
+                estimate_id,
+                cx,
+            );
+            return;
+        };
+        let Some((max_fee_per_gas, max_priority_fee_per_gas)) =
+            self_broadcast_initial_gas_values(&gas_fee, form.self_broadcast_gas_fee.quote)
+        else {
+            self.set_public_balance_estimate_if_current(
+                DeliveryFormKind::Unshield,
+                key,
+                estimate_id,
+                SponsoredFundingEstimateState::PublicBalanceUnavailable,
+                cx,
+            );
+            return;
+        };
+        let quote = form
+            .self_broadcast_gas_fee
+            .quote
+            .unwrap_or_else(|| SelfBroadcastGasFeeQuote::from_rpc_gas_price(max_fee_per_gas));
+        let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
+        else {
+            return;
+        };
+        let utxos = session.unspent_utxos();
+        let unwrap = form.unwrap;
+        let native_top_up =
+            enabled_native_top_up_plan(form.native_top_up_enabled, form.native_top_up.as_ref());
+        let join = self.runtime.spawn_blocking(move || {
+            estimate_desktop_unshield_self_broadcast_cost(
+                &utxos,
+                asset.token,
+                amount,
+                fee_mode,
+                unwrap,
+                native_top_up.as_ref(),
+                quote,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            )
+            .map(|cost| {
+                SponsoredFundingEstimateState::PublicBalanceReady(Box::new(
+                    PublicBalanceFundingEstimate {
+                        chain_id: asset.chain_id,
+                        cost,
+                    },
+                ))
+            })
+            .unwrap_or(SponsoredFundingEstimateState::PublicBalanceUnavailable)
+        });
+        self.finish_public_balance_estimate(DeliveryFormKind::Unshield, key, estimate_id, join, cx);
+    }
+
+    fn finish_public_balance_estimate(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        estimate_id: u64,
+        join: tokio::task::JoinHandle<SponsoredFundingEstimateState>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let estimate = join
+                .await
+                .unwrap_or(SponsoredFundingEstimateState::PublicBalanceUnavailable);
+            let _ = this.update(cx, |root, cx| {
+                root.set_public_balance_estimate_if_current(kind, key, estimate_id, estimate, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn set_public_balance_estimate_if_current(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        estimate_id: u64,
+        estimate: SponsoredFundingEstimateState,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.sponsored_estimate_id != estimate_id {
+                    return false;
+                }
+                let changed = form.sponsored_funding_estimate.as_ref() != Some(&estimate)
+                    || form.sponsored_estimate_pending;
+                form.sponsored_funding_estimate = Some(estimate);
+                form.sponsored_estimate_pending = false;
+                changed
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.sponsored_estimate_id != estimate_id {
+                    return false;
+                }
+                let changed = form.sponsored_funding_estimate.as_ref() != Some(&estimate)
+                    || form.sponsored_estimate_pending;
+                form.sponsored_funding_estimate = Some(estimate);
+                form.sponsored_estimate_pending = false;
+                changed
+            }),
+        };
+        if changed {
+            cx.notify();
         }
     }
 

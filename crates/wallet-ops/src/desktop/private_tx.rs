@@ -2185,6 +2185,114 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     Ok(estimate)
 }
 
+pub fn estimate_desktop_send_self_broadcast_cost(
+    utxos: &[Utxo],
+    token: Address,
+    amount: U256,
+    quote: SelfBroadcastGasFeeQuote,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Result<DesktopSelfBroadcastCostEstimate> {
+    let selection = send_selection_info(utxos, token, amount, false)
+        .wrap_err("select POI-verified send notes for self-broadcast estimate")?;
+    let shape = send_approximate_shape(&selection, selection.max_spendable);
+    Ok(desktop_self_broadcast_cost_estimate(
+        shape,
+        quote,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        Vec::new(),
+    ))
+}
+
+pub fn estimate_desktop_unshield_self_broadcast_cost(
+    utxos: &[Utxo],
+    token: Address,
+    entered_amount: U256,
+    fee_mode: FeeHandlingMode,
+    unwrap: bool,
+    native_top_up: Option<&DesktopNativeTopUpPlan>,
+    quote: SelfBroadcastGasFeeQuote,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Result<DesktopSelfBroadcastCostEstimate> {
+    let receiver_amount = unshield_receiver_amount_for_fee_mode(entered_amount, fee_mode)?;
+    let shape = if let Some(native_top_up) = native_top_up {
+        native_top_up_approximate_shape(
+            utxos,
+            token,
+            token,
+            receiver_amount,
+            U256::ZERO,
+            native_top_up,
+        )?
+    } else {
+        let selection = unshield_selection_info(utxos, token, receiver_amount, false)
+            .wrap_err("select POI-verified unshield notes for self-broadcast estimate")?;
+        unshield_approximate_shape(&selection, selection.max_spendable, unwrap)
+    };
+    let protocol_fees = if let Some(native_top_up) = native_top_up {
+        if token == native_top_up.wrapped_native_token {
+            let combined_amount = native_top_up_required_wrapped_native_amount(
+                token,
+                native_top_up.wrapped_native_token,
+                receiver_amount,
+                native_top_up.native_amount,
+            );
+            vec![DesktopSelfBroadcastProtocolFee {
+                token,
+                amount: combined_amount
+                    .saturating_sub(native_top_up_net_after_protocol_fee(combined_amount)),
+            }]
+        } else {
+            vec![
+                DesktopSelfBroadcastProtocolFee {
+                    token,
+                    amount: unshield_protocol_fee_amount_for_fee_mode(entered_amount, fee_mode)?,
+                },
+                DesktopSelfBroadcastProtocolFee {
+                    token: native_top_up.wrapped_native_token,
+                    amount: native_top_up
+                        .wrapped_native_amount
+                        .saturating_sub(native_top_up.native_amount),
+                },
+            ]
+        }
+    } else {
+        vec![DesktopSelfBroadcastProtocolFee {
+            token,
+            amount: unshield_protocol_fee_amount_for_fee_mode(entered_amount, fee_mode)?,
+        }]
+    };
+    Ok(desktop_self_broadcast_cost_estimate(
+        shape,
+        quote,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        protocol_fees,
+    ))
+}
+
+fn desktop_self_broadcast_cost_estimate(
+    shape: ApproximateTransactionShape,
+    quote: SelfBroadcastGasFeeQuote,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    protocol_fees: Vec<DesktopSelfBroadcastProtocolFee>,
+) -> DesktopSelfBroadcastCostEstimate {
+    let gas_limit = approximate_public_broadcaster_gas(shape);
+    DesktopSelfBroadcastCostEstimate {
+        gas_limit,
+        gas_cost: eip1559_gas_cost_projection(
+            gas_limit,
+            quote,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        ),
+        protocol_fees,
+    }
+}
+
 pub async fn estimate_desktop_send_public_broadcaster_cost(
     request: DesktopSendPublicBroadcasterEstimateRequest,
     http: &HttpContext,
