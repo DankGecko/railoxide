@@ -626,7 +626,7 @@ pub(in crate::root) fn render_sponsored_funding_estimate(
                 primary_unshield_protocol_fee.clone(),
                 |this, protocol_fee| {
                     this.child(sponsored_funding_estimate_row(
-                        "RAILGUN protocol fee",
+                        public_action_protocol_fee_label(RAILGUN_PROTOCOL_FEE_BPS),
                         protocol_fee,
                     ))
                 },
@@ -774,7 +774,8 @@ fn sponsored_funding_detail_row(label: &'static str, value: String) -> gpui::Div
         )
 }
 
-fn sponsored_funding_estimate_row(label: &'static str, value: String) -> gpui::Div {
+fn sponsored_funding_estimate_row(label: impl Into<SharedString>, value: String) -> gpui::Div {
+    let label: SharedString = label.into();
     div()
         .flex()
         .flex_wrap()

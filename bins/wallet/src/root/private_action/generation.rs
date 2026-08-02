@@ -22,12 +22,22 @@ pub(in crate::root) fn sponsored_authorization_display(
             amount,
             Some(token_registry),
         );
-        let usd_value = anchor_cache
-            .cached_token_usd_micro_value(chain_id, limit.wrapped_native_token, amount)
-            .map(format_usd_micro_value);
+        let usd_micro_value =
+            anchor_cache.cached_token_usd_micro_value(chain_id, limit.wrapped_native_token, amount);
         format!(
             "Up to {}",
-            public_action_fee_value_label(&token_value, usd_value)
+            format_value_with_usd_label(
+                token_value,
+                amount,
+                token_display_metadata(
+                    Some(token_registry),
+                    chain_id,
+                    &limit.wrapped_native_token,
+                )
+                .map(|metadata| metadata.decimals),
+                usd_micro_value,
+                false,
+            )
         )
     };
     SponsoredAuthorizationDisplay {

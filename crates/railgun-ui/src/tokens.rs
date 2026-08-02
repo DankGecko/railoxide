@@ -65,7 +65,10 @@ pub enum TokenAnchorSource {
 
 pub const WRAPPED_NATIVE_FEE_RATE: U256 = uint!(1_000_000_000_000_000_000_U256);
 const USD_MICRO_PER_CENT: U256 = uint!(10_000_U256);
+const USD_MICRO_PER_DOLLAR: U256 = uint!(1_000_000_U256);
 const CENTS_PER_DOLLAR: U256 = uint!(100_U256);
+const USD_REDUNDANCY_BASIS_POINTS: U256 = uint!(10_000_U256);
+const USD_REDUNDANCY_TOLERANCE_BASIS_POINTS: U256 = uint!(200_U256);
 
 const NO_ANCHORS: &[TokenAnchorSource] = &[];
 const WRAPPED_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::Fixed {
@@ -393,6 +396,39 @@ pub fn native_usd_micro_value(amount: U256, native_usd_micro_rate: U256) -> Opti
     token_usd_micro_value(amount, WRAPPED_NATIVE_FEE_RATE, native_usd_micro_rate)
 }
 
+/// Returns no supplemental USD value when the token's valuation is within 2% of $1 per token.
+#[must_use]
+pub fn non_redundant_usd_micro_value(
+    token_amount: U256,
+    token_decimals: u8,
+    usd_micro_value: U256,
+) -> Option<U256> {
+    let Some(token_scale) = U256::from(10).checked_pow(U256::from(token_decimals)) else {
+        return Some(usd_micro_value);
+    };
+    let Some(scaled_usd_value) = usd_micro_value
+        .checked_mul(token_scale)
+        .and_then(|value| value.checked_mul(USD_REDUNDANCY_BASIS_POINTS))
+    else {
+        return Some(usd_micro_value);
+    };
+    let Some(nominal_usd_value) = token_amount.checked_mul(USD_MICRO_PER_DOLLAR) else {
+        return Some(usd_micro_value);
+    };
+    let Some(lower_bound) = nominal_usd_value
+        .checked_mul(USD_REDUNDANCY_BASIS_POINTS - USD_REDUNDANCY_TOLERANCE_BASIS_POINTS)
+    else {
+        return Some(usd_micro_value);
+    };
+    let Some(upper_bound) = nominal_usd_value
+        .checked_mul(USD_REDUNDANCY_BASIS_POINTS + USD_REDUNDANCY_TOLERANCE_BASIS_POINTS)
+    else {
+        return Some(usd_micro_value);
+    };
+
+    (!(lower_bound..=upper_bound).contains(&scaled_usd_value)).then_some(usd_micro_value)
+}
+
 #[must_use]
 pub fn format_usd_micro_value(value: U256) -> String {
     let mut rounded_cents = value / USD_MICRO_PER_CENT;
@@ -606,6 +642,48 @@ mod tests {
         assert_eq!(
             token_usd_micro_value(U256::MAX, uint!(1_U256), uint!(2_U256)),
             None
+        );
+    }
+
+    #[test]
+    fn redundant_usd_value_filter_uses_inclusive_two_percent_bounds() {
+        let amount = uint!(100_000_000_U256);
+
+        assert_eq!(
+            non_redundant_usd_micro_value(amount, 6, uint!(98_000_000_U256)),
+            None
+        );
+        assert_eq!(
+            non_redundant_usd_micro_value(amount, 6, uint!(102_000_000_U256)),
+            None
+        );
+        assert_eq!(
+            non_redundant_usd_micro_value(amount, 6, uint!(97_999_999_U256)),
+            Some(uint!(97_999_999_U256))
+        );
+        assert_eq!(
+            non_redundant_usd_micro_value(amount, 6, uint!(102_000_001_U256)),
+            Some(uint!(102_000_001_U256))
+        );
+    }
+
+    #[test]
+    fn redundant_usd_value_filter_handles_decimals_dust_and_overflow() {
+        assert_eq!(
+            non_redundant_usd_micro_value(
+                uint!(2_000_000_000_000_000_000_U256),
+                18,
+                uint!(2_000_000_U256),
+            ),
+            None
+        );
+        assert_eq!(
+            non_redundant_usd_micro_value(uint!(1_U256), 18, U256::ZERO),
+            Some(U256::ZERO)
+        );
+        assert_eq!(
+            non_redundant_usd_micro_value(U256::MAX, 18, U256::MAX),
+            Some(U256::MAX)
         );
     }
 

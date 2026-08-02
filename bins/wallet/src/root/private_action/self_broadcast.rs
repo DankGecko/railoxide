@@ -176,11 +176,16 @@ impl WalletRoot {
                 let format_gas_cost = |amount| {
                     let token_value =
                         format_native_token_amount_for_display(estimate.chain_id, amount);
-                    let usd_value = self
+                    let usd_micro_value = self
                         .public_broadcaster_anchor_cache
-                        .cached_native_usd_micro_value(estimate.chain_id, amount)
-                        .map(format_usd_micro_value);
-                    public_action_fee_value_label(&token_value, usd_value)
+                        .cached_native_usd_micro_value(estimate.chain_id, amount);
+                    format_value_with_usd_label(
+                        token_value,
+                        amount,
+                        Some(18),
+                        usd_micro_value,
+                        false,
+                    )
                 };
                 let gas_cost = estimate.cost.gas_cost;
                 let protocol_fee = (!estimate.cost.protocol_fees.is_empty()).then(|| {
@@ -301,11 +306,10 @@ impl WalletRoot {
 
     fn sponsored_native_cost_label(&self, chain_id: u64, amount: U256) -> String {
         let token_value = format_native_token_amount_ceiling_for_display(chain_id, amount);
-        let usd_value = self
+        let usd_micro_value = self
             .public_broadcaster_anchor_cache
-            .cached_native_usd_micro_value(chain_id, amount)
-            .map(format_usd_micro_value);
-        public_action_fee_value_label(&token_value, usd_value)
+            .cached_native_usd_micro_value(chain_id, amount);
+        format_value_with_usd_label(token_value, amount, Some(18), usd_micro_value, false)
     }
 
     fn sponsored_token_cost_label(&self, chain_id: u64, token: Address, amount: U256) -> String {
@@ -315,11 +319,17 @@ impl WalletRoot {
             amount,
             Some(&self.effective_token_registry),
         );
-        let usd_value = self
+        let usd_micro_value = self
             .public_broadcaster_anchor_cache
-            .cached_token_usd_micro_value(chain_id, token, amount)
-            .map(format_usd_micro_value);
-        public_action_fee_value_label(&token_value, usd_value)
+            .cached_token_usd_micro_value(chain_id, token, amount);
+        format_value_with_usd_label(
+            token_value,
+            amount,
+            token_display_metadata(Some(&self.effective_token_registry), chain_id, &token)
+                .map(|metadata| metadata.decimals),
+            usd_micro_value,
+            false,
+        )
     }
 
     pub(in crate::root) fn debounce_sponsored_funding_estimate(

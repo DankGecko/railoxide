@@ -12,7 +12,7 @@ use ui::theme;
 use wallet_ops::{
     DesktopSendPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
     PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown,
-    PublicBroadcasterFeeMargin, PublicBroadcasterSubmissionResult,
+    PublicBroadcasterFeeMargin, PublicBroadcasterSubmissionResult, TokenAnchorRateCache,
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, fixed_token_anchor_rate, parse_send_amount,
     parse_unshield_amount, public_broadcaster_fee_breakdown, public_broadcaster_service_gas_price,
@@ -25,13 +25,14 @@ use super::private_action::{
     send_public_broadcaster_estimate_input_error, unshield_public_broadcaster_estimate_input_error,
 };
 use super::private_broadcaster::PrivateBroadcasterProgressState;
+use super::public_action::public_action_protocol_fee_label;
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     COST_ESTIMATE_DEBOUNCE, ChainUtxoState, DeliveryFormKind, DeliveryMode, UnshieldAsset,
     UnshieldAssetKey, WalletRoot, app_panel, app_refresh_button, broadcaster_candidate_anchor_rate,
     copyable_mono_field, effective_fee_handling_mode, format_native_token_amount_for_display,
     format_native_top_up_recipient_suffix, format_report_chain, format_token_amount_for_display,
-    should_show_distinct_amount,
+    format_value_with_usd_label, should_show_distinct_amount, token_display_metadata,
 };
 
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: gpui::Pixels = px(12.0);
@@ -61,6 +62,7 @@ pub(super) struct PublicBroadcasterCostDisplay<'a> {
 
 pub(super) struct PrivateBroadcasterProgressContext<'a> {
     pub(super) display: PublicBroadcasterCostDisplay<'a>,
+    pub(super) anchor_cache: &'a TokenAnchorRateCache,
 }
 
 pub(super) fn format_public_broadcaster_fee_margin(
@@ -177,6 +179,24 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         )
     }
 
+    pub(super) fn action_amount_with_usd(
+        &self,
+        amount: U256,
+        anchor_cache: &TokenAnchorRateCache,
+    ) -> String {
+        self.token_amount_with_usd(anchor_cache, self.action_token, amount, false)
+    }
+
+    pub(super) fn fee_amount_with_usd(&self, anchor_cache: &TokenAnchorRateCache) -> String {
+        self.token_amount_value_with_usd(
+            self.fee_amount(),
+            anchor_cache,
+            self.fee_token,
+            self.fee_amount,
+            false,
+        )
+    }
+
     pub(super) fn fee_breakdown(&self) -> PublicBroadcasterFeeBreakdown {
         public_broadcaster_fee_breakdown(
             self.fee_amount,
@@ -199,6 +219,21 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         format_native_token_amount_for_display(self.chain_id, breakdown.native_gas_cost)
     }
 
+    pub(super) fn native_gas_cost_value_with_usd(
+        &self,
+        breakdown: &PublicBroadcasterFeeBreakdown,
+        anchor_cache: &TokenAnchorRateCache,
+    ) -> String {
+        let token_value = self.native_gas_cost_value(breakdown);
+        self.value_with_usd(
+            token_value,
+            breakdown.native_gas_cost,
+            Some(18),
+            anchor_cache.cached_native_usd_micro_value(self.chain_id, breakdown.native_gas_cost),
+            false,
+        )
+    }
+
     pub(super) fn broadcaster_fee_value(
         &self,
         breakdown: &PublicBroadcasterFeeBreakdown,
@@ -216,12 +251,79 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         )
     }
 
-    pub(super) fn protocol_fee_value(&self) -> String {
-        format!(
-            "{} ({} bps)",
-            self.action_amount(self.protocol_fee_amount),
-            self.protocol_fee_bps
+    pub(super) fn broadcaster_fee_value_with_usd(
+        &self,
+        breakdown: &PublicBroadcasterFeeBreakdown,
+        anchor_cache: &TokenAnchorRateCache,
+    ) -> String {
+        let token_value = self.broadcaster_fee_value(breakdown);
+        let Some(margin) = breakdown.broadcaster_fee else {
+            return format_value_with_usd_label(token_value, U256::ZERO, None, None, false);
+        };
+        let (negative, amount) = match margin {
+            PublicBroadcasterFeeMargin::Zero => (false, U256::ZERO),
+            PublicBroadcasterFeeMargin::Positive(amount) => (false, amount),
+            PublicBroadcasterFeeMargin::Negative(amount) => (true, amount),
+        };
+        self.token_amount_value_with_usd(
+            token_value,
+            anchor_cache,
+            self.fee_token,
+            amount,
+            negative,
         )
+    }
+
+    pub(super) fn protocol_fee_value_with_usd(
+        &self,
+        anchor_cache: &TokenAnchorRateCache,
+    ) -> String {
+        self.action_amount_with_usd(self.protocol_fee_amount, anchor_cache)
+    }
+
+    fn token_amount_with_usd(
+        &self,
+        anchor_cache: &TokenAnchorRateCache,
+        token: Address,
+        amount: U256,
+        negative: bool,
+    ) -> String {
+        self.token_amount_value_with_usd(
+            format_token_amount_for_display(self.chain_id, token, amount, self.registry),
+            anchor_cache,
+            token,
+            amount,
+            negative,
+        )
+    }
+
+    fn token_amount_value_with_usd(
+        &self,
+        token_value: String,
+        anchor_cache: &TokenAnchorRateCache,
+        token: Address,
+        amount: U256,
+        negative: bool,
+    ) -> String {
+        self.value_with_usd(
+            token_value,
+            amount,
+            token_display_metadata(self.registry, self.chain_id, &token)
+                .map(|metadata| metadata.decimals),
+            anchor_cache.cached_token_usd_micro_value(self.chain_id, token, amount),
+            negative,
+        )
+    }
+
+    fn value_with_usd(
+        &self,
+        token_value: String,
+        amount: U256,
+        decimals: Option<u8>,
+        usd_micro_value: Option<U256>,
+        negative: bool,
+    ) -> String {
+        format_value_with_usd_label(token_value, amount, decimals, usd_micro_value, negative)
     }
 
     pub(super) fn gas_value(&self) -> String {
@@ -783,6 +885,7 @@ fn append_public_broadcaster_cost_rows(
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
     display: &PublicBroadcasterCostDisplay<'_>,
+    anchor_cache: &TokenAnchorRateCache,
     options: &PublicBroadcasterCostRowsOptions,
     transaction_fee_breakdown_open: bool,
 ) -> gpui::Div {
@@ -801,7 +904,7 @@ fn append_public_broadcaster_cost_rows(
     card = card
         .child(cost_estimate_row_with_optional_suffix(
             "Recipient receives",
-            display.action_amount(display.recipient_amount),
+            display.action_amount_with_usd(display.recipient_amount, anchor_cache),
             display.native_top_up_recipient_suffix(),
         ))
         .when(
@@ -815,8 +918,8 @@ fn append_public_broadcaster_cost_rows(
         )
         .when(!display.protocol_fee_bps.is_zero(), |card| {
             card.child(cost_estimate_row(
-                "RAILGUN protocol fee",
-                display.protocol_fee_value(),
+                public_action_protocol_fee_label(display.protocol_fee_bps),
+                display.protocol_fee_value_with_usd(anchor_cache),
             ))
         })
         .child(render_transaction_fee_breakdown(
@@ -824,6 +927,7 @@ fn append_public_broadcaster_cost_rows(
             key,
             kind,
             display,
+            anchor_cache,
             transaction_fee_breakdown_open,
         ));
     card
@@ -834,10 +938,11 @@ fn render_transaction_fee_breakdown(
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
     display: &PublicBroadcasterCostDisplay<'_>,
+    anchor_cache: &TokenAnchorRateCache,
     open: bool,
 ) -> impl IntoElement {
     let breakdown = display.fee_breakdown();
-    let fee_amount = display.fee_amount();
+    let fee_amount = display.fee_amount_with_usd(anchor_cache);
     Collapsible::new()
         .open(open)
         .w_full()
@@ -872,7 +977,13 @@ fn render_transaction_fee_breakdown(
                         .justify_end()
                         .gap_2()
                         .text_color(rgb(theme::TEXT))
-                        .child(fee_amount)
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .text_align(gpui::TextAlign::Right)
+                                .whitespace_normal()
+                                .child(fee_amount),
+                        )
                         .child(
                             Icon::new(if open {
                                 IconName::ChevronUp
@@ -880,6 +991,7 @@ fn render_transaction_fee_breakdown(
                                 IconName::ChevronDown
                             })
                             .xsmall()
+                            .flex_none()
                             .text_color(rgb(theme::TEXT_MUTED)),
                         ),
                 ),
@@ -895,11 +1007,11 @@ fn render_transaction_fee_breakdown(
                 .border_color(rgb(theme::BORDER))
                 .child(transaction_fee_breakdown_row(
                     "Gas cost",
-                    display.native_gas_cost_value(&breakdown),
+                    display.native_gas_cost_value_with_usd(&breakdown, anchor_cache),
                 ))
                 .child(transaction_fee_breakdown_row(
                     "Broadcaster's fee",
-                    display.broadcaster_fee_value(&breakdown),
+                    display.broadcaster_fee_value_with_usd(&breakdown, anchor_cache),
                 ))
                 .child(
                     div()
@@ -928,6 +1040,7 @@ pub(super) fn render_public_broadcaster_cost_estimate(
     estimate: &PublicBroadcasterCostEstimate,
     fee_anchor_rate: Option<U256>,
     registry: Option<&EffectiveTokenRegistry>,
+    anchor_cache: &TokenAnchorRateCache,
     transaction_fee_breakdown_open: bool,
     refreshing: bool,
 ) -> gpui::Div {
@@ -966,6 +1079,7 @@ pub(super) fn render_public_broadcaster_cost_estimate(
         key,
         kind,
         &display,
+        anchor_cache,
         &PublicBroadcasterCostRowsOptions {
             show_broadcaster: true,
             show_entered_amount: false,
@@ -1056,12 +1170,12 @@ pub(super) fn render_public_broadcaster_cost_status(
         )
 }
 
-fn cost_estimate_row(label: &'static str, value: String) -> gpui::Div {
+fn cost_estimate_row(label: impl Into<SharedString>, value: String) -> gpui::Div {
     cost_estimate_row_with_optional_suffix(label, value, None)
 }
 
 fn cost_estimate_row_with_optional_suffix(
-    label: &'static str,
+    label: impl Into<SharedString>,
     value: String,
     suffix: Option<String>,
 ) -> gpui::Div {
@@ -1145,8 +1259,8 @@ pub(super) fn render_private_broadcaster_progress_context(
         )
         .when(!display.protocol_fee_bps.is_zero(), |card| {
             card.child(private_broadcaster_context_row(
-                "RAILGUN protocol fee",
-                display.protocol_fee_value(),
+                public_action_protocol_fee_label(display.protocol_fee_bps),
+                display.protocol_fee_value_with_usd(context.anchor_cache),
             ))
         })
         .child(private_broadcaster_context_row(
@@ -1155,12 +1269,15 @@ pub(super) fn render_private_broadcaster_progress_context(
         ))
 }
 
-pub(super) fn private_broadcaster_context_row(label: &'static str, value: String) -> gpui::Div {
+pub(super) fn private_broadcaster_context_row(
+    label: impl Into<SharedString>,
+    value: String,
+) -> gpui::Div {
     private_broadcaster_context_row_with_action(label, value, None)
 }
 
 fn private_broadcaster_context_row_with_optional_suffix(
-    label: &'static str,
+    label: impl Into<SharedString>,
     value: String,
     suffix: Option<String>,
 ) -> gpui::Div {
@@ -1174,7 +1291,7 @@ fn private_broadcaster_context_row_with_optional_suffix(
 }
 
 pub(super) fn private_broadcaster_context_row_with_action(
-    label: &'static str,
+    label: impl Into<SharedString>,
     value: String,
     action: Option<AnyElement>,
 ) -> gpui::Div {

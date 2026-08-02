@@ -23,7 +23,7 @@ use gpui_component::{
     spinner::Spinner,
     tooltip::Tooltip,
 };
-use railgun_ui::{format_token_amount, format_usd_micro_value, short_address};
+use railgun_ui::{format_token_amount, short_address};
 use rand::seq::IndexedRandom;
 use tokio::sync::{mpsc, watch};
 use ui::controls::{
@@ -41,14 +41,14 @@ use wallet_ops::{
     DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode, ListUtxosOutput, PreparedSendCall,
     PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
     PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
-    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, SponsoredAuthorizationLimit,
-    SponsoredIncentive, SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastSessionOutcome,
-    SponsorshipError, SponsorshipPayment, TokenAnchorRateCache, TransactionGenerationStage,
-    WalletSession, estimate_desktop_send_self_broadcast_cost,
-    estimate_desktop_unshield_self_broadcast_cost, expected_eip1559_fee_per_gas,
-    fee_policy_eligible_public_broadcasters, native_top_up_policy_for_chain,
-    native_top_up_primary_recipient_amount_for_fee_mode,
+    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, RAILGUN_PROTOCOL_FEE_BPS,
+    SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent,
+    SponsoredAuthorizationLimit, SponsoredIncentive, SponsoredSelfBroadcastCommand,
+    SponsoredSelfBroadcastSessionOutcome, SponsorshipError, SponsorshipPayment,
+    TokenAnchorRateCache, TransactionGenerationStage, WalletSession,
+    estimate_desktop_send_self_broadcast_cost, estimate_desktop_unshield_self_broadcast_cost,
+    expected_eip1559_fee_per_gas, fee_policy_eligible_public_broadcasters,
+    native_top_up_policy_for_chain, native_top_up_primary_recipient_amount_for_fee_mode,
     native_top_up_required_wrapped_native_amount_for_fee_mode, native_top_up_wrapped_native_amount,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
@@ -85,7 +85,7 @@ use super::private_broadcaster::{
 };
 use super::public_account::public_account_display_label;
 use super::public_action::{
-    PublicActionFeeDisplay, maximum_gas_cost_is_significant, public_action_fee_value_label,
+    PublicActionFeeDisplay, maximum_gas_cost_is_significant, public_action_protocol_fee_label,
     render_public_action_fee_estimate,
 };
 use super::public_balances::public_balance_entry_for_chain;
@@ -107,13 +107,13 @@ use super::{
     format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
     format_recipient_amount_with_native_top_up, format_report_chain, format_send_amount_input,
     format_token_amount_ceiling_for_display, format_token_amount_for_display,
-    format_unshield_amount_input, is_effective_wrapped_native_token, labeled_field,
-    native_token_display_label, native_wrapped_output_labels, new_prefilled_input, new_text_input,
-    parse_address, public_balance_amount_label, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, scrollable_dialog_content,
-    secondary_dialog_content_width, send_form_max_entered_amount, should_show_fee_mode_toggle,
-    token_label_row, unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
-    vault_error_kind,
+    format_unshield_amount_input, format_value_with_usd_label, is_effective_wrapped_native_token,
+    labeled_field, native_token_display_label, native_wrapped_output_labels, new_prefilled_input,
+    new_text_input, parse_address, public_balance_amount_label,
+    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
+    scrollable_dialog_content, secondary_dialog_content_width, send_form_max_entered_amount,
+    should_show_fee_mode_toggle, token_display_metadata, token_label_row,
+    unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode, vault_error_kind,
 };
 
 mod delivery;

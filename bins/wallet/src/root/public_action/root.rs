@@ -369,14 +369,12 @@ impl WalletRoot {
                                     .cached_native_usd_micro_value(
                                         self.selected_chain,
                                         estimate.expected_gas_cost,
-                                    )
-                                    .map(format_usd_micro_value),
+                                    ),
                                 self.public_broadcaster_anchor_cache
                                     .cached_native_usd_micro_value(
                                         self.selected_chain,
                                         estimate.max_gas_cost,
-                                    )
-                                    .map(format_usd_micro_value),
+                                    ),
                             ),
                             None => Alert::info(
                                 "wallet-public-send-advanced-estimate-required",
@@ -1613,11 +1611,16 @@ impl WalletRoot {
         let format_gas_cost = |native_gas_cost| {
             let token_value =
                 format_native_token_amount_for_display(self.selected_chain, native_gas_cost);
-            let usd_value = self
+            let usd_micro_value = self
                 .public_broadcaster_anchor_cache
-                .cached_native_usd_micro_value(self.selected_chain, native_gas_cost)
-                .map(format_usd_micro_value);
-            public_action_fee_value_label(&token_value, usd_value)
+                .cached_native_usd_micro_value(self.selected_chain, native_gas_cost);
+            format_value_with_usd_label(
+                token_value,
+                native_gas_cost,
+                Some(18),
+                usd_micro_value,
+                false,
+            )
         };
         let expected_gas_cost = gas_cost.map(|cost| format_gas_cost(cost.expected_cost));
         let maximum_gas_cost = gas_cost.map(|cost| format_gas_cost(cost.maximum_cost));
@@ -1646,9 +1649,16 @@ impl WalletRoot {
                         .public_broadcaster_anchor_cache
                         .cached_token_usd_micro_value(self.selected_chain, token, fee_amount),
                 };
-                public_action_fee_value_label(
-                    &token_value,
-                    usd_micro_value.map(format_usd_micro_value),
+                format_value_with_usd_label(
+                    token_value,
+                    fee_amount,
+                    public_asset_decimals(
+                        self.selected_chain,
+                        asset,
+                        Some(&self.effective_token_registry),
+                    ),
+                    usd_micro_value,
+                    false,
                 )
             })
         } else {
@@ -1819,24 +1829,28 @@ impl WalletRoot {
                 };
                 let expected_token_value =
                     format_native_token_amount_for_display(chain_id, estimate.expected_gas_cost);
-                let expected_usd_value = self
+                let expected_usd_micro_value = self
                     .public_broadcaster_anchor_cache
-                    .cached_native_usd_micro_value(chain_id, estimate.expected_gas_cost)
-                    .map(format_usd_micro_value);
+                    .cached_native_usd_micro_value(chain_id, estimate.expected_gas_cost);
                 let maximum_token_value =
                     format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
-                let maximum_usd_value = self
+                let maximum_usd_micro_value = self
                     .public_broadcaster_anchor_cache
-                    .cached_native_usd_micro_value(chain_id, estimate.max_gas_cost)
-                    .map(format_usd_micro_value);
+                    .cached_native_usd_micro_value(chain_id, estimate.max_gas_cost);
                 let fee_display = PublicActionFeeDisplay {
-                    expected_gas_cost: Some(public_action_fee_value_label(
-                        &expected_token_value,
-                        expected_usd_value,
+                    expected_gas_cost: Some(format_value_with_usd_label(
+                        expected_token_value,
+                        estimate.expected_gas_cost,
+                        Some(18),
+                        expected_usd_micro_value,
+                        false,
                     )),
-                    maximum_gas_cost: Some(public_action_fee_value_label(
-                        &maximum_token_value,
-                        maximum_usd_value,
+                    maximum_gas_cost: Some(format_value_with_usd_label(
+                        maximum_token_value,
+                        estimate.max_gas_cost,
+                        Some(18),
+                        maximum_usd_micro_value,
+                        false,
                     )),
                     show_maximum_gas_cost: maximum_gas_cost_is_significant(
                         estimate.expected_gas_cost,

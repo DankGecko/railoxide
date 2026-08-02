@@ -7,7 +7,9 @@ use crate::root::public_balances::{
     public_account_usd_total_label_for_chain, public_balance_entry_for_chain,
 };
 use crate::root::shell::{balance_sync_data_source, balance_sync_source_label};
-use wallet_ops::{PublicScanSource, SyncProgressStage, SyncProgressUpdate};
+use wallet_ops::{
+    PublicBroadcasterFeeBreakdown, PublicScanSource, SyncProgressStage, SyncProgressUpdate,
+};
 
 #[test]
 fn balance_sync_source_labels_cover_every_public_scan_source() {
@@ -202,7 +204,75 @@ fn public_broadcaster_cost_display_uses_shared_amount_precision() {
     let display = PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, None);
     assert_eq!(display.action_amount(display.recipient_amount), "3217 DAI");
     assert_eq!(display.fee_amount(), "0.16334 DAI");
-    assert_eq!(display.protocol_fee_value(), "8.06 DAI (25 bps)");
+}
+
+#[test]
+fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
+    let dai = address!("0x6B175474E89094C44Da98b954EedeAC495271d0F");
+    let candidate = wallet_ops::public_broadcaster_candidates_for_asset(
+        &[fee_row(1, dai, "usd-values")],
+        1,
+        dai,
+        None,
+        BroadcasterFeePolicy::default(),
+        None,
+    )
+    .expect("candidate")
+    .remove(0);
+    let mut estimate = public_broadcaster_cost_estimate(candidate);
+    estimate.action_token = dai;
+    estimate.fee_token = dai;
+    estimate.fee_amount = uint!(1_000_000_000_000_000_000_U256);
+    estimate.protocol_fee_amount = uint!(100_000_000_000_000_000_U256);
+    estimate.protocol_fee_bps = uint!(25_U256);
+    let display = PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, None);
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, dai, uint!(3_000_000_000_000_000_000_000_U256));
+    let breakdown = PublicBroadcasterFeeBreakdown {
+        native_gas_cost: uint!(1_000_000_000_000_000_U256),
+        fee_token_gas_cost: Some(uint!(250_000_000_000_000_000_U256)),
+        broadcaster_fee: Some(PublicBroadcasterFeeMargin::Negative(uint!(
+            500_000_000_000_000_000_U256
+        ))),
+    };
+
+    let stable_token_values = [
+        display.action_amount_with_usd(uint!(2_000_000_000_000_000_000_U256), &cache),
+        display.fee_amount_with_usd(&cache),
+        display.protocol_fee_value_with_usd(&cache),
+        display.broadcaster_fee_value_with_usd(&breakdown, &cache),
+    ];
+    assert!(stable_token_values.iter().all(|value| !value.contains('$')));
+    assert!(
+        stable_token_values
+            .iter()
+            .all(|value| !value.contains("USD unavailable"))
+    );
+    assert!(
+        display
+            .native_gas_cost_value_with_usd(&breakdown, &cache)
+            .contains('$')
+    );
+
+    let outside_peg_cache = TokenAnchorRateCache::new();
+    outside_peg_cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    outside_peg_cache.store_rate(1, dai, uint!(1_500_000_000_000_000_000_000_U256));
+    assert!(
+        display
+            .action_amount_with_usd(uint!(2_000_000_000_000_000_000_U256), &outside_peg_cache,)
+            .contains('$')
+    );
+    assert!(
+        display
+            .broadcaster_fee_value_with_usd(&breakdown, &outside_peg_cache)
+            .contains("-$")
+    );
+    assert!(
+        display
+            .fee_amount_with_usd(&TokenAnchorRateCache::new())
+            .contains("USD unavailable")
+    );
 }
 
 #[test]

@@ -353,7 +353,7 @@ fn public_action_authorization_fee_rows(
     }
     if let Some(protocol_fee) = display.protocol_fee.as_deref() {
         rows.push(SpendAuthorizationSummaryRow::new(
-            public_action_protocol_fee_label(),
+            public_action_protocol_fee_label(RAILGUN_PROTOCOL_FEE_BPS),
             protocol_fee,
         ));
     }

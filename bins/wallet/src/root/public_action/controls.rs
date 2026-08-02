@@ -132,7 +132,7 @@ pub(in crate::root) fn render_public_action_fee_estimate(
         })
         .when_some(display.protocol_fee.as_ref(), |this, protocol_fee| {
             this.child(public_action_fee_row(
-                public_action_protocol_fee_label(),
+                public_action_protocol_fee_label(RAILGUN_PROTOCOL_FEE_BPS),
                 protocol_fee.clone(),
             ))
         })
@@ -141,8 +141,8 @@ pub(in crate::root) fn render_public_action_fee_estimate(
 pub(in crate::root) fn render_public_advanced_transaction_estimate(
     chain_id: u64,
     estimate: &PublicAdvancedTransactionEstimate,
-    expected_usd_value: Option<String>,
-    maximum_usd_value: Option<String>,
+    expected_usd_micro_value: Option<U256>,
+    maximum_usd_micro_value: Option<U256>,
 ) -> AnyElement {
     let expected_token_value =
         format_native_token_amount_for_display(chain_id, estimate.expected_gas_cost);
@@ -166,14 +166,26 @@ pub(in crate::root) fn render_public_advanced_transaction_estimate(
         ))
         .child(public_action_fee_row(
             "Expected gas cost",
-            public_action_fee_value_label(&expected_token_value, expected_usd_value),
+            format_value_with_usd_label(
+                expected_token_value,
+                estimate.expected_gas_cost,
+                Some(18),
+                expected_usd_micro_value,
+                false,
+            ),
         ))
         .when(
             maximum_gas_cost_is_significant(estimate.expected_gas_cost, estimate.max_gas_cost),
             |this| {
                 this.child(public_action_muted_fee_row(
                     "Maximum gas cost",
-                    public_action_fee_value_label(&maximum_token_value, maximum_usd_value),
+                    format_value_with_usd_label(
+                        maximum_token_value,
+                        estimate.max_gas_cost,
+                        Some(18),
+                        maximum_usd_micro_value,
+                        false,
+                    ),
                 ))
             },
         )
@@ -212,16 +224,6 @@ fn public_action_muted_fee_row(label: &'static str, value: String) -> gpui::Div 
                 .font_family(APP_MONO_FONT_FAMILY)
                 .whitespace_normal(),
         )
-}
-
-pub(in crate::root) fn public_action_fee_value_label(
-    token_value: &str,
-    usd_value: Option<String>,
-) -> String {
-    format!(
-        "{token_value} · {}",
-        usd_value.unwrap_or_else(|| "USD unavailable".to_string())
-    )
 }
 
 pub(in crate::root) fn render_public_action_active_status_notice(

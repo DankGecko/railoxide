@@ -1048,6 +1048,7 @@ impl WalletRoot {
                     anchor_rate,
                     Some(&self.effective_token_registry),
                 ),
+                anchor_cache: &self.public_broadcaster_anchor_cache,
             });
         }
         let estimate = progress.estimate.as_ref()?;
@@ -1061,6 +1062,7 @@ impl WalletRoot {
                 anchor_rate,
                 Some(&self.effective_token_registry),
             ),
+            anchor_cache: &self.public_broadcaster_anchor_cache,
         })
     }
 

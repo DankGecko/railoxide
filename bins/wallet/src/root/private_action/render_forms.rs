@@ -306,6 +306,7 @@ impl WalletRoot {
                     estimate,
                     anchor_rate,
                     Some(&self.effective_token_registry),
+                    &self.public_broadcaster_anchor_cache,
                     form.transaction_fee_breakdown_open,
                     form.estimating_cost,
                 ));
@@ -714,6 +715,7 @@ impl WalletRoot {
                     estimate,
                     anchor_rate,
                     Some(&self.effective_token_registry),
+                    &self.public_broadcaster_anchor_cache,
                     form.transaction_fee_breakdown_open,
                     form.estimating_cost,
                 ));

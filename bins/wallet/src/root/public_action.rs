@@ -15,7 +15,7 @@ use gpui_component::{
     input::InputState,
     spinner::Spinner,
 };
-use railgun_ui::{format_usd_micro_value, short_address};
+use railgun_ui::short_address;
 use tokio::sync::mpsc;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
@@ -51,9 +51,10 @@ use super::{
     PUBLIC_ACTION_DIALOG_WIDTH, WalletRoot, app_step_row, app_stepper_container,
     copyable_mono_field, dialog_content_max_height, dialog_max_height,
     format_native_token_amount_for_display, format_report_chain, format_send_amount_input,
-    format_token_amount_for_display, labeled_field, native_token_display_label, parse_address,
-    public_asset_decimals, public_asset_label, public_balance_amount_label,
-    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+    format_token_amount_for_display, format_value_with_usd_label, labeled_field,
+    native_token_display_label, parse_address, public_asset_decimals, public_asset_label,
+    public_balance_amount_label, scrollable_dialog_content, secondary_dialog_content_width,
+    token_label_row,
 };
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};
@@ -69,9 +70,9 @@ pub(super) use progress::*;
 pub(super) use stepper::*;
 pub(super) use types::*;
 
-fn public_action_protocol_fee_label() -> String {
+pub(in crate::root) fn public_action_protocol_fee_label(fee_bps: U256) -> String {
     format!(
         "RAILGUN protocol fee ({})",
-        format_protocol_fee_percentage(RAILGUN_PROTOCOL_FEE_BPS)
+        format_protocol_fee_percentage(fee_bps)
     )
 }

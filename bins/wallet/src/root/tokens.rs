@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use alloy::primitives::{Address, U256};
 use railgun_ui::{
-    format_scaled_amount, format_token_amount, lookup_token, short_address, token_icon_asset_path,
+    format_scaled_amount, format_token_amount, format_usd_micro_value, lookup_token,
+    non_redundant_usd_micro_value, short_address, token_icon_asset_path,
 };
 use wallet_ops::settings::{EffectiveChainConfig, EffectiveTokenInfo, EffectiveTokenRegistry};
 
@@ -115,6 +116,32 @@ pub(super) fn format_token_amount_ceiling_for_display(
                 info.symbol
             )
         },
+    )
+}
+
+pub(super) fn format_value_with_usd_label(
+    token_value: String,
+    amount: U256,
+    decimals: Option<u8>,
+    usd_micro_value: Option<U256>,
+    negative: bool,
+) -> String {
+    let Some(usd_micro_value) = usd_micro_value else {
+        return format!("{token_value} · USD unavailable");
+    };
+    if decimals.is_some_and(|decimals| {
+        non_redundant_usd_micro_value(amount, decimals, usd_micro_value).is_none()
+    }) {
+        return token_value;
+    }
+    let usd_value = format_usd_micro_value(usd_micro_value);
+    format!(
+        "{token_value} · {}",
+        if negative {
+            format!("-{usd_value}")
+        } else {
+            usd_value
+        }
     )
 }
 
