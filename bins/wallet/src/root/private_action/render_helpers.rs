@@ -313,7 +313,6 @@ fn render_private_action_tooltip_icon(
         .justify_center()
         .rounded_full()
         .text_color(rgb(icon_color))
-        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
         .child(Icon::new(icon).with_size(px(14.0)))
         .tooltip(move |window: &mut Window, cx: &mut App| {
             let Some(width) =
