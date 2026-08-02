@@ -565,6 +565,215 @@ pub(in crate::root) fn render_self_broadcast_settings(
         ))
 }
 
+pub(in crate::root) fn render_sponsored_funding_estimate(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    display: &SponsoredFundingEstimateDisplay,
+    breakdown_open: bool,
+) -> gpui::Div {
+    let estimate = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(app_strong_text("Estimated fees"));
+    match display {
+        SponsoredFundingEstimateDisplay::Ready {
+            expected_sponsorship_cost,
+            gas_cost,
+            builder_premium,
+            primary_unshield_protocol_fee,
+            expected_excess_deposit,
+            maximum_spend,
+            show_excess_deposit_breakdown,
+        } => estimate
+            .child(render_sponsored_funding_breakdown(
+                root,
+                key,
+                kind,
+                expected_sponsorship_cost.clone(),
+                gas_cost.clone(),
+                builder_premium.clone(),
+                expected_excess_deposit,
+                maximum_spend.clone(),
+                *show_excess_deposit_breakdown,
+                breakdown_open,
+            ))
+            .when_some(
+                primary_unshield_protocol_fee.clone(),
+                |this, protocol_fee| {
+                    this.child(sponsored_funding_estimate_row(
+                        "RAILGUN protocol fee",
+                        protocol_fee,
+                    ))
+                },
+            ),
+        SponsoredFundingEstimateDisplay::Error(error) => estimate.child(
+            Alert::error(
+                delivery_element_id(key, kind, "sponsored-estimate-error"),
+                error.clone(),
+            )
+            .small(),
+        ),
+    }
+}
+
+fn render_sponsored_funding_breakdown(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    expected_sponsorship_cost: String,
+    gas_cost: String,
+    builder_premium: String,
+    expected_excess_deposit: &str,
+    maximum_spend: String,
+    show_excess_deposit_breakdown: bool,
+    open: bool,
+) -> Collapsible {
+    Collapsible::new()
+        .open(open)
+        .w_full()
+        .rounded_md()
+        .overflow_hidden()
+        .child(
+            div()
+                .id(delivery_element_id(
+                    key,
+                    kind,
+                    "sponsored-funding-breakdown",
+                ))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .py(px(5.0))
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    root.update(cx, |root, cx| {
+                        root.set_sponsored_funding_breakdown_open(kind, key, !open, cx);
+                    });
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(theme::TEXT))
+                        .child("Expected transaction cost"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            app_strong_text(expected_sponsorship_cost)
+                                .min_w(px(0.0))
+                                .text_size(px(13.0))
+                                .font_family(APP_MONO_FONT_FAMILY)
+                                .whitespace_normal(),
+                        )
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .xsmall()
+                            .text_color(rgb(theme::TEXT_MUTED)),
+                        ),
+                ),
+        )
+        .content(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px(px(10.0))
+                .py(px(8.0))
+                .border_t_1()
+                .border_color(rgb(theme::BORDER))
+                .child(sponsored_funding_detail_row(
+                    "Expected network gas",
+                    gas_cost,
+                ))
+                .child(sponsored_funding_detail_row(
+                    "Builder premium",
+                    builder_premium,
+                ))
+                .when(show_excess_deposit_breakdown, |this| {
+                    this.child(sponsored_funding_estimate_divider())
+                        .child(sponsored_funding_detail_row(
+                            "Unshielded up front",
+                            maximum_spend,
+                        ))
+                        .child(sponsored_funding_detail_row(
+                            "Excess deposited to signer",
+                            expected_excess_deposit.to_string(),
+                        ))
+                        .child(
+                            app_muted_text(
+                                "Unused builder funding remains on the signer as public ETH.",
+                            )
+                            .text_size(px(12.0))
+                            .line_height(px(15.0)),
+                        )
+                }),
+        )
+}
+
+fn sponsored_funding_estimate_divider() -> gpui::Div {
+    div()
+        .my(px(3.0))
+        .border_t_1()
+        .border_color(rgb(theme::BORDER))
+}
+
+fn sponsored_funding_detail_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .text_color(rgb(theme::TEXT))
+        .text_size(px(12.0))
+        .line_height(px(15.0))
+        .child(label)
+        .child(
+            div()
+                .min_w(px(0.0))
+                .font_family(APP_MONO_FONT_FAMILY)
+                .whitespace_normal()
+                .child(value),
+        )
+}
+
+fn sponsored_funding_estimate_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(div().flex_none().text_color(rgb(theme::TEXT)).child(label))
+        .child(
+            app_strong_text(value)
+                .min_w(px(0.0))
+                .text_size(px(13.0))
+                .font_family(APP_MONO_FONT_FAMILY)
+                .whitespace_normal(),
+        )
+}
+
 pub(in crate::root) fn self_broadcast_gas_payer_select_trigger_row(
     label: &str,
     address: &Address,

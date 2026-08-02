@@ -673,7 +673,7 @@ impl WalletRoot {
                 self.refresh_unshield_native_top_up_state(key, cx);
             }
             self.debounce_public_broadcaster_cost_estimate(kind, key, cx);
-            cx.notify();
+            self.debounce_sponsored_funding_estimate(kind, key, cx);
         }
     }
 

@@ -124,12 +124,12 @@ use sidebar::Activity;
 use spend_authorization::{SpendAuthorizationCache, SpendAuthorizationLifetime};
 use startup::WalletStartupRoot;
 use tokens::{
-    format_exact_token_amount_for_display, format_native_token_amount_for_display,
-    format_native_top_up_recipient_suffix, format_recipient_amount_with_native_top_up,
-    format_send_amount_input, format_token_amount_ceiling_for_display,
-    format_token_amount_for_display, format_unshield_amount_input,
-    is_effective_wrapped_native_token, native_token_display_label, native_wrapped_output_labels,
-    parse_address, token_display_label, token_display_metadata,
+    format_exact_token_amount_for_display, format_native_token_amount_ceiling_for_display,
+    format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
+    format_recipient_amount_with_native_top_up, format_send_amount_input,
+    format_token_amount_ceiling_for_display, format_token_amount_for_display,
+    format_unshield_amount_input, is_effective_wrapped_native_token, native_token_display_label,
+    native_wrapped_output_labels, parse_address, token_display_label, token_display_metadata,
 };
 use ui_helpers::{
     app_panel, app_refresh_button, app_status_tag, app_step_row, app_stepper_container,

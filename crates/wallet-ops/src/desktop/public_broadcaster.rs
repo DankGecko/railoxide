@@ -1450,6 +1450,19 @@ pub fn unshield_receiver_amount_for_fee_mode(
     }
 }
 
+pub fn unshield_protocol_fee_amount_for_fee_mode(
+    entered_amount: U256,
+    fee_mode: FeeHandlingMode,
+) -> Result<U256> {
+    let gross_amount = unshield_receiver_amount_for_fee_mode(entered_amount, fee_mode)?;
+    Ok(match fee_mode {
+        FeeHandlingMode::DeductFromAmount => {
+            railgun_protocol_fee_amount(gross_amount, RAILGUN_PROTOCOL_FEE_BPS)
+        }
+        FeeHandlingMode::AddToAmount => gross_amount.saturating_sub(entered_amount),
+    })
+}
+
 pub(super) const fn recipient_amount_after_protocol_fee(
     amount: U256,
     protocol_fee_amount: U256,

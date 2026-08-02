@@ -194,6 +194,7 @@ impl WalletRoot {
                     );
                     this.clear_send_form_text_edit_state(key, cx);
                     this.debounce_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Send, key, cx);
                 } else if matches!(event, InputEvent::PressEnter { .. }) {
                     this.confirm_selected_recipient_suggestion(
                         DeliveryFormKind::Send,
@@ -218,6 +219,7 @@ impl WalletRoot {
                     }
                     this.clear_send_form_text_edit_state(key, cx);
                     this.debounce_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Send, key, cx);
                 }
             },
         )
@@ -266,7 +268,9 @@ impl WalletRoot {
             &gas_fee_editor.max_fee_input,
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.sync_self_broadcast_custom_gas_fee_error(DeliveryFormKind::Send, key, cx);
                     this.clear_send_form_text_edit_state(key, cx);
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Send, key, cx);
                 }
             },
         )
@@ -275,7 +279,9 @@ impl WalletRoot {
             &gas_fee_editor.max_priority_fee_input,
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.sync_self_broadcast_custom_gas_fee_error(DeliveryFormKind::Send, key, cx);
                     this.clear_send_form_text_edit_state(key, cx);
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Send, key, cx);
                 }
             },
         )
@@ -319,6 +325,10 @@ impl WalletRoot {
                 self_broadcast_funding: SelfBroadcastFundingMode::PublicBalance,
                 sponsored_incentive: SponsoredIncentive::Standard,
                 sponsored_custom_incentive_input,
+                sponsored_funding_estimate: None,
+                sponsored_funding_breakdown_open: false,
+                sponsored_estimate_id: 0,
+                sponsored_estimate_pending: false,
                 self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
@@ -423,6 +433,7 @@ impl WalletRoot {
                 self.refresh_unshield_native_top_up_state(key, cx);
             }
             self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+            self.debounce_sponsored_funding_estimate(kind, key, cx);
         }
     }
 
@@ -602,6 +613,7 @@ impl WalletRoot {
         if delivery_mode == DeliveryMode::SelfBroadcast {
             self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Send, key, cx);
         }
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Send, key, cx);
     }
 
     pub(in crate::root) fn set_unshield_asset(
@@ -716,6 +728,7 @@ impl WalletRoot {
         if delivery_mode == DeliveryMode::SelfBroadcast {
             self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Unshield, key, cx);
         }
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
     pub(in crate::root) fn set_send_delivery_mode(
@@ -769,6 +782,7 @@ impl WalletRoot {
             self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Send, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Send, key, cx);
     }
 
     pub(in crate::root) fn set_send_broadcaster_choice(
@@ -1100,6 +1114,36 @@ impl WalletRoot {
         }
     }
 
+    pub(in crate::root) fn set_sponsored_funding_breakdown_open(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        open: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.sponsored_funding_breakdown_open == open {
+                    false
+                } else {
+                    form.sponsored_funding_breakdown_open = open;
+                    true
+                }
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.sponsored_funding_breakdown_open == open {
+                    false
+                } else {
+                    form.sponsored_funding_breakdown_open = open;
+                    true
+                }
+            }),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
     pub(in crate::root) fn set_self_broadcast_gas_payer(
         &mut self,
         kind: DeliveryFormKind,
@@ -1132,7 +1176,7 @@ impl WalletRoot {
         };
         if changed {
             self.sync_self_broadcast_gas_payer_select(kind, key, window, cx);
-            cx.notify();
+            self.debounce_sponsored_funding_estimate(kind, key, cx);
         }
     }
 
@@ -1194,6 +1238,9 @@ impl WalletRoot {
                         .seed_custom_from_auto_if_empty(window, cx);
                 }
                 form.self_broadcast_gas_fee.mode = mode;
+                if mode == Eip1559GasFeeMode::Auto {
+                    form.self_broadcast_gas_fee.error = None;
+                }
                 form.self_broadcast_estimated_native_gas_cost = None;
                 form.error = None;
                 form.result = None;
@@ -1208,6 +1255,9 @@ impl WalletRoot {
                         .seed_custom_from_auto_if_empty(window, cx);
                 }
                 form.self_broadcast_gas_fee.mode = mode;
+                if mode == Eip1559GasFeeMode::Auto {
+                    form.self_broadcast_gas_fee.error = None;
+                }
                 form.self_broadcast_estimated_native_gas_cost = None;
                 form.error = None;
                 form.result = None;
@@ -1215,7 +1265,45 @@ impl WalletRoot {
             }),
         };
         if changed {
-            cx.notify();
+            self.sync_self_broadcast_custom_gas_fee_error(kind, key, cx);
+            self.debounce_sponsored_funding_estimate(kind, key, cx);
+        }
+    }
+
+    fn sync_self_broadcast_custom_gas_fee_error(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &App,
+    ) {
+        let error = match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).and_then(|form| {
+                (form.self_broadcast_gas_fee.mode == Eip1559GasFeeMode::Custom)
+                    .then(|| form.self_broadcast_gas_fee.selection(cx).err())
+                    .flatten()
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).and_then(|form| {
+                (form.self_broadcast_gas_fee.mode == Eip1559GasFeeMode::Custom)
+                    .then(|| form.self_broadcast_gas_fee.selection(cx).err())
+                    .flatten()
+            }),
+        }
+        .map(Arc::<str>::from);
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key)
+                    && form.self_broadcast_gas_fee.mode == Eip1559GasFeeMode::Custom
+                {
+                    form.self_broadcast_gas_fee.error = error;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key)
+                    && form.self_broadcast_gas_fee.mode == Eip1559GasFeeMode::Custom
+                {
+                    form.self_broadcast_gas_fee.error = error;
+                }
+            }
         }
     }
 
@@ -1278,7 +1366,8 @@ impl WalletRoot {
             if let Some(input) = focus_input {
                 input.read(cx).focus_handle(cx).focus(window);
             }
-            cx.notify();
+            self.sync_self_broadcast_custom_gas_fee_error(kind, key, cx);
+            self.debounce_sponsored_funding_estimate(kind, key, cx);
         }
     }
 
@@ -1301,7 +1390,7 @@ impl WalletRoot {
                 form.self_broadcast_gas_fee.refresh_id =
                     form.self_broadcast_gas_fee.refresh_id.wrapping_add(1);
                 form.self_broadcast_gas_fee.refreshing = true;
-                form.self_broadcast_gas_fee.error = None;
+                form.self_broadcast_gas_fee.quote_error = None;
                 form.self_broadcast_gas_fee.refresh_id
             }
             DeliveryFormKind::Unshield => {
@@ -1314,7 +1403,7 @@ impl WalletRoot {
                 form.self_broadcast_gas_fee.refresh_id =
                     form.self_broadcast_gas_fee.refresh_id.wrapping_add(1);
                 form.self_broadcast_gas_fee.refreshing = true;
-                form.self_broadcast_gas_fee.error = None;
+                form.self_broadcast_gas_fee.quote_error = None;
                 form.self_broadcast_gas_fee.refresh_id
             }
         };
@@ -1341,16 +1430,27 @@ impl WalletRoot {
                     return;
                 }
                 gas_fee.refreshing = false;
-                match result {
+                let quote_updated = match result {
                     Ok(quote) => {
                         gas_fee.quote = Some(quote);
-                        gas_fee.error = None;
+                        gas_fee.quote_error = None;
+                        true
                     }
-                    Err(error) => {
-                        gas_fee.error = Some(Arc::from(format_report_chain(&error)));
+                    Err(_error) => {
+                        gas_fee.quote_error = Some(Arc::from(if gas_fee.quote.is_some() {
+                            "Gas quote refresh failed; using the last successful quote."
+                        } else {
+                            "Gas quote is unavailable."
+                        }));
+                        false
                     }
+                };
+                root.sync_self_broadcast_custom_gas_fee_error(kind, key, cx);
+                if quote_updated {
+                    root.revalidate_sponsored_funding_estimate(kind, key, cx);
+                } else {
+                    cx.notify();
                 }
-                cx.notify();
             });
         })
         .detach();
@@ -1430,6 +1530,7 @@ impl WalletRoot {
                         key,
                         cx,
                     );
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
                 } else if matches!(event, InputEvent::PressEnter { .. }) {
                     this.confirm_selected_recipient_suggestion(
                         DeliveryFormKind::Unshield,
@@ -1460,6 +1561,7 @@ impl WalletRoot {
                         key,
                         cx,
                     );
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
                 }
             },
         )
@@ -1500,6 +1602,36 @@ impl WalletRoot {
                         window,
                         cx,
                     );
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &gas_fee_editor.max_fee_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.sync_self_broadcast_custom_gas_fee_error(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        cx,
+                    );
+                    this.clear_unshield_form_text_edit_state(key, cx);
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &gas_fee_editor.max_priority_fee_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.sync_self_broadcast_custom_gas_fee_error(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        cx,
+                    );
+                    this.clear_unshield_form_text_edit_state(key, cx);
+                    this.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
                 }
             },
         )
@@ -1546,6 +1678,10 @@ impl WalletRoot {
                 self_broadcast_funding: SelfBroadcastFundingMode::PublicBalance,
                 sponsored_incentive: SponsoredIncentive::Standard,
                 sponsored_custom_incentive_input,
+                sponsored_funding_estimate: None,
+                sponsored_funding_breakdown_open: false,
+                sponsored_estimate_id: 0,
+                sponsored_estimate_pending: false,
                 self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
@@ -1571,6 +1707,7 @@ impl WalletRoot {
         });
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
         Self::open_private_action_dialog(DeliveryFormKind::Unshield, key, "Unshield", window, cx);
         cx.defer_in(window, move |root, window, cx| {
             if root
@@ -1621,6 +1758,7 @@ impl WalletRoot {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
     pub(in crate::root) fn set_unshield_fee_mode(
@@ -1658,6 +1796,7 @@ impl WalletRoot {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
     pub(in crate::root) fn clear_unshield_form_text_edit_state(
@@ -1737,6 +1876,7 @@ impl WalletRoot {
             self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Unshield, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
     pub(in crate::root) fn set_unshield_broadcaster_choice(

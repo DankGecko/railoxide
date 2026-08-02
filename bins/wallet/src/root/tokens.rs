@@ -133,6 +133,17 @@ pub(super) fn format_native_token_amount_for_display(chain_id: u64, amount: U256
     )
 }
 
+pub(super) fn format_native_token_amount_ceiling_for_display(
+    chain_id: u64,
+    amount: U256,
+) -> String {
+    format!(
+        "{} {}",
+        railgun_ui::format_token_amount_ceiling(amount, 18),
+        native_token_display_label(chain_id)
+    )
+}
+
 pub(super) fn format_native_top_up_recipient_suffix(chain_id: u64, amount: U256) -> String {
     format!(
         "+ {} (gas top-up)",

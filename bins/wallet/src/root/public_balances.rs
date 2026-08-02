@@ -362,12 +362,19 @@ impl WalletRoot {
         }
         match result {
             Ok(Ok(snapshot)) => {
-                self.public_balance_snapshot = Some(Arc::new(merge_public_balance_snapshot(
+                let previous_snapshot = self.public_balance_snapshot.clone();
+                let merged_snapshot = Arc::new(merge_public_balance_snapshot(
                     self.public_balance_snapshot.as_deref(),
                     snapshot,
                     PublicAccountStatus::Active,
-                )));
+                ));
+                self.public_balance_snapshot = Some(Arc::clone(&merged_snapshot));
                 self.public_balance_error = None;
+                self.revalidate_sponsored_estimates_for_public_balance_change(
+                    previous_snapshot.as_deref(),
+                    merged_snapshot.as_ref(),
+                    cx,
+                );
                 if let Some(window) = sync_window {
                     self.sync_self_broadcast_gas_payer_selects(window, cx);
                 }

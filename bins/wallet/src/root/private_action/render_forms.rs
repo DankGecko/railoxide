@@ -2,19 +2,20 @@ use super::{
     Alert, ButtonVariants, DeliveryFormKind, DeliveryMode, Disableable, Entity, ParentElement,
     Pixels, PublicBroadcasterResultKind, SendResult, Sizable, SponsoredSelfBroadcastSessionOutcome,
     Styled, UnshieldAssetKey, UnshieldResult, WalletRoot, app_button, app_muted_text,
-    app_strong_text, delivery_element_id, div, fee_policy_eligible_public_broadcasters,
-    format_form_error_for_asset, is_effective_wrapped_native_token, labeled_field,
-    private_action_input, private_broadcaster_closed_active_progress,
-    public_broadcaster_cost_status, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, px, render_delivery_selector,
-    render_fee_mode_toggle, render_private_action_metrics,
+    app_strong_text, delivery_element_id, div, effective_self_broadcast_funding_mode,
+    fee_policy_eligible_public_broadcasters, format_form_error_for_asset,
+    is_effective_wrapped_native_token, labeled_field, private_action_input,
+    private_broadcaster_closed_active_progress, public_broadcaster_cost_status,
+    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
+    px, render_delivery_selector, render_fee_mode_toggle, render_private_action_metrics,
     render_private_broadcaster_status_notice, render_private_self_broadcast_status_notice,
     render_private_submission_active_status_notice, render_public_broadcaster_cost_estimate,
     render_public_broadcaster_cost_status, render_public_broadcaster_settings,
     render_recipient_picker, render_self_broadcast_settings, render_send_result,
-    render_unshield_generating_status, render_unshield_native_top_up_control,
-    render_unshield_output_toggle, render_unshield_result, selected_broadcaster_fee_warning,
-    send_element_id, should_render_public_broadcaster_cost_preview,
+    render_sponsored_funding_estimate, render_unshield_generating_status,
+    render_unshield_native_top_up_control, render_unshield_output_toggle, render_unshield_result,
+    selected_broadcaster_fee_warning, send_element_id,
+    should_render_public_broadcaster_cost_preview, sponsored_estimate_allows_submission,
     sponsored_funding_choice_visible, sponsored_funding_enabled,
     sponsored_self_broadcast_availability_reason, unshield_element_id,
 };
@@ -54,6 +55,7 @@ impl WalletRoot {
         );
         let mut public_broadcaster_submit_disabled = false;
         let mut self_broadcast_submit_disabled = false;
+        let mut sponsored_funding_estimate = None;
         let generation_ready = self.private_action_generation_ready(asset.chain_id);
         let public_broadcaster_submitted = matches!(
             form.result.as_ref(),
@@ -175,11 +177,20 @@ impl WalletRoot {
                 );
             }
         } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+            sponsored_funding_estimate.clone_from(&form.sponsored_funding_estimate);
+            let effective_funding =
+                effective_self_broadcast_funding_mode(effective_chain, form.self_broadcast_funding);
+            let sponsored_estimate_ready = sponsored_estimate_allows_submission(
+                effective_funding,
+                sponsored_funding_estimate.as_ref(),
+                form.sponsored_estimate_pending,
+            );
             self_broadcast_submit_disabled = form
                 .self_broadcast_gas_payer_uuid
                 .as_deref()
                 .and_then(|uuid| self.selected_self_broadcast_gas_payer_account(Some(uuid)))
-                .is_none();
+                .is_none()
+                || !sponsored_estimate_ready;
             card = card.child(render_self_broadcast_settings(
                 chooser_root,
                 key,
@@ -199,76 +210,84 @@ impl WalletRoot {
             ));
         }
 
-        card = card
-            .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .gap_3()
-                    .child(
-                        labeled_field(
-                            "Recipient 0zk address",
-                            render_recipient_picker(
-                                recipient_root,
-                                key,
-                                DeliveryFormKind::Send,
-                                &form.recipient_input,
-                                &form.recipient_value,
-                                form.recipient_suggestions_open,
-                                form.recipient_suggestion_index,
-                                &form.recipient_suggestions_scroll,
-                                &recipient_options,
-                                form.generating,
-                            ),
-                        )
-                        .flex_1()
-                        .min_w(px(0.0)),
+        card = card.child(
+            div()
+                .flex()
+                .items_end()
+                .gap_3()
+                .child(
+                    labeled_field(
+                        "Recipient 0zk address",
+                        render_recipient_picker(
+                            recipient_root,
+                            key,
+                            DeliveryFormKind::Send,
+                            &form.recipient_input,
+                            &form.recipient_value,
+                            form.recipient_suggestions_open,
+                            form.recipient_suggestion_index,
+                            &form.recipient_suggestions_scroll,
+                            &recipient_options,
+                            form.generating,
+                        ),
                     )
-                    .child(
-                        labeled_field(
-                            unit_hint,
-                            private_action_input(&form.amount_input).disabled(form.generating),
-                        )
-                        .w(px(220.0)),
-                    ),
-            )
-            .child(
-                div().flex().items_end().gap_3().justify_end().child(
-                    app_button(
-                        send_element_id(key, "generate"),
-                        if form.generating {
-                            "Preparing..."
-                        } else if submitted {
-                            "Submitted"
-                        } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-                            "Submit via broadcaster"
-                        } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
-                            "Self-broadcast"
-                        } else {
-                            "Generate calldata"
-                        },
+                    .flex_1()
+                    .min_w(px(0.0)),
+                )
+                .child(
+                    labeled_field(
+                        unit_hint,
+                        private_action_input(&form.amount_input).disabled(form.generating),
                     )
-                    .primary()
-                    .loading(form.generating)
-                    .disabled(
-                        !generation_ready
-                            || form.generating
-                            || public_broadcaster_submit_disabled
-                            || self_broadcast_submit_disabled
-                            || submitted,
-                    )
-                    .tooltip(if generation_ready {
-                        "Prepare private transaction"
-                    } else {
-                        "Generation is available after wallet sync finishes"
-                    })
-                    .on_click(move |_event, window, cx| {
-                        submit_root.update(cx, |root, cx| {
-                            root.generate_send_calldata_from_form(key, window, cx);
-                        });
-                    }),
+                    .w(px(220.0)),
                 ),
-            );
+        );
+        if let Some(estimate_state) = sponsored_funding_estimate {
+            card = card.child(render_sponsored_funding_estimate(
+                estimate_root.clone(),
+                key,
+                DeliveryFormKind::Send,
+                &self.sponsored_funding_estimate_display(&estimate_state),
+                form.sponsored_funding_breakdown_open,
+            ));
+        }
+        card = card.child(
+            div().flex().items_end().gap_3().justify_end().child(
+                app_button(
+                    send_element_id(key, "generate"),
+                    if form.generating {
+                        "Preparing..."
+                    } else if submitted {
+                        "Submitted"
+                    } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+                        "Submit via broadcaster"
+                    } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+                        "Self-broadcast"
+                    } else {
+                        "Generate calldata"
+                    },
+                )
+                .primary()
+                .loading(form.generating)
+                .disabled(
+                    !generation_ready
+                        || form.generating
+                        || public_broadcaster_submit_disabled
+                        || self_broadcast_submit_disabled
+                        || submitted,
+                )
+                .tooltip(if generation_ready {
+                    "Prepare private transaction"
+                } else {
+                    "Generation is available after wallet sync finishes"
+                })
+                .on_click(move |_event, window, cx| {
+                    submit_root.update(cx, |root, cx| {
+                        root.generate_send_calldata_from_form(key, window, cx);
+                    });
+                }),
+            ),
+        );
 
         if should_render_public_broadcaster_cost_preview(
             form.delivery_mode,
@@ -416,6 +435,7 @@ impl WalletRoot {
         );
         let mut public_broadcaster_submit_disabled = false;
         let mut self_broadcast_submit_disabled = false;
+        let mut sponsored_funding_estimate = None;
         let generation_ready = self.private_action_generation_ready(asset.chain_id);
         let public_broadcaster_submitted = matches!(
             form.result.as_ref(),
@@ -538,11 +558,20 @@ impl WalletRoot {
                 );
             }
         } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+            sponsored_funding_estimate.clone_from(&form.sponsored_funding_estimate);
+            let effective_funding =
+                effective_self_broadcast_funding_mode(effective_chain, form.self_broadcast_funding);
+            let sponsored_estimate_ready = sponsored_estimate_allows_submission(
+                effective_funding,
+                sponsored_funding_estimate.as_ref(),
+                form.sponsored_estimate_pending,
+            );
             self_broadcast_submit_disabled = form
                 .self_broadcast_gas_payer_uuid
                 .as_deref()
                 .and_then(|uuid| self.selected_self_broadcast_gas_payer_account(Some(uuid)))
-                .is_none();
+                .is_none()
+                || !sponsored_estimate_ready;
             card = card.child(render_self_broadcast_settings(
                 chooser_root,
                 key,
@@ -620,44 +649,53 @@ impl WalletRoot {
                 form.native_top_up_enabled,
                 form.generating,
                 Some(&self.effective_token_registry),
-            ))
-            .child(
-                div().flex().items_end().gap_3().justify_end().child(
-                    app_button(
-                        unshield_element_id(key, "generate"),
-                        if form.generating {
-                            "Preparing..."
-                        } else if submitted {
-                            "Submitted"
-                        } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-                            "Submit via broadcaster"
-                        } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
-                            "Self-broadcast"
-                        } else {
-                            "Generate calldata"
-                        },
-                    )
-                    .primary()
-                    .loading(form.generating)
-                    .disabled(
-                        !generation_ready
-                            || form.generating
-                            || public_broadcaster_submit_disabled
-                            || self_broadcast_submit_disabled
-                            || submitted,
-                    )
-                    .tooltip(if generation_ready {
-                        "Prepare private transaction"
+            ));
+        if let Some(estimate_state) = sponsored_funding_estimate {
+            card = card.child(render_sponsored_funding_estimate(
+                estimate_root.clone(),
+                key,
+                DeliveryFormKind::Unshield,
+                &self.sponsored_funding_estimate_display(&estimate_state),
+                form.sponsored_funding_breakdown_open,
+            ));
+        }
+        card = card.child(
+            div().flex().items_end().gap_3().justify_end().child(
+                app_button(
+                    unshield_element_id(key, "generate"),
+                    if form.generating {
+                        "Preparing..."
+                    } else if submitted {
+                        "Submitted"
+                    } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+                        "Submit via broadcaster"
+                    } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+                        "Self-broadcast"
                     } else {
-                        "Generation is available after wallet sync finishes"
-                    })
-                    .on_click(move |_event, window, cx| {
-                        submit_root.update(cx, |root, cx| {
-                            root.generate_unshield_calldata_from_form(key, window, cx);
-                        });
-                    }),
-                ),
-            );
+                        "Generate calldata"
+                    },
+                )
+                .primary()
+                .loading(form.generating)
+                .disabled(
+                    !generation_ready
+                        || form.generating
+                        || public_broadcaster_submit_disabled
+                        || self_broadcast_submit_disabled
+                        || submitted,
+                )
+                .tooltip(if generation_ready {
+                    "Prepare private transaction"
+                } else {
+                    "Generation is available after wallet sync finishes"
+                })
+                .on_click(move |_event, window, cx| {
+                    submit_root.update(cx, |root, cx| {
+                        root.generate_unshield_calldata_from_form(key, window, cx);
+                    });
+                }),
+            ),
+        );
 
         if should_render_public_broadcaster_cost_preview(
             form.delivery_mode,

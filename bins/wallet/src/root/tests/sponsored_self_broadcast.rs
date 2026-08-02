@@ -1,17 +1,19 @@
 use super::*;
 use crate::root::private_action::{
-    BLOCK_BUILDER_SPONSORSHIP_LABEL, SelfBroadcastFundingMode, SponsoredAuthorizationDisplay,
+    BLOCK_BUILDER_SPONSORSHIP_LABEL, SelfBroadcastFundingMode, SponsoredAssetFee,
+    SponsoredAuthorizationDisplay, SponsoredFundingEstimate, SponsoredFundingEstimateState,
     append_sponsorship_authorization_rows, apply_sponsored_authorization_review,
     effective_self_broadcast_funding_mode, sponsored_authorization_display,
+    sponsored_estimate_allows_submission, sponsored_estimate_failure_state,
     sponsored_funding_choice_visible, sponsored_incentive_from_text,
-    sponsored_self_broadcast_availability_reason,
+    sponsored_self_broadcast_availability_reason, sponsored_signer_balance_snapshot_changed,
 };
 use crate::root::spend_authorization::SpendAuthorizationSummaryRow;
 use alloy::primitives::FixedBytes;
 use wallet_ops::{
-    SponsoredActionKind, SponsoredIncentive,
+    SponsoredActionKind, SponsoredIncentive, SponsorshipError,
     settings::{build_effective_chain_configs, build_effective_token_registry},
-    sponsored_authorization_limit,
+    sponsored_authorization_limit, sponsorship_payment,
 };
 
 #[test]
@@ -104,6 +106,191 @@ fn sponsorship_summary_requires_fresh_explicit_review_without_warning_notes() {
     assert!(!spend_authorization_can_use_cached_password(&summary));
 }
 
+fn sponsored_balance_snapshot(amount: PublicBalanceAmount) -> PublicBalanceSnapshot {
+    PublicBalanceSnapshot {
+        chain_id: 1,
+        refreshed_at: SystemTime::UNIX_EPOCH,
+        accounts: vec![PublicAccountBalance {
+            account: PublicAccountMetadata {
+                public_account_uuid: "sponsored-signer".to_string(),
+                address: Address::from([0x44; 20]),
+                label: None,
+                source: PublicAccountSource::Imported,
+                scope: PublicAccountScope::Global,
+                derivation_index: None,
+                hardware_descriptor: None,
+                status: PublicAccountStatus::Active,
+                display_order: 0,
+            },
+            balances: vec![PublicBalanceEntry {
+                asset: PublicBalanceAsset {
+                    id: PublicAssetId::Native,
+                    symbol: "ETH".to_string(),
+                    decimals: 18,
+                },
+                amount,
+            }],
+        }],
+    }
+}
+
+#[test]
+fn sponsored_balance_dependency_changes_only_when_snapshot_value_changes() {
+    let five = sponsored_balance_snapshot(PublicBalanceAmount::Available(U256::from(5_u8)));
+    let same = sponsored_balance_snapshot(PublicBalanceAmount::Available(U256::from(5_u8)));
+    let six = sponsored_balance_snapshot(PublicBalanceAmount::Available(U256::from(6_u8)));
+    let unavailable = sponsored_balance_snapshot(PublicBalanceAmount::Unavailable);
+
+    assert!(!sponsored_signer_balance_snapshot_changed(
+        Some(&five),
+        &same,
+        1,
+        "sponsored-signer",
+    ));
+    assert!(sponsored_signer_balance_snapshot_changed(
+        Some(&five),
+        &six,
+        1,
+        "sponsored-signer",
+    ));
+    assert!(sponsored_signer_balance_snapshot_changed(
+        Some(&five),
+        &unavailable,
+        1,
+        "sponsored-signer",
+    ));
+}
+
+#[test]
+fn sponsored_estimate_redacts_unclassified_quote_failures() {
+    let error = eyre::eyre!("planner internals");
+
+    assert_eq!(
+        sponsored_estimate_failure_state(1, None, &error),
+        SponsoredFundingEstimateState::Unavailable
+    );
+}
+
+#[test]
+fn sponsored_submission_accepts_a_ready_estimate_during_background_refresh() {
+    let payment =
+        sponsorship_payment(100, 2, U256::ZERO, SponsoredIncentive::Standard).expect("payment");
+    let ready = SponsoredFundingEstimateState::Ready(Box::new(SponsoredFundingEstimate {
+        chain_id: 1,
+        wrapped_native_token: Address::ZERO,
+        expected_payment: payment,
+        maximum_payment: payment,
+        primary_unshield_protocol_fee: None,
+    }));
+
+    assert!(sponsored_estimate_allows_submission(
+        SelfBroadcastFundingMode::PublicBalance,
+        None,
+        false,
+    ));
+    assert!(!sponsored_estimate_allows_submission(
+        SelfBroadcastFundingMode::PrivateSponsorship,
+        None,
+        false,
+    ));
+    assert!(sponsored_estimate_allows_submission(
+        SelfBroadcastFundingMode::PrivateSponsorship,
+        Some(&ready),
+        false,
+    ));
+    assert!(sponsored_estimate_allows_submission(
+        SelfBroadcastFundingMode::PrivateSponsorship,
+        Some(&ready),
+        true,
+    ));
+    assert!(!sponsored_estimate_allows_submission(
+        SelfBroadcastFundingMode::PrivateSponsorship,
+        Some(&SponsoredFundingEstimateState::Unavailable),
+        false,
+    ));
+}
+
+#[test]
+fn sponsored_estimate_preserves_insufficient_wrapped_native_amounts() {
+    let token = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let error: eyre::Report = SponsorshipError::InsufficientWrappedNative {
+        available: U256::from(5_u64),
+        required: U256::from(8_u64),
+    }
+    .into();
+
+    assert_eq!(
+        sponsored_estimate_failure_state(1, Some(token), &error),
+        SponsoredFundingEstimateState::InsufficientWrappedNative {
+            chain_id: 1,
+            token: Some(token),
+            available: U256::from(5_u64),
+            required: U256::from(8_u64),
+        }
+    );
+}
+
+#[test]
+fn sponsored_estimate_does_not_present_an_intermediate_required_amount() {
+    let token = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let error: eyre::Report = SponsorshipError::InsufficientWrappedNativeForQuote {
+        available: U256::from(5_u64),
+    }
+    .into();
+
+    assert_eq!(
+        sponsored_estimate_failure_state(1, Some(token), &error),
+        SponsoredFundingEstimateState::InsufficientWrappedNativeForQuote {
+            chain_id: 1,
+            token: Some(token),
+            available: U256::from(5_u64),
+        }
+    );
+}
+
+#[test]
+fn sponsored_display_accounting_reconciles_expected_cost() {
+    let expected_payment = sponsorship_payment(100, 1, U256::ZERO, SponsoredIncentive::Standard)
+        .expect("expected payment");
+    let maximum_payment = sponsorship_payment(100, 2, U256::ZERO, SponsoredIncentive::Standard)
+        .expect("maximum payment");
+    let estimate = SponsoredFundingEstimate {
+        chain_id: 1,
+        wrapped_native_token: Address::ZERO,
+        expected_payment,
+        maximum_payment,
+        primary_unshield_protocol_fee: Some(SponsoredAssetFee {
+            token: Address::from([0x11; 20]),
+            amount: U256::from(7_500_u64),
+        }),
+    };
+
+    assert_eq!(
+        maximum_payment.reimbursement_base,
+        maximum_payment.outer_gas_cap + maximum_payment.funding_gas_cap
+    );
+    assert_eq!(
+        estimate.builder_premium(),
+        maximum_payment.gross_wrapped_native_spend - maximum_payment.reimbursement_base
+    );
+    assert_eq!(
+        estimate.expected_excess_deposit(),
+        maximum_payment.funding_principal - expected_payment.outer_gas_cap
+    );
+    assert_eq!(
+        estimate.expected_network_gas_cost(),
+        expected_payment.outer_gas_cap + maximum_payment.funding_gas_cap
+    );
+    assert_eq!(
+        estimate.expected_sponsorship_cost(),
+        maximum_payment.gross_wrapped_native_spend - estimate.expected_excess_deposit()
+    );
+    assert_eq!(
+        estimate.expected_sponsorship_cost(),
+        estimate.expected_network_gas_cost() + estimate.builder_premium()
+    );
+}
+
 #[test]
 fn sponsorship_summary_contains_only_user_relevant_formatted_maxima() {
     let display = SponsoredAuthorizationDisplay {
@@ -135,7 +322,7 @@ fn sponsorship_summary_contains_only_user_relevant_formatted_maxima() {
             ("Builder incentive".to_owned(), "5%".to_owned()),
             ("Transaction signer".to_owned(), "Account #6".to_owned()),
             (
-                "Gross sponsorship wrapped-native spend".to_owned(),
+                "Gross sponsorship spend".to_owned(),
                 display.gross_wrapped_native_spend,
             ),
             ("Maximum fee per gas".to_owned(), display.max_fee_per_gas),

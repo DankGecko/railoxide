@@ -762,6 +762,14 @@ impl WalletRoot {
                 if clear_spend_authorization {
                     root.clear_spend_authorization(cx);
                 }
+                if progress_error.is_some()
+                    || matches!(
+                        sponsored_progress_outcome.as_ref(),
+                        Some(SponsoredSelfBroadcastSessionOutcome::Stopped { .. })
+                    )
+                {
+                    root.debounce_sponsored_funding_estimate(DeliveryFormKind::Send, key, cx);
+                }
                 if let Some(result) = progress_result {
                     root.finish_private_broadcaster_progress(
                         DeliveryFormKind::Send,
@@ -1647,6 +1655,14 @@ impl WalletRoot {
                 }
                 if clear_spend_authorization {
                     root.clear_spend_authorization(cx);
+                }
+                if progress_error.is_some()
+                    || matches!(
+                        sponsored_progress_outcome.as_ref(),
+                        Some(SponsoredSelfBroadcastSessionOutcome::Stopped { .. })
+                    )
+                {
+                    root.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
                 }
                 if refresh_public_balances {
                     root.schedule_public_balance_refresh(cx);

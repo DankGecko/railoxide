@@ -392,10 +392,14 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let mut reschedule_estimates = Vec::new();
+        let mut reschedule_sponsored_estimates = Vec::new();
         let mut refresh_native_top_up = Vec::new();
         for (key, form) in &mut self.send_forms {
             if key.chain_id != snapshot.chain_id {
                 continue;
+            }
+            if !form.generating {
+                reschedule_sponsored_estimates.push((DeliveryFormKind::Send, *key));
             }
             let updated = refresh_form_asset_from_snapshot(
                 snapshot,
@@ -418,6 +422,9 @@ impl WalletRoot {
         for (key, form) in &mut self.unshield_forms {
             if key.chain_id != snapshot.chain_id {
                 continue;
+            }
+            if !form.generating {
+                reschedule_sponsored_estimates.push((DeliveryFormKind::Unshield, *key));
             }
             refresh_native_top_up.push(*key);
             let updated = refresh_form_asset_from_snapshot(
@@ -443,6 +450,9 @@ impl WalletRoot {
         }
         for (kind, key) in reschedule_estimates {
             self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+        }
+        for (kind, key) in reschedule_sponsored_estimates {
+            self.revalidate_sponsored_funding_estimate(kind, key, cx);
         }
     }
 
@@ -588,6 +598,7 @@ impl WalletRoot {
         if delivery_mode == DeliveryMode::PublicBroadcaster {
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         }
+        self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
     pub(in crate::root) fn unshield_delivery_affects_visible_public_account(

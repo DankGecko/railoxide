@@ -597,6 +597,19 @@ fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens(
             .expect("add unshield receiver amount"),
         gross
     );
+    assert_eq!(
+        crate::unshield_protocol_fee_amount_for_fee_mode(
+            entered,
+            FeeHandlingMode::DeductFromAmount,
+        )
+        .expect("deduct protocol fee"),
+        uint!(2_500_U256)
+    );
+    assert_eq!(
+        crate::unshield_protocol_fee_amount_for_fee_mode(entered, FeeHandlingMode::AddToAmount,)
+            .expect("add protocol fee"),
+        gross - entered
+    );
 
     let same_token_add = public_broadcaster_amount_split_for_tokens_and_protocol(
         entered,
