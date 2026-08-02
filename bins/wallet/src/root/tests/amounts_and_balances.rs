@@ -1,6 +1,8 @@
 use super::*;
 use crate::root::chain_load::SyncStatusContext;
-use crate::root::public_action::public_action_progress_steps_for_source;
+use crate::root::public_action::{
+    maximum_gas_cost_is_significant, public_action_progress_steps_for_source,
+};
 use crate::root::public_balances::{
     public_account_usd_total_label_for_chain, public_balance_entry_for_chain,
 };
@@ -1423,6 +1425,26 @@ fn public_action_native_max_subtracts_estimated_gas_reserve() {
         public_action_max_amount_after_reserve(U256::from(100_u64), U256::from(101_u64)),
         None,
     );
+}
+
+#[test]
+fn public_action_maximum_gas_cost_requires_ten_percent_difference() {
+    assert!(!maximum_gas_cost_is_significant(
+        U256::from(100_u8),
+        U256::from(100_u8),
+    ));
+    assert!(!maximum_gas_cost_is_significant(
+        U256::from(100_u8),
+        U256::from(109_u8),
+    ));
+    assert!(maximum_gas_cost_is_significant(
+        U256::from(100_u8),
+        U256::from(110_u8),
+    ));
+    assert!(maximum_gas_cost_is_significant(
+        U256::ZERO,
+        U256::from(1_u8),
+    ));
 }
 
 #[test]

@@ -49,12 +49,14 @@ fn self_broadcast_fee_samples_ignore_zero_tips_when_non_zero_exists() {
         SelfBroadcastFeeSample {
             rpc_gas_price: Some(100),
             max_priority_fee_per_gas: Some(0),
+            current_base_fee_per_gas: Some(70),
             next_base_fee_per_gas: Some(80),
             priority_fee_rewards: vec![0, 0, 0],
         },
         SelfBroadcastFeeSample {
             rpc_gas_price: Some(110),
             max_priority_fee_per_gas: Some(0),
+            current_base_fee_per_gas: Some(75),
             next_base_fee_per_gas: Some(90),
             priority_fee_rewards: vec![0, 5, 7],
         },
@@ -62,9 +64,26 @@ fn self_broadcast_fee_samples_ignore_zero_tips_when_non_zero_exists() {
 
     let quote = self_broadcast_quote_from_fee_samples(&samples).expect("fee quote");
 
-    assert_eq!(quote.suggested_max_priority_fee_per_gas, 7);
+    assert_eq!(quote.suggested_max_priority_fee_per_gas, 5);
     assert_eq!(quote.rpc_gas_price, 110);
+    assert_eq!(quote.current_base_fee_per_gas, Some(75));
     assert_eq!(quote.suggested_max_fee_per_gas, 132);
+}
+
+#[test]
+fn self_broadcast_fee_samples_use_lower_quartile_priority_suggestion() {
+    let samples = [10, 20, 30, 40, 50].map(|tip| SelfBroadcastFeeSample {
+        rpc_gas_price: Some(100),
+        max_priority_fee_per_gas: Some(tip),
+        current_base_fee_per_gas: Some(70),
+        next_base_fee_per_gas: Some(80),
+        priority_fee_rewards: Vec::new(),
+    });
+
+    let quote = self_broadcast_quote_from_fee_samples(&samples).expect("fee quote");
+
+    assert_eq!(quote.suggested_max_priority_fee_per_gas, 20);
+    assert_eq!(quote.suggested_max_fee_per_gas, 120);
 }
 
 #[test]
@@ -72,6 +91,7 @@ fn self_broadcast_fee_samples_can_use_rpc_gas_price_as_tip_fallback() {
     let samples = [SelfBroadcastFeeSample {
         rpc_gas_price: Some(100),
         max_priority_fee_per_gas: Some(0),
+        current_base_fee_per_gas: None,
         next_base_fee_per_gas: None,
         priority_fee_rewards: vec![0],
     }];
@@ -93,6 +113,7 @@ fn self_broadcast_fee_samples_prefer_non_zero_tip_over_rpc_gas_price_fallback() 
     let samples = [SelfBroadcastFeeSample {
         rpc_gas_price: Some(100),
         max_priority_fee_per_gas: Some(5),
+        current_base_fee_per_gas: None,
         next_base_fee_per_gas: None,
         priority_fee_rewards: vec![0],
     }];
@@ -112,6 +133,7 @@ fn self_broadcast_fee_samples_include_fee_history_base_fee_cap() {
     let samples = [SelfBroadcastFeeSample {
         rpc_gas_price: Some(100),
         max_priority_fee_per_gas: Some(1),
+        current_base_fee_per_gas: Some(190),
         next_base_fee_per_gas: Some(200),
         priority_fee_rewards: vec![10],
     }];
@@ -120,6 +142,33 @@ fn self_broadcast_fee_samples_include_fee_history_base_fee_cap() {
 
     assert_eq!(quote.suggested_max_priority_fee_per_gas, 10);
     assert_eq!(quote.suggested_max_fee_per_gas, 250);
+}
+
+#[test]
+fn eip1559_projection_uses_cushioned_current_base_and_caps_at_max_fee() {
+    let quote = SelfBroadcastGasFeeQuote {
+        rpc_gas_price: 100,
+        current_base_fee_per_gas: Some(100),
+        suggested_max_fee_per_gas: 120,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+    let projection = crate::eip1559_gas_cost_projection(10, quote, 1_000, 2);
+
+    assert_eq!(projection.expected_fee_per_gas, 115);
+    assert_eq!(projection.expected_cost, U256::from(1_150_u64));
+    assert_eq!(projection.maximum_cost, U256::from(10_000_u64));
+    assert_eq!(crate::expected_eip1559_fee_per_gas(quote, 110, 2), 110);
+}
+
+#[test]
+fn eip1559_projection_falls_back_to_max_fee_without_fee_history() {
+    let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(100);
+
+    assert_eq!(
+        crate::expected_eip1559_fee_per_gas(quote, 1_000, 500),
+        1_000
+    );
+    assert_eq!(crate::expected_eip1559_fee_per_gas(quote, 80, 1), 80);
 }
 
 #[test]

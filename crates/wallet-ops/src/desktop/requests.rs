@@ -194,6 +194,7 @@ pub const SELF_BROADCAST_AUTO_MAX_FEE_DENOMINATOR: u128 = 100;
 pub const SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS: u128 = 1;
 pub const SELF_BROADCAST_REPLACEMENT_BUMP_NUMERATOR: u128 = 9;
 pub const SELF_BROADCAST_REPLACEMENT_BUMP_DENOMINATOR: u128 = 8;
+pub const EIP1559_EXPECTED_BASE_FEE_DENOMINATOR: u128 = 8;
 pub(crate) const SELF_BROADCAST_FEE_HISTORY_BLOCKS: u64 = 5;
 pub(crate) const SELF_BROADCAST_FEE_HISTORY_REWARD_PERCENTILES: [f64; 3] = [25.0, 50.0, 75.0];
 pub(crate) const SELF_BROADCAST_DIRECT_FEE_QUOTE_GRACE: Duration = Duration::from_millis(750);
@@ -210,8 +211,17 @@ pub(crate) enum SelfBroadcastTipFallback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelfBroadcastGasFeeQuote {
     pub rpc_gas_price: u128,
+    pub current_base_fee_per_gas: Option<u128>,
     pub suggested_max_fee_per_gas: u128,
     pub suggested_max_priority_fee_per_gas: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eip1559GasCostProjection {
+    pub expected_fee_per_gas: u128,
+    pub maximum_fee_per_gas: u128,
+    pub expected_cost: U256,
+    pub maximum_cost: U256,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -279,9 +289,45 @@ impl SelfBroadcastGasFeeQuote {
         };
         Self {
             rpc_gas_price,
+            current_base_fee_per_gas: None,
             suggested_max_fee_per_gas,
             suggested_max_priority_fee_per_gas: SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS,
         }
+    }
+}
+
+#[must_use]
+pub fn expected_eip1559_fee_per_gas(
+    quote: SelfBroadcastGasFeeQuote,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> u128 {
+    let expected = quote
+        .current_base_fee_per_gas
+        .map_or(max_fee_per_gas, |base_fee| {
+            let cushion = base_fee / EIP1559_EXPECTED_BASE_FEE_DENOMINATOR
+                + u128::from(base_fee % EIP1559_EXPECTED_BASE_FEE_DENOMINATOR != 0);
+            base_fee
+                .saturating_add(cushion)
+                .saturating_add(max_priority_fee_per_gas)
+        });
+    expected.min(max_fee_per_gas)
+}
+
+#[must_use]
+pub fn eip1559_gas_cost_projection(
+    gas_limit: u64,
+    quote: SelfBroadcastGasFeeQuote,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Eip1559GasCostProjection {
+    let expected_fee_per_gas =
+        expected_eip1559_fee_per_gas(quote, max_fee_per_gas, max_priority_fee_per_gas);
+    Eip1559GasCostProjection {
+        expected_fee_per_gas,
+        maximum_fee_per_gas: max_fee_per_gas,
+        expected_cost: U256::from(gas_limit) * U256::from(expected_fee_per_gas),
+        maximum_cost: U256::from(gas_limit) * U256::from(max_fee_per_gas),
     }
 }
 

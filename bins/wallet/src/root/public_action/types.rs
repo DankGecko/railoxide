@@ -2,6 +2,7 @@ use super::*;
 
 pub(in crate::root) const PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI: u128 = 1_000_000_000;
 
+#[derive(Clone)]
 pub(in crate::root) struct PublicSendDraft {
     pub(in crate::root) chain_id: u64,
     pub(in crate::root) asset: PublicAssetId,
@@ -135,6 +136,7 @@ pub(in crate::root) const fn advanced_public_send_estimate_required_message(
     }
 }
 
+#[derive(Clone)]
 pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) chain_id: u64,
     pub(in crate::root) asset: PublicAssetId,
@@ -153,8 +155,30 @@ pub(in crate::root) struct PublicShieldDraft {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::root) struct PublicActionFeeDisplay {
-    pub(in crate::root) gas_cost: Option<String>,
+    pub(in crate::root) expected_gas_cost: Option<String>,
+    pub(in crate::root) maximum_gas_cost: Option<String>,
+    pub(in crate::root) show_maximum_gas_cost: bool,
     pub(in crate::root) protocol_fee: Option<String>,
+}
+
+impl PublicActionFeeDisplay {
+    pub(in crate::root) fn visible_maximum_gas_cost(&self) -> Option<&str> {
+        self.show_maximum_gas_cost
+            .then_some(self.maximum_gas_cost.as_deref())
+            .flatten()
+    }
+}
+
+pub(in crate::root) fn maximum_gas_cost_is_significant(
+    expected_gas_cost: U256,
+    maximum_gas_cost: U256,
+) -> bool {
+    if maximum_gas_cost <= expected_gas_cost {
+        return false;
+    }
+    (maximum_gas_cost - expected_gas_cost)
+        .checked_mul(U256::from(10_u8))
+        .is_none_or(|scaled_difference| scaled_difference >= expected_gas_cost)
 }
 
 pub(in crate::root) fn public_send_authorization_summary(
@@ -196,14 +220,20 @@ pub(in crate::root) fn public_send_authorization_summary(
             SpendAuthorizationSummaryRow::new("Data hash", metadata.data_hash),
             SpendAuthorizationSummaryRow::new("Gas limit", format_gas_limit(estimate.gas_limit)),
             SpendAuthorizationSummaryRow::new(
-                "Maximum gas cost",
+                "Expected gas cost",
                 draft
                     .fee_display
-                    .gas_cost
+                    .expected_gas_cost
                     .clone()
-                    .expect("advanced Public Send draft has a gas-cost display"),
+                    .expect("advanced Public Send draft has an expected gas-cost display"),
             ),
         ]);
+        if let Some(maximum_gas_cost) = draft.fee_display.visible_maximum_gas_cost() {
+            rows.push(SpendAuthorizationSummaryRow::new(
+                "Maximum gas cost",
+                maximum_gas_cost,
+            ));
+        }
         return SpendAuthorizationSummary::new(
             "Advanced public transaction",
             public_send_authorization_detail(draft.public_account_source),
@@ -219,10 +249,7 @@ pub(in crate::root) fn public_send_authorization_summary(
         SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
         SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
     ];
-    rows.extend(public_action_authorization_fee_rows(
-        PublicActionMode::Send,
-        &draft.fee_display,
-    ));
+    rows.extend(public_action_authorization_fee_rows(&draft.fee_display));
     SpendAuthorizationSummary::new(
         "Public send",
         public_send_authorization_detail(draft.public_account_source),
@@ -300,10 +327,7 @@ pub(in crate::root) fn public_shield_authorization_summary(
         SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
         SpendAuthorizationSummaryRow::new("Recipient", "Selected private wallet"),
     ];
-    rows.extend(public_action_authorization_fee_rows(
-        PublicActionMode::Shield,
-        &draft.fee_display,
-    ));
+    rows.extend(public_action_authorization_fee_rows(&draft.fee_display));
     SpendAuthorizationSummary::new(
         "Public shield",
         public_shield_authorization_detail(draft.public_account_source),
@@ -312,17 +336,25 @@ pub(in crate::root) fn public_shield_authorization_summary(
 }
 
 fn public_action_authorization_fee_rows(
-    mode: PublicActionMode,
     display: &PublicActionFeeDisplay,
 ) -> Vec<SpendAuthorizationSummaryRow> {
     let mut rows = vec![SpendAuthorizationSummaryRow::new(
-        "Estimated gas cost (max fee)",
-        display.gas_cost.as_deref().unwrap_or("Unavailable"),
+        "Expected gas cost",
+        display
+            .expected_gas_cost
+            .as_deref()
+            .unwrap_or("Unavailable"),
     )];
-    if mode == PublicActionMode::Shield {
+    if let Some(maximum_gas_cost) = display.visible_maximum_gas_cost() {
+        rows.push(SpendAuthorizationSummaryRow::new(
+            "Maximum gas cost",
+            maximum_gas_cost,
+        ));
+    }
+    if let Some(protocol_fee) = display.protocol_fee.as_deref() {
         rows.push(SpendAuthorizationSummaryRow::new(
             public_action_protocol_fee_label(),
-            display.protocol_fee.as_deref().unwrap_or("Unavailable"),
+            protocol_fee,
         ));
     }
     rows

@@ -13,7 +13,8 @@ use super::types::{
 };
 use crate::settings::EffectiveChainConfig;
 use crate::{
-    GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS, SelfBroadcastTipFallback,
+    Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS,
+    SelfBroadcastGasFeeQuote, SelfBroadcastTipFallback, eip1559_gas_cost_projection,
     query_rpc_pool_with_http_client, railgun_protocol_fee_amount, resolve_self_broadcast_gas_fee,
     self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback,
 };
@@ -23,7 +24,7 @@ const PUBLIC_ERC20_SEND_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_WRAP_GAS_UNITS: u64 = 50_000;
 pub(super) const PUBLIC_NATIVE_APPROVE_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_SHIELD_GAS_UNITS: u64 = 650_000;
-pub(super) const PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS: u64 = 800_000;
+pub(super) const PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS: u64 = 900_000;
 const PUBLIC_ACTION_BNB_CHAIN_ID: u64 = 56;
 
 #[must_use]
@@ -61,13 +62,15 @@ pub fn estimate_public_action_gas_cost(
     asset: PublicAssetId,
     gas_fee: PublicActionGasFeeSelection,
     quote: Option<PublicActionGasFeeQuote>,
-) -> Result<U256> {
+) -> Result<Eip1559GasCostProjection> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let max_fee_per_gas = match gas_fee {
+    let (max_fee_per_gas, max_priority_fee_per_gas) = match gas_fee {
         PublicActionGasFeeSelection::Auto => {
-            quote
-                .ok_or_else(|| eyre!("public action gas fee quote is not ready"))?
-                .suggested_max_fee_per_gas
+            let quote = quote.ok_or_else(|| eyre!("public action gas fee quote is not ready"))?;
+            (
+                quote.suggested_max_fee_per_gas,
+                quote.suggested_max_priority_fee_per_gas,
+            )
         }
         PublicActionGasFeeSelection::Custom {
             max_fee_per_gas,
@@ -81,12 +84,19 @@ pub fn estimate_public_action_gas_cost(
                     "max priority fee per gas cannot exceed max fee per gas"
                 ));
             }
-            max_fee_per_gas
+            (max_fee_per_gas, max_priority_fee_per_gas)
         }
     };
     let gas_units =
         public_action_estimated_gas_units_with_buffer(kind, asset, chain.gas.gas_limit_buffer);
-    Ok(U256::from(gas_units) * U256::from(max_fee_per_gas))
+    let quote =
+        quote.unwrap_or_else(|| SelfBroadcastGasFeeQuote::from_rpc_gas_price(max_fee_per_gas));
+    Ok(eip1559_gas_cost_projection(
+        gas_units,
+        quote,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    ))
 }
 
 #[must_use]
@@ -173,6 +183,12 @@ pub async fn estimate_public_advanced_transaction(
             Ok(estimated_gas) => {
                 let gas_limit =
                     buffered_advanced_gas_limit(estimated_gas, chain.gas.gas_limit_buffer);
+                let gas_cost = eip1559_gas_cost_projection(
+                    gas_limit,
+                    quote,
+                    resolved.max_fee_per_gas,
+                    resolved.max_priority_fee_per_gas,
+                );
                 return Ok(PublicAdvancedTransactionEstimate {
                     payload_fingerprint: public_advanced_transaction_payload_fingerprint(
                         request.chain_id,
@@ -184,7 +200,9 @@ pub async fn estimate_public_advanced_transaction(
                     gas_limit,
                     max_fee_per_gas: resolved.max_fee_per_gas,
                     max_priority_fee_per_gas: resolved.max_priority_fee_per_gas,
-                    max_gas_cost: U256::from(gas_limit) * U256::from(resolved.max_fee_per_gas),
+                    expected_fee_per_gas: gas_cost.expected_fee_per_gas,
+                    expected_gas_cost: gas_cost.expected_cost,
+                    max_gas_cost: gas_cost.maximum_cost,
                 });
             }
             Err(error) => {

@@ -652,6 +652,7 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     let token = address!("0x3333333333333333333333333333333333333333");
     let quote = PublicActionGasFeeQuote {
         rpc_gas_price: 2,
+        current_base_fee_per_gas: Some(1),
         suggested_max_fee_per_gas: 3,
         suggested_max_priority_fee_per_gas: 1,
     };
@@ -666,7 +667,7 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     )
     .expect("native send estimate");
     assert_eq!(
-        native_send,
+        native_send.maximum_cost,
         U256::from((PUBLIC_NATIVE_SEND_GAS_UNITS + GAS_LIMIT_BUFFER) * 3)
     );
 
@@ -679,7 +680,10 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
         Some(quote),
     )
     .expect("erc20 send estimate");
-    assert_eq!(erc20_send, U256::from((65_000 + GAS_LIMIT_BUFFER) * 3));
+    assert_eq!(
+        erc20_send.maximum_cost,
+        U256::from((65_000 + GAS_LIMIT_BUFFER) * 3)
+    );
 
     let native_shield = estimate_public_action_gas_cost(
         1,
@@ -694,7 +698,7 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     )
     .expect("native shield estimate");
     assert_eq!(
-        native_shield,
+        native_shield.maximum_cost,
         U256::from(PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS + GAS_LIMIT_BUFFER)
     );
     let erc20_shield = estimate_public_action_gas_cost(
@@ -710,7 +714,7 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     )
     .expect("erc20 shield estimate");
     assert_eq!(
-        erc20_shield,
+        erc20_shield.maximum_cost,
         U256::from(
             PUBLIC_NATIVE_APPROVE_GAS_UNITS
                 + PUBLIC_NATIVE_SHIELD_GAS_UNITS

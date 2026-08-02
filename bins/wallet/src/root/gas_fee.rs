@@ -53,6 +53,7 @@ pub(super) struct Eip1559GasFeeEditorState {
     pub(super) refreshing: bool,
     pub(super) refresh_id: u64,
     pub(super) error: Option<Arc<str>>,
+    pub(super) quote_error: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -148,6 +149,7 @@ impl Eip1559GasFeeEditorState {
             refreshing: false,
             refresh_id: 0,
             error: None,
+            quote_error: None,
         }
     }
 
@@ -325,6 +327,14 @@ pub(super) fn render_eip1559_gas_fee_editor(
         .child(render_gas_fee_inputs(root, target, state, disabled))
         .when_some(state.error.as_ref(), |this, error| {
             this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
+        })
+        .when_some(state.quote_error.as_ref(), |this, error| {
+            let color = if state.quote.is_some() {
+                theme::WARNING
+            } else {
+                theme::DANGER
+            };
+            this.child(app_muted_text(error.to_string()).text_color(rgb(color)))
         })
 }
 

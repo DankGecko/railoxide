@@ -519,6 +519,7 @@ impl SelfBroadcastFeeQuoteTimeoutPolicy {
 pub(crate) struct SelfBroadcastFeeSample {
     pub(crate) rpc_gas_price: Option<u128>,
     pub(crate) max_priority_fee_per_gas: Option<u128>,
+    pub(crate) current_base_fee_per_gas: Option<u128>,
     pub(crate) next_base_fee_per_gas: Option<u128>,
     pub(crate) priority_fee_rewards: Vec<u128>,
 }
@@ -533,10 +534,17 @@ impl SelfBroadcastFeeSample {
             return Self {
                 rpc_gas_price,
                 max_priority_fee_per_gas,
+                current_base_fee_per_gas: None,
                 next_base_fee_per_gas: None,
                 priority_fee_rewards: Vec::new(),
             };
         };
+        let current_base_fee_per_gas = fee_history
+            .base_fee_per_gas
+            .len()
+            .checked_sub(2)
+            .and_then(|index| fee_history.base_fee_per_gas.get(index))
+            .copied();
         let next_base_fee_per_gas = fee_history.base_fee_per_gas.last().copied();
         let priority_fee_rewards = fee_history
             .reward
@@ -547,6 +555,7 @@ impl SelfBroadcastFeeSample {
         Self {
             rpc_gas_price,
             max_priority_fee_per_gas,
+            current_base_fee_per_gas,
             next_base_fee_per_gas,
             priority_fee_rewards,
         }
@@ -705,6 +714,11 @@ pub(crate) fn self_broadcast_quote_from_fee_samples_with_tip_fallback(
             .iter()
             .filter_map(|sample| sample.next_base_fee_per_gas),
     );
+    let mut current_base_fees = non_zero_values(
+        samples
+            .iter()
+            .filter_map(|sample| sample.current_base_fee_per_gas),
+    );
 
     let rpc_gas_price = upper_quartile(&mut gas_prices);
     let fallback_tip = match tip_fallback {
@@ -713,8 +727,8 @@ pub(crate) fn self_broadcast_quote_from_fee_samples_with_tip_fallback(
             .unwrap_or(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS)
             .max(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS),
     };
-    let selected_tip = upper_quartile(&mut fee_history_rewards)
-        .or_else(|| upper_quartile(&mut priority_fee_suggestions))
+    let selected_tip = lower_quartile(&mut fee_history_rewards)
+        .or_else(|| lower_quartile(&mut priority_fee_suggestions))
         .unwrap_or(fallback_tip)
         .max(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS);
     let gas_price_max_fee = rpc_gas_price.map_or(0, self_broadcast_auto_max_fee_per_gas);
@@ -724,6 +738,7 @@ pub(crate) fn self_broadcast_quote_from_fee_samples_with_tip_fallback(
     let suggested_max_fee_per_gas = gas_price_max_fee.max(fee_history_max_fee).max(selected_tip);
     Some(SelfBroadcastGasFeeQuote {
         rpc_gas_price: rpc_gas_price.unwrap_or(suggested_max_fee_per_gas),
+        current_base_fee_per_gas: upper_quartile(&mut current_base_fees),
         suggested_max_fee_per_gas,
         suggested_max_priority_fee_per_gas: selected_tip.min(suggested_max_fee_per_gas),
     })
@@ -731,6 +746,15 @@ pub(crate) fn self_broadcast_quote_from_fee_samples_with_tip_fallback(
 
 pub(super) fn non_zero_values(values: impl IntoIterator<Item = u128>) -> Vec<u128> {
     values.into_iter().filter(|value| *value > 0).collect()
+}
+
+pub(super) fn lower_quartile(values: &mut [u128]) -> Option<u128> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let index = values.len().saturating_sub(1) / 4;
+    values.get(index).copied()
 }
 
 pub(super) fn upper_quartile(values: &mut [u128]) -> Option<u128> {
@@ -2012,6 +2036,21 @@ mod tests {
 
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn fee_history_sample_uses_current_and_next_block_base_fees() {
+        let sample = SelfBroadcastFeeSample::from_parts(
+            Some(120),
+            Some(3),
+            Some(FeeHistory {
+                base_fee_per_gas: vec![70, 80, 90],
+                ..FeeHistory::default()
+            }),
+        );
+
+        assert_eq!(sample.current_base_fee_per_gas, Some(80));
+        assert_eq!(sample.next_base_fee_per_gas, Some(90));
+    }
 
     fn sponsored_input(tree: u32, position: u64, value: u64) -> Utxo {
         Utxo::new(

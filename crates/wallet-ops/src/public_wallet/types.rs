@@ -194,6 +194,8 @@ pub struct PublicAdvancedTransactionEstimate {
     pub gas_limit: u64,
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
+    pub expected_fee_per_gas: u128,
+    pub expected_gas_cost: U256,
     pub max_gas_cost: U256,
 }
 

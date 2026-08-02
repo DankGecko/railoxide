@@ -99,11 +99,10 @@ pub(in crate::root) fn public_action_context_row(label: &'static str, value: Str
 }
 
 pub(in crate::root) fn render_public_action_fee_estimate(
-    mode: PublicActionMode,
     display: &PublicActionFeeDisplay,
     gas_pending: bool,
 ) -> gpui::Div {
-    let gas_cost = display.gas_cost.clone().unwrap_or_else(|| {
+    let expected_gas_cost = display.expected_gas_cost.clone().unwrap_or_else(|| {
         if gas_pending {
             "Estimating...".to_string()
         } else {
@@ -121,14 +120,20 @@ pub(in crate::root) fn render_public_action_fee_estimate(
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(app_strong_text("Estimated fees"))
-        .child(public_action_fee_row("Gas cost (max fee)", gas_cost))
-        .when(mode == PublicActionMode::Shield, |this| {
+        .child(public_action_fee_row(
+            "Expected gas cost",
+            expected_gas_cost,
+        ))
+        .when_some(display.visible_maximum_gas_cost(), |this, maximum| {
+            this.child(public_action_muted_fee_row(
+                "Maximum gas cost",
+                maximum.to_string(),
+            ))
+        })
+        .when_some(display.protocol_fee.as_ref(), |this, protocol_fee| {
             this.child(public_action_fee_row(
                 public_action_protocol_fee_label(),
-                display
-                    .protocol_fee
-                    .clone()
-                    .unwrap_or_else(|| "Enter an amount".to_string()),
+                protocol_fee.clone(),
             ))
         })
 }
@@ -136,9 +141,13 @@ pub(in crate::root) fn render_public_action_fee_estimate(
 pub(in crate::root) fn render_public_advanced_transaction_estimate(
     chain_id: u64,
     estimate: &PublicAdvancedTransactionEstimate,
-    usd_value: Option<String>,
+    expected_usd_value: Option<String>,
+    maximum_usd_value: Option<String>,
 ) -> AnyElement {
-    let token_value = format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
+    let expected_token_value =
+        format_native_token_amount_for_display(chain_id, estimate.expected_gas_cost);
+    let maximum_token_value =
+        format_native_token_amount_for_display(chain_id, estimate.max_gas_cost);
     div()
         .w_full()
         .min_w(px(0.0))
@@ -156,9 +165,18 @@ pub(in crate::root) fn render_public_advanced_transaction_estimate(
             format_gas_limit(estimate.gas_limit),
         ))
         .child(public_action_fee_row(
-            "Maximum gas cost",
-            public_action_fee_value_label(&token_value, usd_value),
+            "Expected gas cost",
+            public_action_fee_value_label(&expected_token_value, expected_usd_value),
         ))
+        .when(
+            maximum_gas_cost_is_significant(estimate.expected_gas_cost, estimate.max_gas_cost),
+            |this| {
+                this.child(public_action_muted_fee_row(
+                    "Maximum gas cost",
+                    public_action_fee_value_label(&maximum_token_value, maximum_usd_value),
+                ))
+            },
+        )
         .into_any_element()
 }
 
@@ -172,6 +190,23 @@ fn public_action_fee_row(label: impl Into<SharedString>, value: String) -> gpui:
         .child(app_muted_text(label).flex_none())
         .child(
             app_strong_text(value)
+                .min_w(px(0.0))
+                .text_size(px(13.0))
+                .font_family(APP_MONO_FONT_FAMILY)
+                .whitespace_normal(),
+        )
+}
+
+fn public_action_muted_fee_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(app_muted_text(label).flex_none())
+        .child(
+            app_muted_text(value)
                 .min_w(px(0.0))
                 .text_size(px(13.0))
                 .font_family(APP_MONO_FONT_FAMILY)

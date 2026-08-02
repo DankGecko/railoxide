@@ -21,13 +21,13 @@ use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    PublicActionCommand, PublicActionCommandKind, PublicActionCommandSender,
-    PublicActionGasFeeSelection, PublicActionKind, PublicActionProgressStatus,
-    PublicActionProgressStep, PublicActionProgressUpdate, PublicActionSessionEvent,
-    PublicAdvancedTransactionAuthorization, PublicAdvancedTransactionEstimate,
-    PublicAdvancedTransactionEstimateRequest, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceEntry, PublicSendRequest, PublicShieldRequest, PublicTransactionIntent,
-    RAILGUN_PROTOCOL_FEE_BPS, estimate_public_action_gas_cost,
+    Eip1559GasCostProjection, PublicActionCommand, PublicActionCommandKind,
+    PublicActionCommandSender, PublicActionGasFeeSelection, PublicActionKind,
+    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
+    PublicActionSessionEvent, PublicAdvancedTransactionAuthorization,
+    PublicAdvancedTransactionEstimate, PublicAdvancedTransactionEstimateRequest, PublicAssetId,
+    PublicBalanceAmount, PublicBalanceEntry, PublicSendRequest, PublicShieldRequest,
+    PublicTransactionIntent, RAILGUN_PROTOCOL_FEE_BPS, estimate_public_action_gas_cost,
     estimate_public_advanced_transaction, estimate_public_native_action_gas_reserve,
     format_protocol_fee_percentage, parse_send_amount, public_action_replacement_bumped_fee,
     public_shield_protocol_fee_amount, quote_public_action_gas_fee,

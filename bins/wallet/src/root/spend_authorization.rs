@@ -40,6 +40,7 @@ use zeroize::Zeroizing;
 use crate::assets::WalletIconSource;
 
 use super::private_action::UnshieldAssetKey;
+use super::public_action::{PublicSendDraft, PublicShieldDraft};
 use super::vault::hardware_device_label;
 use super::{
     WalletRoot, dialog_content_max_height, dialog_max_height, new_masked_input,
@@ -111,7 +112,7 @@ impl SpendAuthorizationCache {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub(super) enum SpendAuthorizationIntent {
     PrivateSend(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
     PrivateSendSelfBroadcastGasPassword(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
@@ -119,8 +120,8 @@ pub(super) enum SpendAuthorizationIntent {
     PrivateUnshieldSelfBroadcastGasPassword(UnshieldAssetKey, Option<SponsoredAuthorizationLimit>),
     BlockedShieldRefund(BlockedShieldRescueUtxoId),
     BlockedShieldRefundGasPassword(BlockedShieldRescueUtxoId),
-    PublicSend,
-    PublicShield,
+    PublicSend(Box<PublicSendDraft>),
+    PublicShield(Box<PublicShieldDraft>),
     WalletConnectRequest {
         request_key: String,
         review_token: u64,
@@ -1397,7 +1398,7 @@ impl WalletRoot {
                     utxo_id, password, window, cx,
                 );
             }
-            SpendAuthorizationIntent::PublicSend => {
+            SpendAuthorizationIntent::PublicSend(draft) => {
                 let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
                 else {
                     self.set_vault_error(
@@ -1406,9 +1407,9 @@ impl WalletRoot {
                     );
                     return;
                 };
-                self.submit_public_send_authorized(password, window, cx);
+                self.submit_public_send_authorized(*draft, password, window, cx);
             }
-            SpendAuthorizationIntent::PublicShield => {
+            SpendAuthorizationIntent::PublicShield(draft) => {
                 let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
                 else {
                     self.set_vault_error(
@@ -1417,7 +1418,7 @@ impl WalletRoot {
                     );
                     return;
                 };
-                self.submit_public_shield_authorized(password, window, cx);
+                self.submit_public_shield_authorized(*draft, password, window, cx);
             }
             SpendAuthorizationIntent::WalletConnectRequest {
                 request_key,
