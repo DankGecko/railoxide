@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_id="io.github.triamazikamno.RailOxide"
+generator_commit="f03a673abe6ce189cea1c2857e2b44af2dd79d1f"
+generator_sha256="b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c"
+generator_url="https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${generator_commit}/cargo/flatpak-cargo-generator.py"
+generator_image="ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:2f06ee4d6948bf5ab39b7d6cb6d4c9e73847323ae46ddb6b57313a0dee75d4ff"
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+packaging_dir="$repo_root/bins/wallet/packaging/flatpak"
+
+variant="hardware"
+arch="$(uname -m)"
+repo_dir=""
+build_dir=""
+state_dir=""
+bundle_path=""
+cargo_sources=""
+generate_sources_path=""
+generator_metadata_path=""
+install_deps=1
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/build-wallet-flatpak [options]
+
+Options:
+  --variant hardware|no-hardware  Build variant (default: hardware)
+  --arch ARCH                     Flatpak architecture (default: host architecture)
+  --repo PATH                     OSTree repository output
+  --build-dir PATH                Flatpak application build directory
+  --state-dir PATH                flatpak-builder state/cache directory
+  --bundle PATH                   Also produce a single-file Flatpak bundle
+  --cargo-sources PATH            Reuse generated Cargo source manifest
+  --generate-sources PATH         Generate Cargo source manifest and exit
+  --generator-metadata PATH       Record generator identity with --generate-sources
+  --no-install-deps               Do not install SDK/runtime dependencies
+  -h, --help                      Show this help
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+absolute_path() {
+  local path="$1"
+  if [[ "$path" = /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s/%s\n' "$PWD" "$path"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --variant)
+      [[ $# -ge 2 ]] || die "--variant requires a value"
+      variant="$2"
+      shift 2
+      ;;
+    --arch)
+      [[ $# -ge 2 ]] || die "--arch requires a value"
+      arch="$2"
+      shift 2
+      ;;
+    --repo)
+      [[ $# -ge 2 ]] || die "--repo requires a value"
+      repo_dir="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --build-dir)
+      [[ $# -ge 2 ]] || die "--build-dir requires a value"
+      build_dir="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --state-dir)
+      [[ $# -ge 2 ]] || die "--state-dir requires a value"
+      state_dir="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --bundle)
+      [[ $# -ge 2 ]] || die "--bundle requires a value"
+      bundle_path="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --cargo-sources)
+      [[ $# -ge 2 ]] || die "--cargo-sources requires a value"
+      cargo_sources="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --generate-sources)
+      [[ $# -ge 2 ]] || die "--generate-sources requires a value"
+      generate_sources_path="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --generator-metadata)
+      [[ $# -ge 2 ]] || die "--generator-metadata requires a value"
+      generator_metadata_path="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --no-install-deps)
+      install_deps=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+case "$variant" in
+  hardware)
+    manifest_name="io.github.triamazikamno.RailOxide.yml"
+    branch="stable"
+    ;;
+  no-hardware)
+    manifest_name="io.github.triamazikamno.RailOxide.NoHardware.yml"
+    branch="stable-no-hardware"
+    ;;
+  *)
+    die "unsupported variant: $variant"
+    ;;
+esac
+
+case "$arch" in
+  x86_64|aarch64)
+    ;;
+  arm64)
+    arch="aarch64"
+    ;;
+  *)
+    die "unsupported architecture: $arch"
+    ;;
+esac
+
+generate_cargo_sources() {
+  local output="$1"
+  local cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/railoxide-flatpak"
+  local tool_dir="$cache_root/flatpak-cargo-generator-$generator_commit"
+  local generator="$tool_dir/flatpak-cargo-generator.py"
+
+  require_command curl
+  require_command python3
+  require_command sha256sum
+  mkdir -p -- "$tool_dir" "$(dirname -- "$output")"
+
+  if [[ ! -f "$generator" ]] || ! printf '%s  %s\n' "$generator_sha256" "$generator" | sha256sum --check --status; then
+    curl --fail --location --silent --show-error "$generator_url" --output "$generator.tmp"
+    printf '%s  %s\n' "$generator_sha256" "$generator.tmp" | sha256sum --check --status \
+      || die "flatpak-cargo-generator checksum mismatch"
+    mv -- "$generator.tmp" "$generator"
+    chmod 0644 "$generator"
+  fi
+
+  if python3 -c 'import aiohttp, tomlkit' >/dev/null 2>&1; then
+    python3 "$generator" --git-tarballs "$repo_root/Cargo.lock" --output "$output"
+    return
+  fi
+
+  command -v docker >/dev/null 2>&1 \
+    || die "source generation requires Python modules aiohttp and tomlkit, or Docker"
+
+  local output_dir output_name
+  output_dir="$(dirname -- "$output")"
+  output_name="$(basename -- "$output")"
+  mkdir -p -- "$cache_root/docker" "$output_dir"
+  docker run --rm \
+    --env "HOST_GID=$(id -g)" \
+    --env "HOST_UID=$(id -u)" \
+    --volume "$cache_root/docker:/cache" \
+    --volume "$output_dir:/output" \
+    --volume "$repo_root:/source:ro" \
+    --volume "$tool_dir:/tool:ro" \
+    "$generator_image" \
+    sh -ceu '
+      XDG_CACHE_HOME=/cache python3 /tool/flatpak-cargo-generator.py --git-tarballs /source/Cargo.lock --output "/output/$1"
+      chown "$HOST_UID:$HOST_GID" "/output/$1"
+    ' sh "$output_name"
+}
+
+if [[ -n "$generate_sources_path" ]]; then
+  [[ -z "$cargo_sources" ]] || die "--generate-sources and --cargo-sources cannot be combined"
+  generate_cargo_sources "$generate_sources_path"
+  if [[ -n "$generator_metadata_path" ]]; then
+    mkdir -p -- "$(dirname -- "$generator_metadata_path")"
+    cat >"$generator_metadata_path" <<EOF
+flatpak_cargo_generator_commit=$generator_commit
+flatpak_cargo_generator_sha256=$generator_sha256
+EOF
+  fi
+  exit 0
+fi
+[[ -z "$generator_metadata_path" ]] || die "--generator-metadata requires --generate-sources"
+
+require_command flatpak
+require_command flatpak-builder
+require_command git
+require_command python3
+require_command tar
+
+release_version="$(python3 - "$repo_root/bins/wallet/Cargo.toml" <<'PY'
+import re
+import sys
+
+in_package = False
+version = None
+with open(sys.argv[1], encoding="utf-8") as manifest:
+    for line in manifest:
+        stripped = line.strip()
+        if stripped == "[package]":
+            in_package = True
+            continue
+        if in_package and stripped.startswith("["):
+            break
+        if in_package and (match := re.fullmatch(r'version\s*=\s*"([^"]+)"', stripped)):
+            version = match.group(1)
+            break
+if version is None:
+    raise SystemExit("wallet package version not found")
+print(version)
+PY
+)"
+[[ "$release_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] \
+  || die "wallet package has an unsupported version: $release_version"
+release_date="$(git -C "$repo_root" show -s --format=%cs HEAD)"
+[[ "$release_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+  || die "could not derive the release date from HEAD"
+source_date_epoch="$(git -C "$repo_root" show -s --format=%ct HEAD)"
+[[ "$source_date_epoch" =~ ^[0-9]+$ ]] \
+  || die "could not derive SOURCE_DATE_EPOCH from HEAD"
+version_without_build="${release_version%%+*}"
+if [[ "$version_without_build" == *-* ]]; then
+  release_type="development"
+else
+  release_type="stable"
+fi
+
+output_root="$repo_root/out/flatpak/$arch/$variant"
+repo_dir="${repo_dir:-$output_root/repo}"
+build_dir="${build_dir:-$output_root/build}"
+state_dir="${state_dir:-$repo_root/.flatpak-builder/$arch}"
+mkdir -p -- "$repo_dir" "$build_dir" "$state_dir"
+
+generated_cargo_sources="$(mktemp --suffix=.json "$repo_root/.railoxide-flatpak-cargo-sources.XXXXXXXX")"
+generated_manifest="$(mktemp --suffix=.yml "$repo_root/.railoxide-flatpak-manifest.XXXXXXXX")"
+source_archive="$(mktemp --suffix=.tar "$repo_root/.railoxide-flatpak-source.XXXXXXXX")"
+trap 'rm -f -- "$generated_cargo_sources" "$generated_manifest" "$source_archive"' EXIT
+
+if [[ -z "$cargo_sources" ]]; then
+  generate_cargo_sources "$generated_cargo_sources"
+elif [[ ! -f "$cargo_sources" ]]; then
+  die "Cargo source manifest does not exist: $cargo_sources"
+else
+  cp -- "$cargo_sources" "$generated_cargo_sources"
+fi
+
+if [[ -n "$(git -C "$repo_root" submodule status)" ]]; then
+  die "Flatpak tracked-file snapshots do not support Git submodules"
+fi
+(
+  cd -- "$repo_root"
+  while IFS= read -r -d '' path; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      printf '%s\0' "$path"
+    fi
+  done < <(git ls-files --cached -z) \
+    | tar --create --file="$source_archive" --format=gnu --group=0 \
+        --mtime="@$source_date_epoch" --null --numeric-owner --owner=0 --files-from=-
+)
+
+python3 - "$packaging_dir/$manifest_name" "$generated_manifest" "$(basename -- "$generated_cargo_sources")" "$(basename -- "$source_archive")" "$release_version" "$release_date" "$release_type" "$source_date_epoch" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+source = source.replace("cargo-sources.json", sys.argv[3])
+source = source.replace("@SOURCE_ARCHIVE@", sys.argv[4])
+source = source.replace("@RELEASE_VERSION@", sys.argv[5])
+source = source.replace("@RELEASE_DATE@", sys.argv[6])
+source = source.replace("@RELEASE_TYPE@", sys.argv[7])
+source = source.replace("@SOURCE_DATE_EPOCH@", sys.argv[8])
+Path(sys.argv[2]).write_text(source, encoding="utf-8")
+PY
+
+builder_args=(
+  --arch="$arch"
+  --collection-id="$app_id"
+  --default-branch="$branch"
+  --force-clean
+  --rebuild-on-sdk-change
+  --repo="$repo_dir"
+  --sandbox
+  --state-dir="$state_dir"
+  --subject="RailOxide Flatpak $branch"
+)
+if [[ -f /.dockerenv ]]; then
+  builder_args+=(--disable-rofiles-fuse)
+fi
+if [[ "$install_deps" -eq 1 ]]; then
+  builder_args+=(--install-deps-from=flathub --user)
+fi
+
+flatpak-builder "${builder_args[@]}" "$build_dir" "$generated_manifest"
+
+if [[ -n "$bundle_path" ]]; then
+  mkdir -p -- "$(dirname -- "$bundle_path")"
+  flatpak build-bundle --arch="$arch" "$repo_dir" "$bundle_path" "$app_id" "$branch"
+fi

@@ -1,0 +1,138 @@
+name: Flatpak CI
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - bins/wallet/**
+      - crates/**
+      - scripts/build-wallet-flatpak
+      - scripts/package-wallet-flatpak-release
+      - .github/workflows/flatpak-ci.yml
+      - .github/workflows/flatpak-release.yml
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - bins/wallet/**
+      - crates/**
+      - scripts/build-wallet-flatpak
+      - scripts/package-wallet-flatpak-release
+      - .github/workflows/flatpak-ci.yml
+      - .github/workflows/flatpak-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sources:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:2f06ee4d6948bf5ab39b7d6cb6d4c9e73847323ae46ddb6b57313a0dee75d4ff
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Generate Cargo sources
+        run: >-
+          scripts/build-wallet-flatpak
+          --generate-sources out/flatpak/generated/cargo-sources.json
+          --generator-metadata out/flatpak/generated/generator-metadata
+
+      - name: Upload Cargo sources
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flatpak-cargo-sources
+          path: out/flatpak/generated
+          if-no-files-found: error
+
+  build:
+    needs: sources
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            rust_commit: 322782fc93167b9d80f804ec51bb524ca9d734de9563ccfd57ae6a49d2962833
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            rust_commit: 26759a8cf4f379f1484726e0a6bc8aa866e282e3c6fc96c364278dd07019fc1e
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:2f06ee4d6948bf5ab39b7d6cb6d4c9e73847323ae46ddb6b57313a0dee75d4ff
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download Cargo sources
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flatpak-cargo-sources
+          path: out/flatpak/generated
+
+      - name: Install Rust SDK extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          extension=org.freedesktop.Sdk.Extension.rust-stable//25.08
+          flatpak install --system --noninteractive --assumeyes --arch="${{ matrix.arch }}" flathub "$extension"
+          flatpak update --system --noninteractive --assumeyes --arch="${{ matrix.arch }}" --commit="${{ matrix.rust_commit }}" "$extension"
+          [[ "$(flatpak info --system --arch="${{ matrix.arch }}" --show-commit "$extension")" == "${{ matrix.rust_commit }}" ]]
+
+      - name: Build hardware variant
+        run: >-
+          scripts/build-wallet-flatpak
+          --variant hardware
+          --arch ${{ matrix.arch }}
+          --cargo-sources out/flatpak/generated/cargo-sources.json
+          --no-install-deps
+          --bundle out/flatpak/RailOxide-${{ matrix.arch }}.flatpak
+
+      - name: Build no-hardware variant
+        run: >-
+          scripts/build-wallet-flatpak
+          --variant no-hardware
+          --arch ${{ matrix.arch }}
+          --cargo-sources out/flatpak/generated/cargo-sources.json
+          --no-install-deps
+          --bundle out/flatpak/RailOxide-no-hardware-${{ matrix.arch }}.flatpak
+
+      - name: Smoke test bundles and permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_id=io.github.triamazikamno.RailOxide
+          flatpak install --user --noninteractive --assumeyes "out/flatpak/RailOxide-${{ matrix.arch }}.flatpak"
+          flatpak install --user --noninteractive --assumeyes "out/flatpak/RailOxide-no-hardware-${{ matrix.arch }}.flatpak"
+          flatpak run --user "$app_id//stable" --help
+          flatpak run --user "$app_id//stable-no-hardware" --help
+
+          hardware_permissions="$(flatpak info --user --show-permissions "$app_id//stable")"
+          no_hardware_permissions="$(flatpak info --user --show-permissions "$app_id//stable-no-hardware")"
+          [[ "$hardware_permissions" == *'shared=ipc;network;'* ]]
+          [[ "$hardware_permissions" == *'sockets=fallback-x11;wayland;'* ]]
+          [[ "$hardware_permissions" == *'devices=dri;usb;'* ]]
+          [[ "$hardware_permissions" != *'filesystems='* ]]
+          [[ "$no_hardware_permissions" == *'shared=ipc;network;'* ]]
+          [[ "$no_hardware_permissions" == *'sockets=fallback-x11;wayland;'* ]]
+          [[ "$no_hardware_permissions" == *'devices=dri;'* ]]
+          [[ "$no_hardware_permissions" != *'usb'* ]]
+          [[ "$no_hardware_permissions" != *'filesystems='* ]]
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flatpak-bundles-${{ matrix.arch }}
+          path: out/flatpak/*.flatpak
+          if-no-files-found: error

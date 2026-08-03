@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_id="io.github.triamazikamno.RailOxide"
+repository_url="https://triamazikamno.github.io/railoxide/flatpak/repo/"
+runtime_repository="https://dl.flathub.org/repo/flathub.flatpakrepo"
+builder_image_digest="sha256:2f06ee4d6948bf5ab39b7d6cb6d4c9e73847323ae46ddb6b57313a0dee75d4ff"
+rust_aarch64_commit="26759a8cf4f379f1484726e0a6bc8aa866e282e3c6fc96c364278dd07019fc1e"
+rust_x86_64_commit="322782fc93167b9d80f804ec51bb524ca9d734de9563ccfd57ae6a49d2962833"
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+packaging_dir="$repo_root/bins/wallet/packaging/flatpak"
+
+tag=""
+input_dir=""
+output_dir=""
+cargo_sources=""
+generator_metadata=""
+source_commit=""
+gpg_key_id=""
+gpg_homedir="${GNUPGHOME:-$HOME/.gnupg}"
+arches=(x86_64 aarch64)
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/package-wallet-flatpak-release [options]
+
+Options:
+  --tag TAG                 Release tag used in bundle filenames
+  --input-dir PATH          Directory containing ARCH/{hardware,no-hardware}/repo
+  --output-dir PATH         Destination for release assets and Pages content
+  --cargo-sources PATH      Generated Cargo source manifest to preserve
+  --generator-metadata PATH Generator identity produced with Cargo sources
+  --source-commit SHA       Immutable source commit used by build jobs
+  --gpg-key-id ID           GPG key used to sign commits and checksums
+  --gpg-homedir PATH        GPG home containing the signing key
+  --arches "ARCH ..."       Architectures to package (default: x86_64 aarch64)
+  -h, --help                Show this help
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+absolute_path() {
+  local path="$1"
+  if [[ "$path" = /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s/%s\n' "$PWD" "$path"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tag)
+      [[ $# -ge 2 ]] || die "--tag requires a value"
+      tag="$2"
+      shift 2
+      ;;
+    --input-dir)
+      [[ $# -ge 2 ]] || die "--input-dir requires a value"
+      input_dir="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --output-dir)
+      [[ $# -ge 2 ]] || die "--output-dir requires a value"
+      output_dir="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --cargo-sources)
+      [[ $# -ge 2 ]] || die "--cargo-sources requires a value"
+      cargo_sources="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --generator-metadata)
+      [[ $# -ge 2 ]] || die "--generator-metadata requires a value"
+      generator_metadata="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --source-commit)
+      [[ $# -ge 2 ]] || die "--source-commit requires a value"
+      source_commit="$2"
+      shift 2
+      ;;
+    --gpg-key-id)
+      [[ $# -ge 2 ]] || die "--gpg-key-id requires a value"
+      gpg_key_id="$2"
+      shift 2
+      ;;
+    --gpg-homedir)
+      [[ $# -ge 2 ]] || die "--gpg-homedir requires a value"
+      gpg_homedir="$(absolute_path "$2")"
+      shift 2
+      ;;
+    --arches)
+      [[ $# -ge 2 ]] || die "--arches requires a value"
+      read -r -a arches <<<"$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[[ -n "$tag" ]] || die "--tag is required"
+[[ "$tag" =~ ^[A-Za-z0-9._+-]+$ ]] || die "tag contains unsupported filename characters"
+[[ -n "$input_dir" ]] || die "--input-dir is required"
+[[ -n "$output_dir" ]] || die "--output-dir is required"
+[[ -n "$cargo_sources" && -f "$cargo_sources" ]] || die "--cargo-sources must name an existing file"
+[[ -n "$generator_metadata" && -f "$generator_metadata" ]] || die "--generator-metadata must name an existing file"
+[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || die "--source-commit must be a full lowercase Git SHA"
+[[ -n "$gpg_key_id" ]] || die "--gpg-key-id is required"
+[[ ${#arches[@]} -gt 0 ]] || die "at least one architecture is required"
+
+for command in base64 flatpak gpg ostree sha256sum; do
+  command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
+done
+
+gpg --homedir "$gpg_homedir" --batch --list-secret-keys "$gpg_key_id" >/dev/null 2>&1 \
+  || die "GPG secret key not found: $gpg_key_id"
+
+release_dir="$output_dir/release"
+publish_repo="$output_dir/publish-repo"
+site_dir="$output_dir/site"
+site_flatpak_dir="$site_dir/flatpak"
+
+[[ ! -e "$publish_repo" ]] || die "output repository already exists: $publish_repo"
+[[ ! -e "$site_dir" ]] || die "Pages output already exists: $site_dir"
+mkdir -p -- "$release_dir" "$publish_repo" "$site_flatpak_dir"
+
+ostree --repo="$publish_repo" init --mode=archive-z2
+ostree --repo="$publish_repo" config set core.collection-id "$app_id"
+
+for arch in "${arches[@]}"; do
+  case "$arch" in
+    x86_64|aarch64)
+      ;;
+    *)
+      die "unsupported architecture: $arch"
+      ;;
+  esac
+
+  for variant in hardware no-hardware; do
+    if [[ "$variant" == "hardware" ]]; then
+      branch="stable"
+    else
+      branch="stable-no-hardware"
+    fi
+    source_repo="$input_dir/$arch/$variant/repo"
+    ref="app/$app_id/$arch/$branch"
+    [[ -d "$source_repo" ]] || die "source repository not found: $source_repo"
+
+    flatpak build-commit-from \
+      --gpg-homedir="$gpg_homedir" \
+      --gpg-sign="$gpg_key_id" \
+      --no-update-summary \
+      --src-ref="$ref" \
+      --src-repo="$source_repo" \
+      --subject="RailOxide $tag ($arch, $branch)" \
+      --untrusted \
+      "$publish_repo" "$ref"
+  done
+done
+
+flatpak build-update-repo \
+  --gpg-homedir="$gpg_homedir" \
+  --gpg-sign="$gpg_key_id" \
+  "$publish_repo"
+
+public_key="$output_dir/flatpak-release-public.gpg"
+gpg --homedir "$gpg_homedir" --batch --export "$gpg_key_id" >"$public_key"
+[[ -s "$public_key" ]] || die "failed to export Flatpak public key"
+
+for arch in "${arches[@]}"; do
+  hardware_bundle="$release_dir/RailOxide-$tag-$arch.flatpak"
+  no_hardware_bundle="$release_dir/RailOxide-$tag-no-hardware-$arch.flatpak"
+
+  flatpak build-bundle \
+    --arch="$arch" \
+    --gpg-keys="$public_key" \
+    --repo-url="$repository_url" \
+    --runtime-repo="$runtime_repository" \
+    "$publish_repo" "$hardware_bundle" "$app_id" stable
+  flatpak build-bundle \
+    --arch="$arch" \
+    --gpg-keys="$public_key" \
+    --repo-url="$repository_url" \
+    --runtime-repo="$runtime_repository" \
+    "$publish_repo" "$no_hardware_bundle" "$app_id" stable-no-hardware
+
+  ostree --repo="$publish_repo" cat "app/$app_id/$arch/stable" /files/manifest.json \
+    >"$release_dir/manifest-hardware-$arch.json"
+  ostree --repo="$publish_repo" cat "app/$app_id/$arch/stable-no-hardware" /files/manifest.json \
+    >"$release_dir/manifest-no-hardware-$arch.json"
+done
+
+cp -- "$cargo_sources" "$release_dir/cargo-sources.json"
+printf '%s\n' "$source_commit" >"$release_dir/SOURCE-COMMIT"
+generator_commit="$(sed -n 's/^flatpak_cargo_generator_commit=//p' "$generator_metadata")"
+generator_sha256="$(sed -n 's/^flatpak_cargo_generator_sha256=//p' "$generator_metadata")"
+[[ "$generator_commit" =~ ^[0-9a-f]{40}$ ]] || die "generator metadata has an invalid commit"
+[[ "$generator_sha256" =~ ^[0-9a-f]{64}$ ]] || die "generator metadata has an invalid SHA-256"
+cat >"$release_dir/BUILD-INPUTS" <<EOF
+source_commit=$source_commit
+builder_image_digest=$builder_image_digest
+rust_extension_aarch64_commit=$rust_aarch64_commit
+rust_extension_x86_64_commit=$rust_x86_64_commit
+flatpak_cargo_generator_commit=$generator_commit
+flatpak_cargo_generator_sha256=$generator_sha256
+EOF
+cp -- "$release_dir/SOURCE-COMMIT" "$site_flatpak_dir/SOURCE-COMMIT"
+cp -R --reflink=never "$publish_repo" "$site_flatpak_dir/repo"
+cp -- "$public_key" "$site_flatpak_dir/flatpak-release-public.gpg"
+
+gpg_key="$(base64 --wrap=0 "$public_key")"
+for template in RailOxide.flatpakref RailOxide-NoHardware.flatpakref railoxide.flatpakrepo; do
+  sed "s|@GPG_KEY@|$gpg_key|g" "$packaging_dir/$template.in" >"$site_flatpak_dir/$template"
+done
+
+cat >"$site_dir/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RailOxide Flatpak</title>
+  </head>
+  <body>
+    <main>
+      <h1>RailOxide Flatpak</h1>
+      <p><a href="flatpak/RailOxide.flatpakref">Install with hardware-wallet support</a></p>
+      <p><a href="flatpak/RailOxide-NoHardware.flatpakref">Install without hardware-wallet support</a></p>
+      <p><a href="flatpak/railoxide.flatpakrepo">Add the RailOxide Flatpak repository</a></p>
+    </main>
+  </body>
+</html>
+EOF
+
+fingerprint="$(gpg --homedir "$gpg_homedir" --batch --with-colons --fingerprint "$gpg_key_id" | awk -F: '$1 == "fpr" { print $10; exit }')"
+[[ -n "$fingerprint" ]] || die "could not determine GPG fingerprint"
+printf '%s\n' "$fingerprint" >"$release_dir/FLATPAK-GPG-FINGERPRINT"
+
+(
+  cd -- "$release_dir"
+  shopt -s nullglob
+  checksum_files=(*.flatpak *.json BUILD-INPUTS FLATPAK-GPG-FINGERPRINT SOURCE-COMMIT)
+  [[ ${#checksum_files[@]} -gt 0 ]] || die "no release files found for checksums"
+  sha256sum "${checksum_files[@]}" >SHA256SUMS
+  gpg --homedir "$gpg_homedir" --batch --armor --detach-sign \
+    --local-user "$gpg_key_id" --output SHA256SUMS.asc SHA256SUMS
+)
