@@ -4,6 +4,7 @@ Name=RailOxide
 Comment=Desktop wallet for RAILGUN private transactions
 Exec=io.github.triamazikamno.RailOxide
 Icon=io.github.triamazikamno.RailOxide
+StartupWMClass=io.github.triamazikamno.RailOxide
 Terminal=false
 Categories=Finance;Network;
 Keywords=wallet;cryptocurrency;privacy;RAILGUN;

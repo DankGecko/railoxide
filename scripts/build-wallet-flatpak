@@ -2,6 +2,7 @@
 set -euo pipefail
 
 app_id="io.github.triamazikamno.RailOxide"
+runtime_repository="https://dl.flathub.org/repo/flathub.flatpakrepo"
 generator_commit="f03a673abe6ce189cea1c2857e2b44af2dd79d1f"
 generator_sha256="b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c"
 generator_url="https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${generator_commit}/cargo/flatpak-cargo-generator.py"
@@ -240,6 +241,10 @@ release_date="$(git -C "$repo_root" show -s --format=%cs HEAD)"
 source_date_epoch="$(git -C "$repo_root" show -s --format=%ct HEAD)"
 [[ "$source_date_epoch" =~ ^[0-9]+$ ]] \
   || die "could not derive SOURCE_DATE_EPOCH from HEAD"
+source_commit="$(git -C "$repo_root" rev-parse HEAD)"
+[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
+  || die "could not derive the source commit from HEAD"
+git_short_hash="${source_commit:0:7}"
 version_without_build="${release_version%%+*}"
 if [[ "$version_without_build" == *-* ]]; then
   release_type="development"
@@ -280,7 +285,7 @@ fi
         --mtime="@$source_date_epoch" --null --numeric-owner --owner=0 --files-from=-
 )
 
-python3 - "$packaging_dir/$manifest_name" "$generated_manifest" "$(basename -- "$generated_cargo_sources")" "$(basename -- "$source_archive")" "$release_version" "$release_date" "$release_type" "$source_date_epoch" <<'PY'
+python3 - "$packaging_dir/$manifest_name" "$generated_manifest" "$(basename -- "$generated_cargo_sources")" "$(basename -- "$source_archive")" "$release_version" "$release_date" "$release_type" "$source_date_epoch" "$git_short_hash" <<'PY'
 from pathlib import Path
 import sys
 
@@ -291,6 +296,7 @@ source = source.replace("@RELEASE_VERSION@", sys.argv[5])
 source = source.replace("@RELEASE_DATE@", sys.argv[6])
 source = source.replace("@RELEASE_TYPE@", sys.argv[7])
 source = source.replace("@SOURCE_DATE_EPOCH@", sys.argv[8])
+source = source.replace("@GIT_SHORT_HASH@", sys.argv[9])
 Path(sys.argv[2]).write_text(source, encoding="utf-8")
 PY
 
@@ -316,5 +322,8 @@ flatpak-builder "${builder_args[@]}" "$build_dir" "$generated_manifest"
 
 if [[ -n "$bundle_path" ]]; then
   mkdir -p -- "$(dirname -- "$bundle_path")"
-  flatpak build-bundle --arch="$arch" "$repo_dir" "$bundle_path" "$app_id" "$branch"
+  flatpak build-bundle \
+    --arch="$arch" \
+    --runtime-repo="$runtime_repository" \
+    "$repo_dir" "$bundle_path" "$app_id" "$branch"
 fi

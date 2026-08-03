@@ -24,6 +24,7 @@ modules:
       env:
         CARGO_HOME: /run/build/railoxide/cargo
         CARGO_NET_OFFLINE: "true"
+        RAILOXIDE_BUILD_GIT_SHORT_HASH: "@GIT_SHORT_HASH@"
         RAILOXIDE_RELEASE_DATE: "@RELEASE_DATE@"
         RAILOXIDE_RELEASE_TYPE: "@RELEASE_TYPE@"
         RAILOXIDE_RELEASE_VERSION: "@RELEASE_VERSION@"

@@ -117,6 +117,7 @@ write_linux_desktop_file() {
       printf 'Comment=Desktop wallet for RAILGUN private transactions\n'
       printf 'Exec=%s/bin/railoxide-wallet\n' "$prefix"
       printf 'Icon=app.railoxide.wallet\n'
+      printf 'StartupWMClass=app.railoxide.wallet\n'
       printf 'Terminal=false\n'
       printf 'Type=Application\n'
       printf 'Categories=Finance;Network;\n'
