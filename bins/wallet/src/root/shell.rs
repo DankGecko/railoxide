@@ -216,6 +216,21 @@ pub(crate) fn open_wallet_window(
             origin: Point::default(),
             size: size(px(1_360.0), px(860.0)),
         })),
+        app_id: {
+            #[cfg(target_os = "linux")]
+            {
+                Some(
+                    std::env::var("FLATPAK_ID")
+                        .ok()
+                        .filter(|app_id| !app_id.is_empty())
+                        .unwrap_or_else(|| "app.railoxide.wallet".to_owned()),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        },
         titlebar: Some(wallet_titlebar_options()),
         window_decorations: Some(gpui::WindowDecorations::Client),
         ..Default::default()

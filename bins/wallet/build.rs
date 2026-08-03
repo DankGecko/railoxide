@@ -3,11 +3,30 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const BUILD_GIT_SHORT_HASH: &str = "RAILOXIDE_BUILD_GIT_SHORT_HASH";
+
 fn main() {
+    println!("cargo::rerun-if-env-changed={BUILD_GIT_SHORT_HASH}");
     track_git_refs();
 
-    let short_hash = git_short_hash().unwrap_or_else(|| "unknown".to_owned());
+    let short_hash = injected_git_short_hash()
+        .or_else(git_short_hash)
+        .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo::rustc-env=RAILOXIDE_GIT_SHORT_HASH={short_hash}");
+}
+
+fn injected_git_short_hash() -> Option<String> {
+    let value = env::var_os(BUILD_GIT_SHORT_HASH)?;
+    let mut hash = value
+        .into_string()
+        .unwrap_or_else(|_| panic!("{BUILD_GIT_SHORT_HASH} must be valid UTF-8"));
+
+    assert!(
+        hash.len() == 7 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{BUILD_GIT_SHORT_HASH} must contain exactly seven hexadecimal characters"
+    );
+    hash.make_ascii_lowercase();
+    Some(hash)
 }
 
 fn track_git_refs() {

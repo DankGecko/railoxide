@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/triamazikamno/railoxide/releases">Releases</a> ·
-  <a href="#install-from-source">Install</a> ·
+  <a href="#flatpak">Install</a> ·
   <a href="#build">Build</a> ·
   <a href="#privacy-model">Privacy Model</a>
 </p>
@@ -36,6 +36,22 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 - Resilient public broadcaster network connection management
 - Decentralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
 - WalletConnect support for DeFi exposure
+
+## Flatpak
+
+Flatpak is the recommended Linux installation when a packaged release is available. The default package includes hardware-wallet support and raw USB access:
+
+```bash
+flatpak install --user https://triamazikamno.github.io/railoxide/flatpak/RailOxide.flatpakref
+```
+
+A restricted build omits hardware-wallet support and does not receive USB access:
+
+```bash
+flatpak install --user https://triamazikamno.github.io/railoxide/flatpak/RailOxide-NoHardware.flatpakref
+```
+
+Both builds otherwise use the same sandbox and update repository. Install only one variant at a time. See the [`Flatpak guide`](docs/flatpak.md) for permissions, updates, and data migration.
 
 ## Install From Source
 

@@ -3,6 +3,10 @@
 /result
 /out/
 /cache/
+/.flatpak-builder/
+/flatpak-build/
+/flatpak-repo/
+/.railoxide-flatpak-*
 
 /*.heap
 /heap*.svg

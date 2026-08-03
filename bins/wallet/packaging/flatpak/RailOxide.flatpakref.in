@@ -1,0 +1,9 @@
+[Flatpak Ref]
+Title=RailOxide
+Name=io.github.triamazikamno.RailOxide
+Branch=stable
+Url=https://triamazikamno.github.io/railoxide/flatpak/repo/
+GPGKey=@GPG_KEY@
+RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
+IsRuntime=false
+SuggestRemoteName=railoxide

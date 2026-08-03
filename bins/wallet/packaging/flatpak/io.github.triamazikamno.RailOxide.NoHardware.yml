@@ -1,0 +1,46 @@
+id: io.github.triamazikamno.RailOxide
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: io.github.triamazikamno.RailOxide
+default-branch: stable-no-hardware
+collection-id: io.github.triamazikamno.RailOxide
+source-date-epoch: @SOURCE_DATE_EPOCH@
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --device=dri
+  - --socket=wayland
+  - --socket=fallback-x11
+modules:
+  - name: railoxide
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/railoxide/cargo
+        CARGO_NET_OFFLINE: "true"
+        RAILOXIDE_BUILD_GIT_SHORT_HASH: "@GIT_SHORT_HASH@"
+        RAILOXIDE_RELEASE_DATE: "@RELEASE_DATE@"
+        RAILOXIDE_RELEASE_TYPE: "@RELEASE_TYPE@"
+        RAILOXIDE_RELEASE_VERSION: "@RELEASE_VERSION@"
+    build-commands:
+      - cargo build --frozen --release -p wallet
+      - install -Dm0755 target/release/wallet ${FLATPAK_DEST}/bin/io.github.triamazikamno.RailOxide
+      - install -Dm0644 LICENSE ${FLATPAK_DEST}/share/licenses/io.github.triamazikamno.RailOxide/LICENSE
+      - install -Dm0644 bins/wallet/packaging/flatpak/io.github.triamazikamno.RailOxide.desktop ${FLATPAK_DEST}/share/applications/io.github.triamazikamno.RailOxide.desktop
+      - install -d ${FLATPAK_DEST}/share/metainfo
+      - sed -e "s/@VERSION@/${RAILOXIDE_RELEASE_VERSION}/g" -e "s/@DATE@/${RAILOXIDE_RELEASE_DATE}/g" -e "s/@RELEASE_TYPE@/${RAILOXIDE_RELEASE_TYPE}/g" bins/wallet/packaging/flatpak/io.github.triamazikamno.RailOxide.metainfo.xml.in > ${FLATPAK_DEST}/share/metainfo/io.github.triamazikamno.RailOxide.metainfo.xml
+      - install -Dm0644 bins/wallet/packaging/icons/railoxide-icon.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.triamazikamno.RailOxide.svg
+      - for size in 16 24 32 48 64 128 256 512; do install -Dm0644 bins/wallet/packaging/icons/png/${size}x${size}.png ${FLATPAK_DEST}/share/icons/hicolor/${size}x${size}/apps/io.github.triamazikamno.RailOxide.png; done
+    sources:
+      - type: archive
+        path: "@SOURCE_ARCHIVE@"
+        archive-type: tar
+        strip-components: 0
+      - cargo-sources.json
+      - type: shell
+        commands:
+          - mv cargo/config cargo/config.toml

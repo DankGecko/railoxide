@@ -1,0 +1,7 @@
+[Flatpak Repo]
+Title=RailOxide
+Url=https://triamazikamno.github.io/railoxide/flatpak/repo/
+GPGKey=@GPG_KEY@
+Homepage=https://github.com/triamazikamno/railoxide
+Comment=Official RailOxide Flatpak repository
+Description=Signed Flatpak releases of the RailOxide desktop wallet
