@@ -121,7 +121,7 @@ done
 [[ -n "$gpg_key_id" ]] || die "--gpg-key-id is required"
 [[ ${#arches[@]} -gt 0 ]] || die "at least one architecture is required"
 
-for command in base64 flatpak gpg ostree sha256sum; do
+for command in base64 flatpak gpg gzip ostree sha256sum tar; do
   command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
 
@@ -132,10 +132,15 @@ release_dir="$output_dir/release"
 publish_repo="$output_dir/publish-repo"
 site_dir="$output_dir/site"
 site_flatpak_dir="$site_dir/flatpak"
+provenance_name="RailOxide-$tag-build-provenance"
+provenance_dir="$output_dir/$provenance_name"
+provenance_archive="$release_dir/$provenance_name.tar.gz"
+release_payloads=()
 
 [[ ! -e "$publish_repo" ]] || die "output repository already exists: $publish_repo"
 [[ ! -e "$site_dir" ]] || die "Pages output already exists: $site_dir"
-mkdir -p -- "$release_dir" "$publish_repo" "$site_flatpak_dir"
+[[ ! -e "$provenance_dir" ]] || die "provenance output already exists: $provenance_dir"
+mkdir -p -- "$release_dir" "$publish_repo" "$site_flatpak_dir" "$provenance_dir"
 
 ostree --repo="$publish_repo" init --mode=archive-z2
 ostree --repo="$publish_repo" config set core.collection-id "$app_id"
@@ -196,20 +201,21 @@ for arch in "${arches[@]}"; do
     --repo-url="$repository_url" \
     --runtime-repo="$runtime_repository" \
     "$publish_repo" "$no_hardware_bundle" "$app_id" stable-no-hardware
+  release_payloads+=("$hardware_bundle" "$no_hardware_bundle")
 
   ostree --repo="$publish_repo" cat "app/$app_id/$arch/stable" /files/manifest.json \
-    >"$release_dir/manifest-hardware-$arch.json"
+    >"$provenance_dir/manifest-hardware-$arch.json"
   ostree --repo="$publish_repo" cat "app/$app_id/$arch/stable-no-hardware" /files/manifest.json \
-    >"$release_dir/manifest-no-hardware-$arch.json"
+    >"$provenance_dir/manifest-no-hardware-$arch.json"
 done
 
-cp -- "$cargo_sources" "$release_dir/cargo-sources.json"
-printf '%s\n' "$source_commit" >"$release_dir/SOURCE-COMMIT"
+cp -- "$cargo_sources" "$provenance_dir/cargo-sources.json"
+printf '%s\n' "$source_commit" >"$provenance_dir/SOURCE-COMMIT"
 generator_commit="$(sed -n 's/^flatpak_cargo_generator_commit=//p' "$generator_metadata")"
 generator_sha256="$(sed -n 's/^flatpak_cargo_generator_sha256=//p' "$generator_metadata")"
 [[ "$generator_commit" =~ ^[0-9a-f]{40}$ ]] || die "generator metadata has an invalid commit"
 [[ "$generator_sha256" =~ ^[0-9a-f]{64}$ ]] || die "generator metadata has an invalid SHA-256"
-cat >"$release_dir/BUILD-INPUTS" <<EOF
+cat >"$provenance_dir/BUILD-INPUTS" <<EOF
 source_commit=$source_commit
 builder_image_digest=$builder_image_digest
 rust_extension_aarch64_commit=$rust_aarch64_commit
@@ -217,7 +223,7 @@ rust_extension_x86_64_commit=$rust_x86_64_commit
 flatpak_cargo_generator_commit=$generator_commit
 flatpak_cargo_generator_sha256=$generator_sha256
 EOF
-cp -- "$release_dir/SOURCE-COMMIT" "$site_flatpak_dir/SOURCE-COMMIT"
+cp -- "$provenance_dir/SOURCE-COMMIT" "$site_flatpak_dir/SOURCE-COMMIT"
 cp -R --reflink=never "$publish_repo" "$site_flatpak_dir/repo"
 cp -- "$public_key" "$site_flatpak_dir/flatpak-release-public.gpg"
 
@@ -247,14 +253,39 @@ EOF
 
 fingerprint="$(gpg --homedir "$gpg_homedir" --batch --with-colons --fingerprint "$gpg_key_id" | awk -F: '$1 == "fpr" { print $10; exit }')"
 [[ -n "$fingerprint" ]] || die "could not determine GPG fingerprint"
-printf '%s\n' "$fingerprint" >"$release_dir/FLATPAK-GPG-FINGERPRINT"
+printf '%s\n' "$fingerprint" >"$provenance_dir/FLATPAK-GPG-FINGERPRINT"
+
+(
+  cd -- "$output_dir"
+  tar \
+    --sort=name \
+    --mtime='@0' \
+    --owner=0 \
+    --group=0 \
+    --numeric-owner \
+    -cf - "$provenance_name"
+) | gzip -n >"$provenance_archive"
+[[ -s "$provenance_archive" ]] || die "failed to create build provenance archive"
+release_payloads+=("$provenance_archive")
 
 (
   cd -- "$release_dir"
-  shopt -s nullglob
-  checksum_files=(*.flatpak *.json BUILD-INPUTS FLATPAK-GPG-FINGERPRINT SOURCE-COMMIT)
+  checksum_files=()
+  for payload in "${release_payloads[@]}"; do
+    checksum_files+=("$(basename -- "$payload")")
+  done
   [[ ${#checksum_files[@]} -gt 0 ]] || die "no release files found for checksums"
   sha256sum "${checksum_files[@]}" >SHA256SUMS
   gpg --homedir "$gpg_homedir" --batch --armor --detach-sign \
     --local-user "$gpg_key_id" --output SHA256SUMS.asc SHA256SUMS
 )
+
+release_assets=(
+  "${release_payloads[@]}"
+  "$release_dir/SHA256SUMS"
+  "$release_dir/SHA256SUMS.asc"
+)
+shopt -s nullglob
+release_entries=("$release_dir"/*)
+[[ ${#release_entries[@]} -eq ${#release_assets[@]} ]] \
+  || die "release directory contains unexpected files"

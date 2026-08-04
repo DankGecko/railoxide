@@ -274,9 +274,45 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: >-
-          gh release upload "$RELEASE_TAG"
-          out/flatpak/published/release/*
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir=out/flatpak/published/release
+          assets=(
+            "$release_dir/RailOxide-$RELEASE_TAG-x86_64.flatpak"
+            "$release_dir/RailOxide-$RELEASE_TAG-no-hardware-x86_64.flatpak"
+            "$release_dir/RailOxide-$RELEASE_TAG-aarch64.flatpak"
+            "$release_dir/RailOxide-$RELEASE_TAG-no-hardware-aarch64.flatpak"
+            "$release_dir/RailOxide-$RELEASE_TAG-build-provenance.tar.gz"
+            "$release_dir/SHA256SUMS"
+            "$release_dir/SHA256SUMS.asc"
+          )
+          for asset in "${assets[@]}"; do
+            [[ -f "$asset" ]]
+          done
+          shopt -s nullglob
+          release_entries=("$release_dir"/*)
+          [[ ${#release_entries[@]} -eq ${#assets[@]} ]]
+          existing_asset_count="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.assets | length')"
+          [[ "$existing_asset_count" == 0 ]]
+          gh release upload "$RELEASE_TAG" "${assets[@]}"
+          expected_names=(
+            "RailOxide-$RELEASE_TAG-aarch64.flatpak"
+            "RailOxide-$RELEASE_TAG-build-provenance.tar.gz"
+            "RailOxide-$RELEASE_TAG-no-hardware-aarch64.flatpak"
+            "RailOxide-$RELEASE_TAG-no-hardware-x86_64.flatpak"
+            "RailOxide-$RELEASE_TAG-x86_64.flatpak"
+            SHA256SUMS
+            SHA256SUMS.asc
+          )
+          mapfile -t published_names < <(
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+              --jq '.assets | map(.name) | sort | .[]'
+          )
+          [[ ${#published_names[@]} -eq ${#expected_names[@]} ]]
+          for index in "${!expected_names[@]}"; do
+            [[ "${published_names[$index]}" == "${expected_names[$index]}" ]]
+          done
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4

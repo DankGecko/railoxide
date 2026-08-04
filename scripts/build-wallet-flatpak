@@ -258,10 +258,11 @@ build_dir="${build_dir:-$output_root/build}"
 state_dir="${state_dir:-$repo_root/.flatpak-builder/$arch}"
 mkdir -p -- "$repo_dir" "$build_dir" "$state_dir"
 
-generated_cargo_sources="$(mktemp --suffix=.json "$repo_root/.railoxide-flatpak-cargo-sources.XXXXXXXX")"
-generated_manifest="$(mktemp --suffix=.yml "$repo_root/.railoxide-flatpak-manifest.XXXXXXXX")"
-source_archive="$(mktemp --suffix=.tar "$repo_root/.railoxide-flatpak-source.XXXXXXXX")"
-trap 'rm -f -- "$generated_cargo_sources" "$generated_manifest" "$source_archive"' EXIT
+temporary_dir="$(mktemp -d "$repo_root/.railoxide-flatpak-build.XXXXXXXX")"
+generated_cargo_sources="$temporary_dir/cargo-sources.json"
+generated_manifest="$temporary_dir/manifest.yml"
+source_archive="$temporary_dir/source.tar"
+trap 'rm -rf -- "$temporary_dir"' EXIT
 
 if [[ -z "$cargo_sources" ]]; then
   generate_cargo_sources "$generated_cargo_sources"
