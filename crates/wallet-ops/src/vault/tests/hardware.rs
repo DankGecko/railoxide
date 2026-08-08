@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use alloy::primitives::{FixedBytes, U256};
 use std::fs;
 
 #[test]
@@ -294,6 +295,160 @@ fn hardware_cache_keys_require_hardware_view_context() {
         b"private cache row",
     );
 
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn authenticated_hardware_view_session_reopens_sender_candidate() {
+    use railgun_wallet::{Note, UtxoSource};
+    use sync_service::{
+        SenderTransactionCandidate, SenderTransactionCandidateOutput,
+        SenderTransactionCandidateSpend, WalletCacheStore,
+    };
+
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let wallet_id = "hardware-sender-candidate";
+    let descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(0);
+    let metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            "Hardware sender candidate",
+            descriptor.clone(),
+        )
+        .expect("hardware metadata");
+    store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            0,
+            &wallet,
+            &metadata,
+            &test_hardware_view_access_key(0),
+        )
+        .expect("store hardware wallet");
+    assert!(matches!(
+        store.load_view_session(TEST_PASSWORD, wallet_id),
+        Err(VaultError::HardwareWalletViewRequiresDevice)
+    ));
+    let view_session = Arc::new(load_test_hardware_view_session(
+        &store,
+        wallet_id,
+        &descriptor,
+    ));
+    let chain_metadata = store
+        .wallet_chain_metadata_for_session(
+            view_session.as_ref(),
+            0,
+            1,
+            "0x1111111111111111111111111111111111111111",
+            100,
+        )
+        .expect("hardware chain metadata");
+    let wallet_cache_key = chain_metadata
+        .wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .expect("hardware wallet cache key");
+    let note = Note {
+        token_hash: U256::from_be_bytes([0x41; KEY_LEN]),
+        value: U256::from(7),
+        random: [0x42; 16],
+        npk: U256::from_be_bytes([0x43; KEY_LEN]),
+    };
+    let candidate = SenderTransactionCandidate::new(
+        1,
+        wallet_cache_key.clone(),
+        UtxoSource {
+            tx_hash: FixedBytes::from([0x44; KEY_LEN]),
+            block_number: 120,
+            block_timestamp: 1_700_000_120,
+        },
+        vec![SenderTransactionCandidateSpend {
+            tree: 1,
+            position: 2,
+            commitment: FixedBytes::from([0x45; KEY_LEN]),
+        }],
+        vec![SenderTransactionCandidateOutput {
+            tree: 3,
+            position: 4,
+            commitment: FixedBytes::from(note.commitment().to_be_bytes::<KEY_LEN>()),
+            note: Some(note),
+        }],
+    )
+    .expect("valid hardware sender candidate");
+    let cache_store = DesktopEncryptedWalletCacheStore::new(
+        Arc::clone(&db),
+        &view_session,
+        chain_metadata.clone(),
+    )
+    .expect("hardware encrypted cache store");
+    cache_store
+        .commit_sender_transaction_candidates_for_test(
+            1,
+            &wallet_cache_key,
+            std::slice::from_ref(&candidate),
+            &[],
+        )
+        .expect("persist hardware sender candidate");
+    drop(cache_store);
+    drop(view_session);
+    drop(store);
+    drop(db);
+
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("reopen hardware candidate db"),
+    );
+    let store = DesktopVaultStore::from_db(Arc::clone(&db));
+    let unmatched = HardwareProfileSession::unmatched(
+        HardwareDeviceKind::Ledger,
+        HardwareProfileBinding::evm_address_fingerprint(
+            "ledger:evm:0x3333333333333333333333333333333333333333",
+        ),
+        None,
+    );
+    assert!(matches!(
+        store.load_hardware_view_session(
+            TEST_PASSWORD,
+            &unmatched,
+            wallet_id,
+            &test_hardware_view_access_key(0),
+        ),
+        Err(VaultError::HardwareWalletIdentityMismatch)
+    ));
+    let hardware_session = store
+        .hardware_profile_session_for_fingerprint(
+            TEST_PASSWORD,
+            HardwareDeviceKind::Ledger,
+            &descriptor.profile_fingerprint,
+            None,
+        )
+        .expect("re-authenticate hardware profile");
+    let view_session = Arc::new(
+        store
+            .load_hardware_view_session(
+                TEST_PASSWORD,
+                &hardware_session,
+                wallet_id,
+                &test_hardware_view_access_key(0),
+            )
+            .expect("re-authenticate hardware view session"),
+    );
+    let reopened =
+        DesktopEncryptedWalletCacheStore::new(Arc::clone(&db), &view_session, chain_metadata)
+            .expect("reopen hardware encrypted cache store");
+    let loaded = reopened
+        .get_sender_transaction_candidate(1, &wallet_cache_key, &candidate.semantic_id())
+        .expect("load hardware sender candidate")
+        .expect("hardware sender candidate present");
+    assert_eq!(loaded.encode().unwrap(), candidate.encode().unwrap());
+
+    drop(reopened);
     drop(store);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

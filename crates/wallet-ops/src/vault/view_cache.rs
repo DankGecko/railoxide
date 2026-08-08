@@ -3,8 +3,8 @@ use super::{
     DesktopViewSession, EncryptedRecord, HardwareProfileSession, Instant, KEY_LEN, Mutex,
     RailgunError, Serialize, U256, VaultError, ViewUnlock, ViewingKeyData, WalletCacheError,
     WalletCacheKey, WalletChainMetadataBundle, WalletMeta, WalletUtxo, WalletViewBundle,
-    deserialize_wallet_utxo, serialize_wallet_utxo, wallet_cache_counts,
-    wallet_utxo_stable_identity,
+    deserialize_wallet_utxo, serialize_wallet_utxo, vault_error_from_wallet_cache,
+    wallet_cache_counts, wallet_utxo_stable_identity,
 };
 use alloy::primitives::FixedBytes;
 use local_db::{
@@ -13,6 +13,9 @@ use local_db::{
     WalletPrivateRecordKind, WalletPrivateStateBatch, WalletUtxoRowMutation,
 };
 use sync_service::types::{WalletCheckpointMutation, WalletUtxoMutation};
+use sync_service::{
+    SenderTransactionCandidate, WalletCacheStore, sender_transaction_candidate_rewind_ids,
+};
 
 impl DesktopViewSession {
     #[must_use]
@@ -122,6 +125,22 @@ impl DesktopViewSession {
 }
 
 impl DesktopEncryptedWalletCacheStore {
+    pub(super) fn for_chain_cache_repair(
+        db: Arc<DbStore>,
+        view_session: &DesktopViewSession,
+        metadata: WalletChainMetadataBundle,
+    ) -> Result<Self, VaultError> {
+        if metadata.wallet_uuid != view_session.wallet_id() {
+            return Err(VaultError::UnlockFailed);
+        }
+        let cache_keys = view_session.derive_cache_keys(&metadata.wallet_chain_uuid)?;
+        Ok(Self {
+            db,
+            metadata: Mutex::new(metadata),
+            cache_keys,
+        })
+    }
+
     pub fn new(
         db: Arc<DbStore>,
         view_session: &Arc<DesktopViewSession>,
@@ -218,6 +237,34 @@ impl DesktopEncryptedWalletCacheStore {
         Ok(WalletPrivateNamespaceId::new(chain_id, wallet_id.clone()))
     }
 
+    pub(super) fn sender_transaction_candidate_rewind_row_ids(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        from_block: u64,
+    ) -> Result<Vec<Vec<u8>>, VaultError> {
+        let namespace = self
+            .private_namespace(chain_id, wallet_id)
+            .map_err(vault_error_from_wallet_cache)?;
+        let candidates = self
+            .list_sender_transaction_candidates(chain_id, wallet_id)
+            .map_err(vault_error_from_wallet_cache)?;
+        let semantic_ids = sender_transaction_candidate_rewind_ids(&candidates, from_block)
+            .map_err(|_| VaultError::Decrypt)?;
+        Ok(semantic_ids
+            .iter()
+            .map(|semantic_id| {
+                self.cache_keys
+                    .private_row_id(
+                        WalletPrivateRecordKind::SenderTransactionCandidate,
+                        namespace.wallet_id.as_str(),
+                        semantic_id.as_slice(),
+                    )
+                    .to_vec()
+            })
+            .collect())
+    }
+
     pub(super) fn encrypted_private_row<T: Serialize>(
         &self,
         namespace: &WalletPrivateNamespaceId,
@@ -296,6 +343,35 @@ impl DesktopEncryptedWalletCacheStore {
         )
     }
 
+    pub(super) fn sender_transaction_candidate_row(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        candidate: &SenderTransactionCandidate,
+    ) -> Result<OpaqueWalletPrivateRow, VaultError> {
+        if candidate.chain_id != namespace.chain_id
+            || candidate.wallet_id.as_str() != namespace.wallet_id.as_str()
+        {
+            return Err(VaultError::Decrypt);
+        }
+        let semantic_id = candidate.semantic_id();
+        let row_id = self.cache_keys.private_row_id(
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            namespace.wallet_id.as_str(),
+            semantic_id.as_slice(),
+        );
+        let plaintext = candidate.encode().map_err(|_| VaultError::Decrypt)?;
+        let encrypted = self.cache_keys.encrypt_private_row(
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            namespace.wallet_id.as_str(),
+            &row_id,
+            &plaintext,
+        )?;
+        Ok(OpaqueWalletPrivateRow {
+            row_id: row_id.to_vec(),
+            payload: rmp_serde::to_vec_named(&encrypted)?,
+        })
+    }
+
     pub(super) fn decode_pending_output_row(
         &self,
         namespace: &WalletPrivateNamespaceId,
@@ -341,6 +417,42 @@ impl DesktopEncryptedWalletCacheStore {
             return Err(VaultError::Decrypt);
         }
         Ok(record)
+    }
+
+    pub(super) fn decode_sender_transaction_candidate_row(
+        &self,
+        namespace: &WalletPrivateNamespaceId,
+        row: &OpaqueWalletPrivateRow,
+    ) -> Result<SenderTransactionCandidate, VaultError> {
+        let row_id: [u8; KEY_LEN] = row
+            .row_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| VaultError::Decrypt)?;
+        let encrypted: EncryptedRecord = rmp_serde::from_slice(&row.payload)?;
+        let plaintext = self.cache_keys.decrypt_private_row(
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            namespace.wallet_id.as_str(),
+            &row_id,
+            &encrypted,
+        )?;
+        let candidate =
+            SenderTransactionCandidate::decode(&plaintext).map_err(|_| VaultError::Decrypt)?;
+        if candidate.chain_id != namespace.chain_id
+            || candidate.wallet_id.as_str() != namespace.wallet_id.as_str()
+        {
+            return Err(VaultError::Decrypt);
+        }
+        let semantic_id = candidate.semantic_id();
+        let expected_row_id = self.cache_keys.private_row_id(
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            namespace.wallet_id.as_str(),
+            semantic_id.as_slice(),
+        );
+        if expected_row_id != row_id {
+            return Err(VaultError::Decrypt);
+        }
+        Ok(candidate)
     }
 
     fn encrypted_wallet_utxo_entries(
@@ -394,6 +506,7 @@ impl DesktopEncryptedWalletCacheStore {
                 sync_actor_state: None,
                 pending_output_contexts: OpaqueWalletPrivateRowMutation::default(),
                 output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
+                sender_transaction_candidates: OpaqueWalletPrivateRowMutation::default(),
             })?;
         Ok(())
     }
@@ -431,6 +544,7 @@ impl DesktopEncryptedWalletCacheStore {
                     updates: &output_poi_recoveries,
                     deletes: &[],
                 },
+                sender_transaction_candidates: OpaqueWalletPrivateRowMutation::default(),
             })?;
         Ok(())
     }
@@ -481,6 +595,49 @@ impl DesktopEncryptedWalletCacheStore {
                 output_poi_recoveries: OpaqueWalletPrivateRowMutation {
                     updates: &[],
                     deletes: &output_poi_recoveries,
+                },
+                sender_transaction_candidates: OpaqueWalletPrivateRowMutation::default(),
+            })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_sender_transaction_candidates_for_test(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        updates: &[SenderTransactionCandidate],
+        deletes: &[FixedBytes<32>],
+    ) -> Result<(), WalletCacheError> {
+        let namespace = self.private_namespace(chain_id, wallet_id)?;
+        let updates = updates
+            .iter()
+            .map(|candidate| self.sender_transaction_candidate_row(&namespace, candidate))
+            .collect::<Result<Vec<_>, VaultError>>()
+            .map_err(|_| WalletCacheError::Crypto)?;
+        let deletes = deletes
+            .iter()
+            .map(|transaction_hash| {
+                self.cache_keys
+                    .private_row_id(
+                        WalletPrivateRecordKind::SenderTransactionCandidate,
+                        namespace.wallet_id.as_str(),
+                        transaction_hash.as_slice(),
+                    )
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        self.db
+            .batch_commit_wallet_private_state(&WalletPrivateStateBatch {
+                namespace: &namespace,
+                utxos: WalletUtxoRowMutation::Preserve,
+                metadata: WalletMetaMutation::Preserve,
+                sync_actor_state: None,
+                pending_output_contexts: OpaqueWalletPrivateRowMutation::default(),
+                output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
+                sender_transaction_candidates: OpaqueWalletPrivateRowMutation {
+                    updates: &updates,
+                    deletes: &deletes,
                 },
             })?;
         Ok(())
@@ -560,6 +717,25 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
                     .to_vec()
             })
             .collect::<Vec<_>>();
+        let sender_transaction_candidate_updates = commit
+            .sender_transaction_candidate_updates()
+            .iter()
+            .map(|candidate| self.sender_transaction_candidate_row(&namespace, candidate))
+            .collect::<Result<Vec<_>, VaultError>>()
+            .map_err(|_| WalletCacheError::Crypto)?;
+        let sender_transaction_candidate_deletes = commit
+            .sender_transaction_candidate_deletes()
+            .iter()
+            .map(|transaction_hash| {
+                self.cache_keys
+                    .private_row_id(
+                        WalletPrivateRecordKind::SenderTransactionCandidate,
+                        namespace.wallet_id.as_str(),
+                        transaction_hash.as_slice(),
+                    )
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
         self.db
             .batch_commit_wallet_private_state(&WalletPrivateStateBatch {
                 namespace: &namespace,
@@ -578,6 +754,10 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
                 output_poi_recoveries: OpaqueWalletPrivateRowMutation {
                     updates: &output_poi_recovery_updates,
                     deletes: &output_poi_recovery_deletes,
+                },
+                sender_transaction_candidates: OpaqueWalletPrivateRowMutation {
+                    updates: &sender_transaction_candidate_updates,
+                    deletes: &sender_transaction_candidate_deletes,
                 },
             })?;
         if let (Some(metadata), Some(wallet_meta)) = (metadata.as_mut(), wallet_meta.as_ref()) {
@@ -737,6 +917,55 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
             .iter()
             .map(|row| {
                 self.decode_output_recovery_row(&namespace, row)
+                    .map_err(|_| WalletCacheError::Crypto)
+            })
+            .collect()
+    }
+
+    fn get_sender_transaction_candidate(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+        outer_transaction_hash: &FixedBytes<32>,
+    ) -> Result<Option<SenderTransactionCandidate>, WalletCacheError> {
+        let namespace = self.private_namespace(chain_id, wallet_id)?;
+        let row_id = self.cache_keys.private_row_id(
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            namespace.wallet_id.as_str(),
+            outer_transaction_hash.as_slice(),
+        );
+        self.db
+            .get_opaque_wallet_private_row(
+                &namespace,
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+                &row_id,
+            )?
+            .map(|row| {
+                let candidate = self
+                    .decode_sender_transaction_candidate_row(&namespace, &row)
+                    .map_err(|_| WalletCacheError::Crypto)?;
+                if candidate.semantic_id() != *outer_transaction_hash {
+                    return Err(WalletCacheError::Crypto);
+                }
+                Ok(candidate)
+            })
+            .transpose()
+    }
+
+    fn list_sender_transaction_candidates(
+        &self,
+        chain_id: u64,
+        wallet_id: &WalletCacheKey,
+    ) -> Result<Vec<SenderTransactionCandidate>, WalletCacheError> {
+        let namespace = self.private_namespace(chain_id, wallet_id)?;
+        self.db
+            .list_opaque_wallet_private_rows(
+                &namespace,
+                WalletPrivateRecordKind::SenderTransactionCandidate,
+            )?
+            .iter()
+            .map(|row| {
+                self.decode_sender_transaction_candidate_row(&namespace, row)
                     .map_err(|_| WalletCacheError::Crypto)
             })
             .collect()

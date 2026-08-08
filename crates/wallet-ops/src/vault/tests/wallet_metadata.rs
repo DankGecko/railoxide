@@ -2,8 +2,9 @@ use super::super::*;
 use super::helpers::*;
 use alloy::primitives::FixedBytes;
 use local_db::{
-    OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, PendingOutputPoiContextRecord,
-    PendingOutputPoiRole, WalletMeta, WalletSyncActorStateRecord,
+    OpaqueWalletPrivateRow, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
+    PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta, WalletPrivateNamespaceId,
+    WalletPrivateRecordKind, WalletSyncActorStateRecord,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -534,6 +535,33 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
         updated_at: 2,
     })
     .expect("store actor state");
+    let second_namespace =
+        WalletPrivateNamespaceId::new(second_chain.chain_id, second_cache_key.clone());
+    let first_cache_key = first_chain
+        .wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .expect("first wallet cache key");
+    let first_namespace = WalletPrivateNamespaceId::new(first_chain.chain_id, first_cache_key);
+    let target_candidate_row = OpaqueWalletPrivateRow {
+        row_id: vec![0x21; 32],
+        payload: b"target encrypted sender candidate".to_vec(),
+    };
+    let unrelated_candidate_row = OpaqueWalletPrivateRow {
+        row_id: vec![0x22; 32],
+        payload: b"unrelated encrypted sender candidate".to_vec(),
+    };
+    db.put_opaque_wallet_private_row(
+        &second_namespace,
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &target_candidate_row,
+    )
+    .expect("store target sender candidate");
+    db.put_opaque_wallet_private_row(
+        &first_namespace,
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &unrelated_candidate_row,
+    )
+    .expect("store unrelated sender candidate");
     let pending_commitment = FixedBytes::from([0x31; 32]);
     db.put_pending_output_poi_context(&PendingOutputPoiContextRecord {
         chain_id: second_chain.chain_id,
@@ -721,6 +749,22 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
         db.list_output_poi_recoveries(second_chain.chain_id, second_cache_key.as_str())
             .expect("list deleted output recoveries")
             .is_empty()
+    );
+    assert!(
+        db.list_opaque_wallet_private_rows(
+            &second_namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+        )
+        .expect("list deleted sender candidates")
+        .is_empty()
+    );
+    assert_eq!(
+        db.list_opaque_wallet_private_rows(
+            &first_namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+        )
+        .expect("list retained unrelated sender candidates"),
+        vec![unrelated_candidate_row]
     );
     assert!(
         db.list_pending_output_poi_contexts(second_chain.chain_id, second_wallet_id)

@@ -542,6 +542,11 @@ mod tests {
     #[test]
     fn wallet_session_observation_keeps_ppoi_workflow_separate_from_snapshot() {
         let status = WalletPpoiWorkflowStatus {
+            awaiting_recovery: 5,
+            awaiting_public_txid_data: 0,
+            awaiting_poi_data: 0,
+            retrying_recovery: 0,
+            recovery_needs_attention: 0,
             awaiting_submission: 1,
             awaiting_validation: 2,
             needs_attention: 3,

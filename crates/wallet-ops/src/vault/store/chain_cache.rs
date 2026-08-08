@@ -6,6 +6,8 @@ use local_db::{
     WalletUtxoRowMutation,
 };
 
+use crate::vault::DesktopEncryptedWalletCacheStore;
+
 use super::{
     DesktopVaultStore, DesktopViewSession, EncryptedRecord, VaultError, WALLET_CHAIN_INDEX_PREFIX,
     WALLET_CHAIN_METADATA_PREFIX, WalletCacheKey, WalletChainMetadataBundle, WalletMeta,
@@ -228,7 +230,15 @@ impl DesktopVaultStore {
         metadata: &mut WalletChainMetadataBundle,
         start_block: u64,
     ) -> Result<(), VaultError> {
-        self.commit_wallet_chain_cache_repair(view_session, metadata, &[], start_block)
+        let candidate_deletes =
+            self.sender_transaction_candidate_rewind_row_ids(view_session, metadata, start_block)?;
+        self.commit_wallet_chain_cache_repair(
+            view_session,
+            metadata,
+            &[],
+            &candidate_deletes,
+            start_block,
+        )
     }
 
     pub fn rewind_wallet_chain_cache_with_session(
@@ -237,6 +247,8 @@ impl DesktopVaultStore {
         metadata: &mut WalletChainMetadataBundle,
         start_block: u64,
     ) -> Result<(), VaultError> {
+        let candidate_deletes =
+            self.sender_transaction_candidate_rewind_row_ids(view_session, metadata, start_block)?;
         let cache_keys = view_session.derive_cache_keys(&metadata.wallet_chain_uuid)?;
         let wallet_id = metadata.wallet_chain_uuid.parse::<WalletCacheKey>()?;
         let existing_rows = self.db.list_wallet_utxos(&wallet_id)?;
@@ -289,7 +301,13 @@ impl DesktopVaultStore {
             records.push((alloy::hex::encode(row_id), data));
         }
 
-        self.commit_wallet_chain_cache_repair(view_session, metadata, &records, start_block)?;
+        self.commit_wallet_chain_cache_repair(
+            view_session,
+            metadata,
+            &records,
+            &candidate_deletes,
+            start_block,
+        )?;
         tracing::info!(
             wallet_chain_uuid = %metadata.wallet_chain_uuid,
             start_block,
@@ -302,11 +320,31 @@ impl DesktopVaultStore {
         Ok(())
     }
 
+    fn sender_transaction_candidate_rewind_row_ids(
+        &self,
+        view_session: &DesktopViewSession,
+        metadata: &WalletChainMetadataBundle,
+        start_block: u64,
+    ) -> Result<Vec<Vec<u8>>, VaultError> {
+        let wallet_id = metadata.wallet_chain_uuid.parse::<WalletCacheKey>()?;
+        let cache = DesktopEncryptedWalletCacheStore::for_chain_cache_repair(
+            self.db.clone(),
+            view_session,
+            metadata.clone(),
+        )?;
+        cache.sender_transaction_candidate_rewind_row_ids(
+            metadata.chain_id,
+            &wallet_id,
+            start_block,
+        )
+    }
+
     fn commit_wallet_chain_cache_repair(
         &self,
         view_session: &DesktopViewSession,
         metadata: &mut WalletChainMetadataBundle,
         records: &[(String, Vec<u8>)],
+        candidate_deletes: &[Vec<u8>],
         start_block: u64,
     ) -> Result<(), VaultError> {
         let last_scanned_block = start_block.saturating_sub(1);
@@ -363,6 +401,10 @@ impl DesktopVaultStore {
                     sync_actor_state: Some(&sync_actor_state),
                     pending_output_contexts: OpaqueWalletPrivateRowMutation::default(),
                     output_poi_recoveries: OpaqueWalletPrivateRowMutation::default(),
+                    sender_transaction_candidates: OpaqueWalletPrivateRowMutation {
+                        updates: &[],
+                        deletes: candidate_deletes,
+                    },
                 },
                 &vault_records,
             )?;

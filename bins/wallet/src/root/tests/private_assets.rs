@@ -481,6 +481,38 @@ fn private_pending_banner_collapses_pending_states_to_one_line() {
 }
 
 #[test]
+fn private_pending_summary_surfaces_sender_recovery_without_assets() {
+    let snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "sender-recovery".to_string(),
+        utxo_count: 0,
+        unspent_count: 0,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: Vec::new(),
+        totals: Vec::new(),
+    };
+    let summary = private_pending_summary_with_workflow(
+        &[],
+        &snapshot,
+        Vec::new(),
+        wallet_ops::WalletPpoiWorkflowStatus {
+            awaiting_recovery: 1,
+            awaiting_public_txid_data: 1,
+            ..wallet_ops::WalletPpoiWorkflowStatus::default()
+        },
+        false,
+        None,
+    )
+    .expect("sender workflow summary");
+
+    assert_eq!(
+        private_pending_summary_title(&summary),
+        "Waiting for public transaction proof data"
+    );
+}
+
+#[test]
 fn private_asset_rows_show_separate_pending_amounts() {
     let token = Address::from([0x11; 20]);
     let mut pending_in = unshield_utxo_output(token, 7, 0, 2);

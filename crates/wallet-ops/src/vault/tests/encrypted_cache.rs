@@ -20,6 +20,8 @@ const PENDING_OUTPUT_CONTEXT_V2: RawWalletPrivateTable =
     TableDefinition::new("pending_output_poi_context_v2");
 const OUTPUT_POI_RECOVERY_V2: RawWalletPrivateTable =
     TableDefinition::new("output_poi_recovery_v2");
+const SENDER_TRANSACTION_CANDIDATE_V1: RawWalletPrivateTable =
+    TableDefinition::new("sender_transaction_candidate_v1");
 
 fn put_raw_wallet_private_row(
     db_path: &Path,
@@ -100,6 +102,46 @@ fn sample_private_workflow_records(
             last_error: Some("recovery-role-sentinel".to_string()),
         },
     )
+}
+
+fn sample_sender_transaction_candidate(
+    chain_id: u64,
+    wallet_id: &WalletCacheKey,
+    transaction_marker: u8,
+    note_marker: u8,
+    block_number: u64,
+) -> sync_service::SenderTransactionCandidate {
+    use railgun_wallet::{Note, UtxoSource};
+    use sync_service::{SenderTransactionCandidateOutput, SenderTransactionCandidateSpend};
+
+    let note = Note {
+        token_hash: U256::from_be_bytes([note_marker; KEY_LEN]),
+        value: U256::from(note_marker),
+        random: [note_marker; 16],
+        npk: U256::from_be_bytes([note_marker.wrapping_add(1); KEY_LEN]),
+    };
+    let output_commitment = FixedBytes::from(note.commitment().to_be_bytes::<KEY_LEN>());
+    sync_service::SenderTransactionCandidate::new(
+        chain_id,
+        wallet_id.clone(),
+        UtxoSource {
+            tx_hash: FixedBytes::from([transaction_marker; KEY_LEN]),
+            block_number,
+            block_timestamp: 1_700_000_000 + block_number,
+        },
+        vec![SenderTransactionCandidateSpend {
+            tree: 1,
+            position: 2,
+            commitment: FixedBytes::from([transaction_marker.wrapping_add(1); KEY_LEN]),
+        }],
+        vec![SenderTransactionCandidateOutput {
+            tree: 3,
+            position: 4,
+            commitment: output_commitment,
+            note: Some(note),
+        }],
+    )
+    .expect("valid sender transaction candidate")
 }
 
 fn encrypted_private_workflow_row<T: Serialize>(
@@ -392,6 +434,442 @@ fn current_poi_workflow_writes_are_opaque_and_restart_safe() {
             .expect("list recoveries after restart")
             .len(),
         1
+    );
+
+    drop(cache_store);
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn sender_transaction_candidates_are_opaque_restart_safe_and_fail_closed() {
+    use sync_service::WalletCacheStore;
+
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let db_path = db.db_path();
+    let store = DesktopVaultStore::from_db(Arc::clone(&db));
+    let created = create_with_params(TEST_PASSWORD, test_kdf()).expect("create vault");
+    store
+        .put_metadata(&created.metadata)
+        .expect("persist metadata");
+    let wallet_id = "sender-candidate-wallet";
+    let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    store
+        .import_wallet_mnemonic(TEST_PASSWORD, wallet_id, 0, "english", mnemonic)
+        .expect("import wallet");
+    let view_session = Arc::new(
+        store
+            .load_view_session(TEST_PASSWORD, wallet_id)
+            .expect("load view session"),
+    );
+    let chain_metadata = store
+        .wallet_chain_metadata_for_session(
+            view_session.as_ref(),
+            0,
+            1,
+            "0x1111111111111111111111111111111111111111",
+            100,
+        )
+        .expect("chain metadata");
+    let wallet_cache_key = chain_metadata
+        .wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .expect("wallet cache key");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key.clone());
+    let cache_store = DesktopEncryptedWalletCacheStore::new(
+        Arc::clone(&db),
+        &view_session,
+        chain_metadata.clone(),
+    )
+    .expect("encrypted cache store");
+    let candidate = sample_sender_transaction_candidate(1, &wallet_cache_key, 0xa1, 0xb2, 120);
+
+    cache_store
+        .commit_sender_transaction_candidates_for_test(
+            1,
+            &wallet_cache_key,
+            std::slice::from_ref(&candidate),
+            &[],
+        )
+        .expect("persist sender candidate");
+    let loaded = cache_store
+        .get_sender_transaction_candidate(1, &wallet_cache_key, &candidate.semantic_id())
+        .expect("load sender candidate")
+        .expect("sender candidate present");
+    assert_eq!(
+        loaded.encode().expect("encode loaded candidate"),
+        candidate.encode().unwrap()
+    );
+
+    let opaque_row = db
+        .list_opaque_wallet_private_rows(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+        )
+        .expect("list opaque candidate rows")
+        .pop()
+        .expect("opaque candidate row");
+    let encrypted: EncryptedRecord =
+        rmp_serde::from_slice(&opaque_row.payload).expect("decode encrypted envelope");
+    let row_id: [u8; KEY_LEN] = opaque_row.row_id.clone().try_into().expect("opaque row id");
+    assert!(
+        cache_store
+            .cache_keys
+            .decrypt_private_row(
+                WalletPrivateRecordKind::OutputPoiRecovery,
+                namespace.wallet_id.as_str(),
+                &row_id,
+                &encrypted,
+            )
+            .is_err()
+    );
+    let mut wrong_row = opaque_row.clone();
+    wrong_row.row_id[0] ^= 1;
+    assert!(
+        cache_store
+            .decode_sender_transaction_candidate_row(&namespace, &wrong_row)
+            .is_err()
+    );
+    let other_namespace =
+        WalletPrivateNamespaceId::new(1, WalletCacheKey::from_opaque_id([0x44; 16]));
+    assert!(
+        cache_store
+            .decode_sender_transaction_candidate_row(&other_namespace, &opaque_row)
+            .is_err()
+    );
+
+    let wrong_semantic_id = FixedBytes::from([0xc3; KEY_LEN]);
+    let wrong_semantic_row_id = cache_store.cache_keys.private_row_id(
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        namespace.wallet_id.as_str(),
+        wrong_semantic_id.as_slice(),
+    );
+    let wrong_semantic_envelope = cache_store
+        .cache_keys
+        .encrypt_private_row(
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+            namespace.wallet_id.as_str(),
+            &wrong_semantic_row_id,
+            &candidate.encode().expect("encode candidate"),
+        )
+        .expect("encrypt semantically mismatched candidate");
+    assert!(
+        cache_store
+            .decode_sender_transaction_candidate_row(
+                &namespace,
+                &OpaqueWalletPrivateRow {
+                    row_id: wrong_semantic_row_id.to_vec(),
+                    payload: rmp_serde::to_vec_named(&wrong_semantic_envelope)
+                        .expect("encode mismatched envelope"),
+                },
+            )
+            .is_err()
+    );
+
+    drop(cache_store);
+    drop(store);
+    drop(db);
+    let raw_rows = raw_wallet_private_rows(&db_path, SENDER_TRANSACTION_CANDIDATE_V1);
+    assert_eq!(raw_rows.len(), 1);
+    for (key, payload) in &raw_rows {
+        assert!(!contains_subsequence(
+            key,
+            candidate.semantic_id().as_slice()
+        ));
+        assert!(!contains_subsequence(
+            payload,
+            candidate.semantic_id().as_slice()
+        ));
+        assert!(!contains_subsequence(key, &[0xb2; 16]));
+        assert!(!contains_subsequence(payload, &[0xb2; 16]));
+        assert!(sync_service::SenderTransactionCandidate::decode(payload).is_err());
+    }
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("reopen db"),
+    );
+    let cache_store =
+        DesktopEncryptedWalletCacheStore::new(Arc::clone(&db), &view_session, chain_metadata)
+            .expect("reopen encrypted cache store");
+    assert_eq!(
+        cache_store
+            .list_sender_transaction_candidates(1, &wallet_cache_key)
+            .expect("list candidates after restart")
+            .len(),
+        1
+    );
+
+    drop(cache_store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn chain_cache_repair_rewinds_sender_candidates_at_the_boundary() {
+    use sync_service::WalletCacheStore;
+
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let store = DesktopVaultStore::from_db(Arc::clone(&db));
+    let created = create_with_params(TEST_PASSWORD, test_kdf()).expect("create vault");
+    store
+        .put_metadata(&created.metadata)
+        .expect("persist metadata");
+    let wallet_id = "sender-candidate-rewind-wallet";
+    store
+        .import_wallet_mnemonic(
+            TEST_PASSWORD,
+            wallet_id,
+            0,
+            "english",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .expect("import wallet");
+    let view_session = Arc::new(store.load_view_session(TEST_PASSWORD, wallet_id).unwrap());
+    let mut chain_metadata = store
+        .wallet_chain_metadata_for_session(
+            view_session.as_ref(),
+            0,
+            1,
+            "0x1111111111111111111111111111111111111111",
+            100,
+        )
+        .unwrap();
+    let wallet_cache_key = chain_metadata.wallet_chain_uuid.parse().unwrap();
+    let cache_store = DesktopEncryptedWalletCacheStore::new(
+        Arc::clone(&db),
+        &view_session,
+        chain_metadata.clone(),
+    )
+    .unwrap();
+    let retained = sample_sender_transaction_candidate(1, &wallet_cache_key, 0x21, 0x31, 149);
+    let boundary = sample_sender_transaction_candidate(1, &wallet_cache_key, 0x22, 0x32, 150);
+    let after_boundary = sample_sender_transaction_candidate(1, &wallet_cache_key, 0x23, 0x33, 160);
+    cache_store
+        .commit_sender_transaction_candidates_for_test(
+            1,
+            &wallet_cache_key,
+            &[retained.clone(), boundary, after_boundary],
+            &[],
+        )
+        .unwrap();
+    store
+        .rewind_wallet_chain_cache_with_session(view_session.as_ref(), &mut chain_metadata, 150)
+        .expect("rewind chain cache and sender candidates");
+
+    let remaining = cache_store
+        .list_sender_transaction_candidates(1, &wallet_cache_key)
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].semantic_id(), retained.semantic_id());
+
+    store
+        .reset_wallet_chain_cache_with_session(view_session.as_ref(), &mut chain_metadata, 100)
+        .expect("reset chain cache to deployment");
+    assert!(
+        cache_store
+            .list_sender_transaction_candidates(1, &wallet_cache_key)
+            .expect("list candidates after deployment reset")
+            .is_empty()
+    );
+
+    drop(cache_store);
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn malformed_sender_candidate_aborts_chain_cache_repair_atomically() {
+    use local_db::WalletSyncActorStateRecord;
+    use railgun_wallet::{Note, Utxo, UtxoCommitmentKind, UtxoSource};
+
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let store = DesktopVaultStore::from_db(Arc::clone(&db));
+    let created = create_with_params(TEST_PASSWORD, test_kdf()).expect("create vault");
+    store
+        .put_metadata(&created.metadata)
+        .expect("persist metadata");
+    let wallet_id = "sender-candidate-repair-failure-wallet";
+    store
+        .import_wallet_mnemonic(
+            TEST_PASSWORD,
+            wallet_id,
+            0,
+            "english",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .expect("import wallet");
+    let view_session = Arc::new(
+        store
+            .load_view_session(TEST_PASSWORD, wallet_id)
+            .expect("load view session"),
+    );
+    let mut chain_metadata = store
+        .wallet_chain_metadata_for_session(
+            view_session.as_ref(),
+            0,
+            1,
+            "0x1111111111111111111111111111111111111111",
+            100,
+        )
+        .expect("chain metadata");
+    let wallet_cache_key = chain_metadata
+        .wallet_chain_uuid
+        .parse::<WalletCacheKey>()
+        .expect("wallet cache key");
+    let namespace = WalletPrivateNamespaceId::new(1, wallet_cache_key.clone());
+    let cache_store = DesktopEncryptedWalletCacheStore::new(
+        Arc::clone(&db),
+        &view_session,
+        chain_metadata.clone(),
+    )
+    .expect("encrypted cache store");
+    let utxo = WalletUtxo {
+        utxo: Utxo::new(
+            Note {
+                token_hash: U256::from_be_bytes([0x11; KEY_LEN]),
+                value: uint!(1_U256),
+                random: [0x22; 16],
+                npk: U256::from_be_bytes([0x33; KEY_LEN]),
+            },
+            3,
+            1,
+            UtxoSource {
+                tx_hash: FixedBytes::from([0x44; KEY_LEN]),
+                block_number: 120,
+                block_timestamp: 1_700_000_120,
+            },
+            UtxoCommitmentKind::Transact,
+        ),
+        spent: None,
+    };
+    cache_store
+        .replace_wallet_cache_atomically_for_test(
+            &wallet_cache_key,
+            std::slice::from_ref(&utxo),
+            180,
+            Some([0xaa; KEY_LEN]),
+        )
+        .expect("seed wallet cache");
+    let candidate = sample_sender_transaction_candidate(1, &wallet_cache_key, 0x51, 0x61, 160);
+    cache_store
+        .commit_sender_transaction_candidates_for_test(
+            1,
+            &wallet_cache_key,
+            std::slice::from_ref(&candidate),
+            &[],
+        )
+        .expect("seed candidate");
+    let valid_row = db
+        .list_opaque_wallet_private_rows(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+        )
+        .expect("list candidate rows")
+        .pop()
+        .expect("candidate row");
+    db.put_opaque_wallet_private_row(
+        &namespace,
+        WalletPrivateRecordKind::SenderTransactionCandidate,
+        &OpaqueWalletPrivateRow {
+            row_id: vec![0xef; KEY_LEN],
+            payload: valid_row.payload,
+        },
+    )
+    .expect("inject malformed encrypted candidate row");
+    db.put_wallet_sync_actor_state(&WalletSyncActorStateRecord {
+        chain_id: 1,
+        wallet_id: wallet_cache_key.to_string(),
+        highest_accepted_reset_intent: 7,
+        pending_reset: None,
+        updated_at: 1,
+    })
+    .expect("seed actor state");
+
+    let utxos_before = db.list_wallet_utxos(&wallet_cache_key).unwrap();
+    let wallet_meta_before =
+        rmp_serde::to_vec_named(&db.get_wallet_meta(&wallet_cache_key).unwrap())
+            .expect("encode wallet meta snapshot");
+    let actor_before = db
+        .get_wallet_sync_actor_state(1, wallet_cache_key.as_str())
+        .unwrap();
+    let vault_before = db
+        .get_desktop_wallet_vault_record(&wallet_chain_metadata_record_key(
+            &chain_metadata.wallet_chain_uuid,
+        ))
+        .unwrap();
+    let candidates_before = db
+        .list_opaque_wallet_private_rows(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+        )
+        .unwrap();
+    let in_memory_metadata_before =
+        rmp_serde::to_vec_named(&chain_metadata).expect("encode metadata snapshot");
+
+    assert!(
+        store
+            .rewind_wallet_chain_cache_with_session(
+                view_session.as_ref(),
+                &mut chain_metadata,
+                150,
+            )
+            .is_err()
+    );
+
+    assert_eq!(
+        db.list_wallet_utxos(&wallet_cache_key).unwrap(),
+        utxos_before
+    );
+    assert_eq!(
+        rmp_serde::to_vec_named(&db.get_wallet_meta(&wallet_cache_key).unwrap())
+            .expect("encode unchanged wallet meta"),
+        wallet_meta_before
+    );
+    assert_eq!(
+        db.get_wallet_sync_actor_state(1, wallet_cache_key.as_str())
+            .unwrap(),
+        actor_before
+    );
+    assert_eq!(
+        db.get_desktop_wallet_vault_record(&wallet_chain_metadata_record_key(
+            &chain_metadata.wallet_chain_uuid,
+        ))
+        .unwrap(),
+        vault_before
+    );
+    assert_eq!(
+        db.list_opaque_wallet_private_rows(
+            &namespace,
+            WalletPrivateRecordKind::SenderTransactionCandidate,
+        )
+        .unwrap(),
+        candidates_before
+    );
+    assert_eq!(
+        rmp_serde::to_vec_named(&chain_metadata).expect("encode unchanged metadata"),
+        in_memory_metadata_before
     );
 
     drop(cache_store);

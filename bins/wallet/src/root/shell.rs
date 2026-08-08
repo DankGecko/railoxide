@@ -34,7 +34,7 @@ use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind, PoiArtifactCacheListProgress,
     PoiArtifactCachePhase, PoiArtifactCacheProgress, PublicScanSource, WalletNetworkMode,
-    WalletSyncTip,
+    WalletPpoiWorkflowStatus, WalletSyncTip,
 };
 
 use crate::assets::{
@@ -51,7 +51,8 @@ use super::private_assets::{
     format_private_asset_rows_from_snapshot, should_show_pending_poi_amount,
 };
 use super::utxo::{
-    blocked_shield_rescue_display_rows, recoverable_poi_candidate_count, should_focus_utxo_table,
+    blocked_shield_rescue_display_rows, ppoi_workflow_status_detail, ppoi_workflow_status_title,
+    recoverable_poi_candidate_count, should_focus_utxo_table,
 };
 use super::{
     Activity, ChainUtxoState, HERO_CARD_MAX_WIDTH, HERO_MEDIUM_BREAKPOINT, HERO_STAGE_MAX_WIDTH,
@@ -302,7 +303,10 @@ impl Render for WalletRoot {
                 wallet_generation,
             )
         }) {
-            window.push_notification(Notification::success("PPOI verification complete."), cx);
+            window.push_notification(
+                Notification::success("Outgoing transaction proofs recovered."),
+                cx,
+            );
         }
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.sync_walletconnect_attention_for_window(window);
@@ -733,7 +737,10 @@ impl WalletRoot {
 
     fn render_wallet_status_bar(&self, root: &Entity<Self>) -> Option<gpui::AnyElement> {
         let state = self.chain_states.get(&self.selected_chain)?;
-        let counts = self.wallet_status_counts(state.snapshot().map(AsRef::as_ref));
+        let counts = self.wallet_status_counts(
+            state.snapshot().map(AsRef::as_ref),
+            state.ppoi_workflow_status(),
+        );
         let syncing = state.is_syncing();
         if !state.renders_table() {
             return None;
@@ -757,9 +764,13 @@ impl WalletRoot {
     fn wallet_status_counts(
         &self,
         snapshot: Option<&wallet_ops::ListUtxosOutput>,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus,
     ) -> WalletStatusCounts {
         let Some(snapshot) = snapshot else {
-            return WalletStatusCounts::default();
+            return WalletStatusCounts {
+                ppoi_workflow_status,
+                ..WalletStatusCounts::default()
+            };
         };
         let assets = format_private_asset_rows_from_snapshot(
             snapshot,
@@ -784,6 +795,7 @@ impl WalletRoot {
                 &self.blocked_shield_refunds_in_flight,
             )
             .len(),
+            ppoi_workflow_status,
         }
     }
 
@@ -956,7 +968,7 @@ impl WalletRoot {
         let balances_status = self.balances_status_for_state(state);
         let mut chips = Vec::new();
 
-        if counts.ppoi_attention_count() > 0 {
+        if counts.ppoi_status_count() > 0 {
             chips.push(Self::render_ppoi_status_indicator(
                 root,
                 ppoi_status,
@@ -984,10 +996,17 @@ impl WalletRoot {
         counts: WalletStatusCounts,
         label: &'static str,
     ) -> gpui::AnyElement {
+        let details_root = root.clone();
         render_ppoi_status_hover_target(root, "wallet-status-ppoi-hover")
+            .cursor_pointer()
+            .on_click(move |_event, window, cx| {
+                details_root.update(cx, |root, cx| {
+                    root.open_private_pending_status_dialog(window, cx);
+                });
+            })
             .child(
                 Badge::new()
-                    .count(counts.ppoi_attention_count())
+                    .count(counts.ppoi_status_count())
                     .color(rgb(ppoi_attention_badge_color(counts)))
                     .child(
                         status_presence_text(label, status)
@@ -1202,8 +1221,13 @@ impl Render for BalancesStatusHoverCard {
                 .get(&chain_id)
                 .map(|chain| chain.block_time);
             let state = root.chain_states.get(&chain_id);
-            let counts = root
-                .wallet_status_counts(state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref));
+            let counts = root.wallet_status_counts(
+                state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref),
+                state.map_or_else(
+                    WalletPpoiWorkflowStatus::default,
+                    ChainUtxoState::ppoi_workflow_status,
+                ),
+            );
             let context = state.and_then(|state| match state {
                 ChainUtxoState::Loading { .. } => Some(SyncStatusContext::Loading),
                 ChainUtxoState::Syncing { .. } => Some(SyncStatusContext::Syncing),
@@ -1314,8 +1338,13 @@ impl Render for PpoiStatusHoverCard {
         let (status, progress, refreshing, counts, retrying) = {
             let root = self.root.read(cx);
             let state = root.chain_states.get(&root.selected_chain);
-            let counts = root
-                .wallet_status_counts(state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref));
+            let counts = root.wallet_status_counts(
+                state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref),
+                state.map_or_else(
+                    WalletPpoiWorkflowStatus::default,
+                    ChainUtxoState::ppoi_workflow_status,
+                ),
+            );
             let status = state.map_or(PresenceStatus::Unknown, |state| {
                 root.ppoi_status_for_state(state, counts)
             });
@@ -1409,10 +1438,27 @@ impl Render for PpoiStatusHoverCard {
             .when(refreshing, |this| {
                 this.child(render_ppoi_hover_note(
                     "Submitting PPOIs…",
-                    "Submitting sender-created contexts and checking owned outputs. Retry PPOI submissions from Activity if an output remains blocked.",
+                    "Submitting sender-created contexts and checking owned outputs. Open Private asset status to review or retry blocked work.",
                     theme::WARNING,
                 ))
             })
+            .when(
+                counts.ppoi_workflow_status.has_outstanding() && !refreshing,
+                |this| {
+                    this.child(render_ppoi_hover_note(
+                        ppoi_workflow_status_title(counts.ppoi_workflow_status, false)
+                            .unwrap_or("Outgoing proof recovery"),
+                        &ppoi_workflow_status_detail(counts.ppoi_workflow_status),
+                        if counts.ppoi_workflow_status.needs_attention > 0
+                            || counts.ppoi_workflow_status.recovery_needs_attention > 0
+                        {
+                            theme::DANGER
+                        } else {
+                            theme::WARNING
+                        },
+                    ))
+                },
+            )
             .when(counts.ppoi_attention_count() > 0, |this| {
                 this.child(render_ppoi_hover_action_note(
                     self.root.clone(),
@@ -2195,7 +2241,10 @@ fn short_poi_list_key(bytes: &[u8]) -> String {
 }
 
 const fn ppoi_attention_badge_color(counts: WalletStatusCounts) -> u32 {
-    if counts.blocked_shield_outputs > 0 {
+    if counts.blocked_shield_outputs > 0
+        || counts.ppoi_workflow_status.needs_attention > 0
+        || counts.ppoi_workflow_status.recovery_needs_attention > 0
+    {
         theme::DANGER
     } else {
         theme::WARNING_BG
@@ -2203,7 +2252,10 @@ const fn ppoi_attention_badge_color(counts: WalletStatusCounts) -> u32 {
 }
 
 const fn ppoi_attention_hover_color(counts: WalletStatusCounts) -> u32 {
-    if counts.blocked_shield_outputs > 0 {
+    if counts.blocked_shield_outputs > 0
+        || counts.ppoi_workflow_status.needs_attention > 0
+        || counts.ppoi_workflow_status.recovery_needs_attention > 0
+    {
         theme::DANGER
     } else {
         theme::WARNING
@@ -2211,23 +2263,26 @@ const fn ppoi_attention_hover_color(counts: WalletStatusCounts) -> u32 {
 }
 
 fn ppoi_attention_detail(counts: WalletStatusCounts) -> String {
-    if counts.blocked_shield_outputs > 0 && counts.recoverable_poi_outputs > 0 {
-        format!(
-            "Review {} and {}",
-            count_label(counts.blocked_shield_outputs, "blocked Shield output"),
-            count_label(counts.recoverable_poi_outputs, "PPOI output needing retry"),
-        )
-    } else if counts.blocked_shield_outputs > 0 {
-        format!(
-            "Review {}",
-            count_label(counts.blocked_shield_outputs, "blocked Shield output")
-        )
-    } else {
-        format!(
-            "Review {}",
-            count_label(counts.recoverable_poi_outputs, "PPOI output needing retry")
-        )
+    let mut items = Vec::with_capacity(2);
+    if counts.blocked_shield_outputs > 0 {
+        items.push(count_label(
+            counts.blocked_shield_outputs,
+            "blocked Shield output",
+        ));
     }
+    let recovery_attention = counts.recoverable_poi_outputs.saturating_add(
+        usize::try_from(
+            counts
+                .ppoi_workflow_status
+                .needs_attention
+                .saturating_add(counts.ppoi_workflow_status.recovery_needs_attention),
+        )
+        .unwrap_or(usize::MAX),
+    );
+    if recovery_attention > 0 {
+        items.push(count_label(recovery_attention, "PPOI output needing retry"));
+    }
+    format!("Review {}", items.join(" and "))
 }
 
 fn status_presence_dot(status: PresenceStatus) -> gpui::Div {

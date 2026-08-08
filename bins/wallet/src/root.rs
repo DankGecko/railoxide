@@ -277,9 +277,9 @@ use utxo::{
     apply_blocked_shield_rescue_rows, blocked_shield_refund_action_available,
     blocked_shield_refund_origin_resolving, display_rows_from_output, format_compact_age,
     global_poi_retry_available, pending_finality_display, poi_retry_button_label,
-    ppoi_row_state_detail, ppoi_state_detail, ppoi_workflow_status_detail,
-    ppoi_workflow_status_title, recoverable_poi_candidate_count, shield_poi_wait_display,
-    should_show_blocked_shield_refund_action, should_show_ppoi_retry_action,
+    ppoi_row_state_detail, ppoi_state_detail, recoverable_poi_candidate_count,
+    shield_poi_wait_display, should_show_blocked_shield_refund_action,
+    should_show_ppoi_retry_action,
 };
 #[cfg(test)]
 use vault::{

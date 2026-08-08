@@ -657,6 +657,11 @@ impl ChainUtxoState {
                 ..
             } => *ppoi_workflow_status,
             Self::Idle | Self::Loading { .. } => WalletPpoiWorkflowStatus {
+                awaiting_recovery: 0,
+                awaiting_public_txid_data: 0,
+                awaiting_poi_data: 0,
+                retrying_recovery: 0,
+                recovery_needs_attention: 0,
                 awaiting_submission: 0,
                 awaiting_validation: 0,
                 needs_attention: 0,
@@ -729,15 +734,34 @@ pub(super) struct WalletStatusCounts {
     pub(super) pending_poi_assets: usize,
     pub(super) recoverable_poi_outputs: usize,
     pub(super) blocked_shield_outputs: usize,
+    pub(super) ppoi_workflow_status: WalletPpoiWorkflowStatus,
 }
 
 impl WalletStatusCounts {
-    pub(super) const fn ppoi_attention_count(self) -> usize {
-        self.recoverable_poi_outputs + self.blocked_shield_outputs
+    pub(super) fn ppoi_attention_count(self) -> usize {
+        let workflow_attention = usize::try_from(
+            self.ppoi_workflow_status
+                .needs_attention
+                .saturating_add(self.ppoi_workflow_status.recovery_needs_attention),
+        )
+        .unwrap_or(usize::MAX);
+        self.recoverable_poi_outputs
+            .saturating_add(workflow_attention)
+            .saturating_add(self.blocked_shield_outputs)
+    }
+
+    pub(super) fn ppoi_status_count(self) -> usize {
+        let workflow_count =
+            usize::try_from(self.ppoi_workflow_status.outstanding_count()).unwrap_or(usize::MAX);
+        workflow_count
+            .saturating_add(self.recoverable_poi_outputs)
+            .saturating_add(self.blocked_shield_outputs)
     }
 
     pub(super) const fn has_ppoi_blocking_checks(self) -> bool {
-        self.pending_poi_assets > 0 || self.recoverable_poi_outputs > 0
+        self.pending_poi_assets > 0
+            || self.recoverable_poi_outputs > 0
+            || self.ppoi_workflow_status.has_outstanding()
     }
 }
 
@@ -817,7 +841,7 @@ pub(super) fn balance_lag_threshold_blocks(block_time: Duration) -> u64 {
     u64::try_from(threshold).unwrap_or(u64::MAX).max(2)
 }
 
-pub(super) const fn ppoi_presence_status(
+pub(super) fn ppoi_presence_status(
     refreshing: bool,
     source_available: bool,
     artifact_cache_expected: bool,
@@ -851,6 +875,13 @@ pub(super) const fn ppoi_presence_status(
     }
 
     if refreshing {
+        PresenceStatus::Active
+    } else if counts.blocked_shield_outputs > 0
+        || counts.ppoi_workflow_status.needs_attention > 0
+        || counts.ppoi_workflow_status.recovery_needs_attention > 0
+    {
+        PresenceStatus::Error
+    } else if counts.ppoi_status_count() > 0 {
         PresenceStatus::Active
     } else {
         PresenceStatus::Healthy
@@ -985,11 +1016,14 @@ pub(super) fn installed_observer_is_exact_current(
 }
 
 pub(super) const fn ppoi_validation_completion_is_current(
-    previous_revision: u64,
-    current_revision: u64,
+    previous: WalletPpoiWorkflowStatus,
+    current: WalletPpoiWorkflowStatus,
     observer_is_exact_current: bool,
 ) -> bool {
-    observer_is_exact_current && current_revision > previous_revision
+    observer_is_exact_current
+        && current.validation_revision > previous.validation_revision
+        && previous.has_outstanding()
+        && !current.has_outstanding()
 }
 
 pub(super) fn ppoi_validation_toast_scope_is_current(
@@ -2019,8 +2053,7 @@ impl WalletRoot {
             let initial_snapshot = initial_observation.snapshot.clone();
             let initial_readiness = wallet_readiness_disposition(&initial_observation.readiness);
             let initial_ppoi_workflow_status = initial_observation.ppoi_workflow_status;
-            let mut last_ppoi_validation_revision =
-                initial_ppoi_workflow_status.validation_revision;
+            let mut last_ppoi_workflow_status = initial_ppoi_workflow_status;
             let initial_sync_tip = *session.sync_tip_rx.borrow();
             let initial_poi_refreshing = *session.poi_refreshing_rx.borrow();
             let initial_poi_artifact_cache_progress = poi_artifact_cache_progress_rx
@@ -2190,8 +2223,8 @@ impl WalletRoot {
                             .map(|rx| *rx.borrow());
                         let ppoi_workflow_status = observation.ppoi_workflow_status;
                         let validation_completed = ppoi_validation_completion_is_current(
-                            last_ppoi_validation_revision,
-                            ppoi_workflow_status.validation_revision,
+                            last_ppoi_workflow_status,
+                            ppoi_workflow_status,
                             true,
                         );
                         let disposition = wallet_readiness_disposition(&observation.readiness);
@@ -2352,8 +2385,7 @@ impl WalletRoot {
                         if !matches!(should_continue, Ok(true)) {
                             break;
                         }
-                        last_ppoi_validation_revision =
-                            ppoi_workflow_status.validation_revision;
+                        last_ppoi_workflow_status = ppoi_workflow_status;
                     }
                     changed = async {
                         match sync_tip_rx.as_mut() {

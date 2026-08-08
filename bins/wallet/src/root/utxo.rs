@@ -748,21 +748,12 @@ impl WalletRoot {
             return centered_message("Choose a wallet to view activity");
         }
         match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Error {
-                message,
-                ppoi_workflow_status,
-                ..
-            }) => div()
+            Some(ChainUtxoState::Error { message, .. }) => div()
                 .size_full()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
-                .gap_2()
-                .children(render_ppoi_workflow_status_card(
-                    *ppoi_workflow_status,
-                    false,
-                ))
                 .child(
                     div()
                         .flex_1()
@@ -884,10 +875,6 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .gap_2()
-            .children(render_ppoi_workflow_status_card(
-                ppoi_workflow_status,
-                poi_refreshing,
-            ))
             .when(local_pending_spent_count > 0, |this| {
                 this.child(
                     self.render_local_pending_spent_summary(
@@ -1867,23 +1854,67 @@ pub(super) const fn ppoi_workflow_status_title(
     refreshing: bool,
 ) -> Option<&'static str> {
     let has_work = status.awaiting_submission > 0
+        || status.awaiting_recovery > 0
         || status.awaiting_validation > 0
         || status.needs_attention > 0;
     if refreshing && has_work {
-        Some("Submitting PPOIs…")
-    } else if status.needs_attention > 0 {
+        Some("Recovering outgoing proofs…")
+    } else if status.needs_attention > 0 || status.recovery_needs_attention > 0 {
         Some("PPOI submission needs attention")
+    } else if status.awaiting_public_txid_data > 0 {
+        Some("Waiting for public transaction proof data")
+    } else if status.awaiting_poi_data > 0 {
+        Some("Waiting for PPOI data")
+    } else if status.retrying_recovery > 0 {
+        Some("Outgoing proof recovery will retry")
+    } else if status.awaiting_recovery > 0 || status.awaiting_submission > 0 {
+        Some("Outgoing proof recovery pending")
     } else if status.awaiting_validation > 0 {
         Some("Awaiting PPOI verification")
-    } else if status.awaiting_submission > 0 {
-        Some("PPOI submission pending")
     } else {
         None
     }
 }
 
 pub(super) fn ppoi_workflow_status_detail(status: WalletPpoiWorkflowStatus) -> String {
-    let mut parts = Vec::with_capacity(3);
+    let mut parts = Vec::with_capacity(8);
+    let classified_recovery = status
+        .awaiting_public_txid_data
+        .saturating_add(status.awaiting_poi_data)
+        .saturating_add(status.retrying_recovery)
+        .saturating_add(status.recovery_needs_attention)
+        .min(status.awaiting_recovery);
+    let unclassified_recovery = status.awaiting_recovery.saturating_sub(classified_recovery);
+    if status.awaiting_public_txid_data > 0 {
+        parts.push(ppoi_workflow_count_label(
+            status.awaiting_public_txid_data,
+            "waiting for public transaction data",
+        ));
+    }
+    if status.awaiting_poi_data > 0 {
+        parts.push(ppoi_workflow_count_label(
+            status.awaiting_poi_data,
+            "waiting for PPOI data",
+        ));
+    }
+    if status.retrying_recovery > 0 {
+        parts.push(ppoi_workflow_count_label(
+            status.retrying_recovery,
+            "retrying recovery",
+        ));
+    }
+    if status.recovery_needs_attention > 0 {
+        parts.push(ppoi_workflow_count_label(
+            status.recovery_needs_attention,
+            "recovery needing attention",
+        ));
+    }
+    if unclassified_recovery > 0 {
+        parts.push(ppoi_workflow_count_label(
+            unclassified_recovery,
+            "awaiting recovery",
+        ));
+    }
     if status.awaiting_submission > 0 {
         parts.push(ppoi_workflow_count_label(
             status.awaiting_submission,
@@ -1912,52 +1943,6 @@ pub(super) fn ppoi_workflow_status_detail(status: WalletPpoiWorkflowStatus) -> S
 fn ppoi_workflow_count_label(count: u64, suffix: &str) -> String {
     let noun = if count == 1 { "PPOI" } else { "PPOIs" };
     format!("{count} {noun} {suffix}")
-}
-
-fn render_ppoi_workflow_status_card(
-    status: WalletPpoiWorkflowStatus,
-    refreshing: bool,
-) -> Option<gpui::Div> {
-    let title = ppoi_workflow_status_title(status, refreshing)?;
-    let color = if status.needs_attention > 0 && !refreshing {
-        theme::DANGER
-    } else {
-        theme::WARNING
-    };
-    Some(
-        div()
-            .w_full()
-            .min_w(px(0.0))
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb_with_alpha(color, 0.34))
-            .bg(rgb_with_alpha(color, 0.08))
-            .p(px(10.0))
-            .children(refreshing.then(|| {
-                Spinner::new()
-                    .icon(IconName::LoaderCircle)
-                    .color(rgb(color).into())
-                    .with_size(px(14.0))
-            }))
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(app_strong_text(title).text_color(rgb(color)))
-                    .child(
-                        app_muted_text(ppoi_workflow_status_detail(status))
-                            .line_height(px(18.0))
-                            .whitespace_normal(),
-                    ),
-            ),
-    )
 }
 
 pub(super) const fn ppoi_retry_tooltip(state: UtxoPpoiState) -> &'static str {

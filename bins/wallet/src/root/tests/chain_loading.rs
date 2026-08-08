@@ -162,10 +162,35 @@ fn initial_sync_observation_boundary_resets_wallets_and_tracks_new_chains() {
 
 #[test]
 fn ppoi_validation_toast_requires_later_exact_observer_revision() {
-    assert!(ppoi_validation_completion_is_current(3, 4, true));
-    assert!(!ppoi_validation_completion_is_current(3, 3, true));
-    assert!(!ppoi_validation_completion_is_current(4, 3, true));
-    assert!(!ppoi_validation_completion_is_current(3, 4, false));
+    let pending = WalletPpoiWorkflowStatus {
+        awaiting_validation: 2,
+        validation_revision: 3,
+        ..WalletPpoiWorkflowStatus::default()
+    };
+    let partially_complete = WalletPpoiWorkflowStatus {
+        awaiting_validation: 1,
+        validation_revision: 4,
+        ..WalletPpoiWorkflowStatus::default()
+    };
+    let complete = WalletPpoiWorkflowStatus {
+        validation_revision: 5,
+        ..WalletPpoiWorkflowStatus::default()
+    };
+    assert!(!ppoi_validation_completion_is_current(
+        pending,
+        partially_complete,
+        true
+    ));
+    assert!(ppoi_validation_completion_is_current(
+        partially_complete,
+        complete,
+        true
+    ));
+    assert!(!ppoi_validation_completion_is_current(
+        partially_complete,
+        complete,
+        false
+    ));
 }
 
 #[test]
@@ -1264,6 +1289,14 @@ fn wallet_status_presence_classifies_sync_and_ppoi_health() {
         blocked_shield_outputs: 1,
         ..WalletStatusCounts::default()
     };
+    let automatic_recovery = WalletStatusCounts {
+        recoverable_poi_outputs: 1,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus {
+            awaiting_recovery: 2,
+            ..WalletPpoiWorkflowStatus::default()
+        },
+        ..WalletStatusCounts::default()
+    };
 
     assert_eq!(
         ppoi_presence_status(true, true, false, None, WalletStatusCounts::default()),
@@ -1346,6 +1379,35 @@ fn wallet_status_presence_classifies_sync_and_ppoi_health() {
     );
     assert_eq!(ppoi_attention.ppoi_attention_count(), 2);
     assert_eq!(blocked_shield_attention.ppoi_attention_count(), 1);
+    assert_eq!(automatic_recovery.ppoi_attention_count(), 1);
+    assert_eq!(automatic_recovery.ppoi_status_count(), 3);
+    assert_eq!(
+        ppoi_presence_status(false, true, false, None, automatic_recovery),
+        PresenceStatus::Active
+    );
+    let distinct_attention = WalletStatusCounts {
+        recoverable_poi_outputs: 1,
+        ppoi_workflow_status: WalletPpoiWorkflowStatus {
+            needs_attention: 1,
+            ..WalletPpoiWorkflowStatus::default()
+        },
+        ..WalletStatusCounts::default()
+    };
+    assert_eq!(distinct_attention.ppoi_attention_count(), 2);
+    assert_eq!(distinct_attention.ppoi_status_count(), 2);
+    let candidate_attention = WalletStatusCounts {
+        ppoi_workflow_status: WalletPpoiWorkflowStatus {
+            awaiting_recovery: 1,
+            recovery_needs_attention: 1,
+            ..WalletPpoiWorkflowStatus::default()
+        },
+        ..WalletStatusCounts::default()
+    };
+    assert_eq!(candidate_attention.ppoi_attention_count(), 1);
+    assert_eq!(
+        ppoi_presence_status(false, true, false, None, candidate_attention),
+        PresenceStatus::Error
+    );
 }
 
 #[test]

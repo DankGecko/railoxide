@@ -6,8 +6,9 @@ use super::private_action::{
 use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
     private_pending_summary, private_pending_summary_detail, private_pending_summary_title,
-    private_send_action_tooltip, private_unshield_action_tooltip, should_show_pending_amount,
-    should_show_pending_poi_amount, total_private_balance_usd_amount,
+    private_pending_summary_with_workflow, private_send_action_tooltip,
+    private_unshield_action_tooltip, should_show_pending_amount, should_show_pending_poi_amount,
+    total_private_balance_usd_amount,
 };
 use super::private_broadcaster::{
     PrivateBroadcasterProgressStepState, PrivateSubmissionProgressFlow, SelfBroadcastGasRetryKind,
@@ -21,6 +22,7 @@ use super::public_action::{
 };
 use super::public_broadcaster_cost::public_broadcaster_cost_status;
 use super::shell::balance_sync_issue_detail;
+use super::utxo::{ppoi_workflow_status_detail, ppoi_workflow_status_title};
 use super::*;
 
 mod address_book;

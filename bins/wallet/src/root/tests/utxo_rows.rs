@@ -247,6 +247,11 @@ fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
     );
 
     let pending = wallet_ops::WalletPpoiWorkflowStatus {
+        awaiting_recovery: 3,
+        awaiting_public_txid_data: 0,
+        awaiting_poi_data: 0,
+        retrying_recovery: 0,
+        recovery_needs_attention: 0,
         awaiting_submission: 1,
         awaiting_validation: 2,
         needs_attention: 0,
@@ -254,15 +259,15 @@ fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
     };
     assert_eq!(
         ppoi_workflow_status_title(pending, false),
-        Some("Awaiting PPOI verification")
+        Some("Outgoing proof recovery pending")
     );
     assert_eq!(
         ppoi_workflow_status_title(pending, true),
-        Some("Submitting PPOIs…")
+        Some("Recovering outgoing proofs…")
     );
     assert_eq!(
         ppoi_workflow_status_detail(pending),
-        "1 PPOI awaiting submission · 2 PPOIs awaiting verification"
+        "3 PPOIs awaiting recovery · 1 PPOI awaiting submission · 2 PPOIs awaiting verification"
     );
 
     let attention = wallet_ops::WalletPpoiWorkflowStatus {
@@ -272,6 +277,19 @@ fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
     assert_eq!(
         ppoi_workflow_status_title(attention, false),
         Some("PPOI submission needs attention")
+    );
+    let public_wait = wallet_ops::WalletPpoiWorkflowStatus {
+        awaiting_recovery: 2,
+        awaiting_public_txid_data: 2,
+        ..wallet_ops::WalletPpoiWorkflowStatus::default()
+    };
+    assert_eq!(
+        ppoi_workflow_status_title(public_wait, false),
+        Some("Waiting for public transaction proof data")
+    );
+    assert_eq!(
+        ppoi_workflow_status_detail(public_wait),
+        "2 PPOIs waiting for public transaction data"
     );
     assert!(ppoi_workflow_status_detail(attention).contains("1 PPOI needs attention"));
 }

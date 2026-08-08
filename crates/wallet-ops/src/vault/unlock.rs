@@ -469,6 +469,9 @@ impl CacheKeys {
         match kind {
             WalletPrivateRecordKind::PendingOutputPoiContext => RecordKind::PendingOutputPoiContext,
             WalletPrivateRecordKind::OutputPoiRecovery => RecordKind::OutputPoiRecovery,
+            WalletPrivateRecordKind::SenderTransactionCandidate => {
+                RecordKind::SenderTransactionCandidate
+            }
         }
     }
 
@@ -476,6 +479,7 @@ impl CacheKeys {
         match kind {
             WalletPrivateRecordKind::PendingOutputPoiContext => b"pending-output-poi-context",
             WalletPrivateRecordKind::OutputPoiRecovery => b"output-poi-recovery",
+            WalletPrivateRecordKind::SenderTransactionCandidate => b"sender-transaction-candidate",
         }
     }
 

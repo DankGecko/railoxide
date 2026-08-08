@@ -203,6 +203,7 @@ pub enum RecordKind {
     WalletCacheRow,
     PendingOutputPoiContext,
     OutputPoiRecovery,
+    SenderTransactionCandidate,
     HardwareProfileMetadata,
     HardwareWalletAccountIndexReservation,
     PublicAccountMetadata,
@@ -228,6 +229,7 @@ impl RecordKind {
             Self::WalletCacheRow => "wallet-cache-row",
             Self::PendingOutputPoiContext => "pending-output-poi-context",
             Self::OutputPoiRecovery => "output-poi-recovery",
+            Self::SenderTransactionCandidate => "sender-transaction-candidate",
             Self::HardwareProfileMetadata => "hardware-profile-metadata",
             Self::HardwareWalletAccountIndexReservation => {
                 "hardware-wallet-account-index-reservation"
