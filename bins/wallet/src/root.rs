@@ -275,11 +275,10 @@ use startup::{load_validated_startup_settings, resolve_initial_chain_id};
 use utxo::{
     UtxoDisplayRow, UtxoFinalityContext, activity_classification_icon_style,
     apply_blocked_shield_rescue_rows, blocked_shield_refund_action_available,
-    blocked_shield_refund_origin_resolving, display_rows_from_output, format_compact_age,
-    global_poi_retry_available, pending_finality_display, poi_retry_button_label,
-    ppoi_row_state_detail, ppoi_state_detail, recoverable_poi_candidate_count,
-    shield_poi_wait_display, should_show_blocked_shield_refund_action,
-    should_show_ppoi_retry_action,
+    blocked_shield_refund_origin_resolving, display_rows_from_output, global_poi_retry_available,
+    pending_finality_display, poi_retry_button_label, ppoi_row_state_detail, ppoi_state_detail,
+    recoverable_poi_candidate_count, shield_poi_wait_display,
+    should_show_blocked_shield_refund_action, should_show_ppoi_retry_action,
 };
 #[cfg(test)]
 use vault::{
@@ -331,9 +330,6 @@ const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COST_ESTIMATE_DEBOUNCE: Duration = Duration::from_secs(1);
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
-const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
-const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
-const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
 const PROVER_CACHE_BUILD_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -391,10 +387,13 @@ pub(crate) struct WalletRoot {
     trezor_passphrase_mode_focus: FocusHandle,
     http: HttpContext,
     network_health: WalletNetworkHealth,
+    tor_bridge_activity: Option<wallet_ops::TorBridgeActivitySnapshot>,
+    tor_download_rate: Option<u64>,
     root_shutdown: watch::Sender<bool>,
     network_status_popover_open: bool,
     network_status_error: Option<Arc<str>>,
     tor_exit_ip_query: TorExitIpQueryState,
+    tor_exit_ip_query_generation: u64,
     tor_state_reset_confirming: bool,
     prover_cache_build_progress: Option<ProverCacheBuildProgress>,
     prover_cache_build_popover_open: bool,
@@ -1134,6 +1133,7 @@ impl WalletRoot {
             )
         });
         let network_health = http.network_health();
+        let tor_bridge_activity = http.tor_bridge_activity_snapshot();
         let sidebar_public_broadcaster_count =
             ethereum_weth_public_broadcaster_count(&monitor_state.read().fee_rows());
         let mut public_broadcaster_sort_seed = [0_u8; 32];
@@ -1191,10 +1191,13 @@ impl WalletRoot {
             trezor_passphrase_mode_focus,
             http,
             network_health,
+            tor_bridge_activity,
+            tor_download_rate: None,
             root_shutdown,
             network_status_popover_open: false,
             network_status_error: None,
             tor_exit_ip_query: TorExitIpQueryState::Idle,
+            tor_exit_ip_query_generation: 0,
             tor_state_reset_confirming: false,
             prover_cache_build_progress: None,
             prover_cache_build_popover_open: false,
@@ -1764,6 +1767,7 @@ impl WalletRoot {
         })
         .detach();
         root.spawn_network_health_monitor(cx);
+        root.spawn_tor_bridge_activity_sampler(cx);
         root
     }
 }

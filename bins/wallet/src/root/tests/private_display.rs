@@ -35,35 +35,6 @@ fn display_rows_use_known_token_metadata() {
 }
 
 #[test]
-fn compact_age_uses_expected_thresholds() {
-    const M: u64 = SECONDS_PER_MINUTE;
-    const H: u64 = SECONDS_PER_HOUR;
-    const D: u64 = SECONDS_PER_DAY;
-    const MO: u64 = SECONDS_PER_MONTH;
-    const Y: u64 = SECONDS_PER_YEAR;
-
-    assert_eq!(format_compact_age(0), "0s");
-    assert_eq!(format_compact_age(59), "59s");
-    assert_eq!(format_compact_age(M), "1m");
-    assert_eq!(format_compact_age(59 * M + 59), "59m");
-    assert_eq!(format_compact_age(H), "1h");
-    assert_eq!(format_compact_age(2 * H + 14 * M), "2h 14m");
-    assert_eq!(format_compact_age(3 * H), "3h");
-    assert_eq!(format_compact_age(23 * H + 59 * M), "23h");
-    assert_eq!(format_compact_age(D), "1d");
-    assert_eq!(format_compact_age(2 * D + 3 * H), "2d 3h");
-    assert_eq!(format_compact_age(3 * D), "3d");
-    assert_eq!(format_compact_age(29 * D), "29d");
-    assert_eq!(format_compact_age(30 * D), "1mo");
-    assert_eq!(format_compact_age(2 * MO + 4 * D), "2mo 4d");
-    assert_eq!(format_compact_age(3 * MO), "3mo");
-    assert_eq!(format_compact_age(11 * MO), "11mo");
-    assert_eq!(format_compact_age(Y), "1y");
-    assert_eq!(format_compact_age(2 * Y + 3 * MO), "2y 3mo");
-    assert_eq!(format_compact_age(3 * Y), "3y");
-}
-
-#[test]
 fn display_rows_fall_back_for_unknown_token_metadata() {
     let output = ListUtxosOutput {
         chain_id: 1,

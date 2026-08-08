@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
@@ -44,9 +44,9 @@ use super::spend_authorization::{
 };
 use super::tokens::parse_address;
 use super::{
-    SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-    WalletRoot, centered_message, dialog_content_max_height, dialog_max_height, rgb_with_alpha,
-    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+    SECONDS_PER_HOUR, SECONDS_PER_MINUTE, WalletRoot, centered_message, dialog_content_max_height,
+    dialog_max_height, rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width,
+    token_label_row,
 };
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};
@@ -2204,80 +2204,7 @@ fn format_tree_position(tree: u32, position: u64) -> String {
 
 fn generated_age_label(timestamp: u64) -> String {
     let age_secs = now_epoch_secs().saturating_sub(timestamp);
-    format!("{} ago", format_compact_age(age_secs))
-}
-
-pub(super) fn format_compact_age(age_secs: u64) -> String {
-    if age_secs < SECONDS_PER_MINUTE {
-        return format!("{age_secs}s");
-    }
-
-    if age_secs < SECONDS_PER_HOUR {
-        return format!("{}m", age_secs / SECONDS_PER_MINUTE);
-    }
-
-    if age_secs < 3 * SECONDS_PER_HOUR {
-        return format_age_parts(
-            age_secs / SECONDS_PER_HOUR,
-            "h",
-            (age_secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE,
-            "m",
-        );
-    }
-
-    if age_secs < SECONDS_PER_DAY {
-        return format!("{}h", age_secs / SECONDS_PER_HOUR);
-    }
-
-    if age_secs < 3 * SECONDS_PER_DAY {
-        return format_age_parts(
-            age_secs / SECONDS_PER_DAY,
-            "d",
-            (age_secs % SECONDS_PER_DAY) / SECONDS_PER_HOUR,
-            "h",
-        );
-    }
-
-    if age_secs < 30 * SECONDS_PER_DAY {
-        return format!("{}d", age_secs / SECONDS_PER_DAY);
-    }
-
-    if age_secs < 3 * SECONDS_PER_MONTH {
-        return format_age_parts(
-            age_secs / SECONDS_PER_MONTH,
-            "mo",
-            (age_secs % SECONDS_PER_MONTH) / SECONDS_PER_DAY,
-            "d",
-        );
-    }
-
-    if age_secs < SECONDS_PER_YEAR {
-        return format!("{}mo", age_secs / SECONDS_PER_MONTH);
-    }
-
-    if age_secs < 3 * SECONDS_PER_YEAR {
-        return format_age_parts(
-            age_secs / SECONDS_PER_YEAR,
-            "y",
-            (age_secs % SECONDS_PER_YEAR) / SECONDS_PER_MONTH,
-            "mo",
-        );
-    }
-
-    format!("{}y", age_secs / SECONDS_PER_YEAR)
-}
-
-fn format_age_parts(
-    primary: u64,
-    primary_unit: &str,
-    secondary: u64,
-    secondary_unit: &str,
-) -> String {
-    if secondary == 0 {
-        format!("{primary}{primary_unit}")
-    } else {
-        format!("{primary}{primary_unit} {secondary}{secondary_unit}")
-    }
+    ui::format::format_relative_age(Duration::from_secs(age_secs))
 }
 
 fn local_datetime_label(timestamp: u64) -> String {

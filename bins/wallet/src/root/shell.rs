@@ -3,7 +3,7 @@ use std::collections::btree_map::Entry;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
 use broadcaster_monitor::{EventRx, EventTx, Shared};
@@ -50,6 +50,7 @@ use super::chain_load::{
 use super::private_assets::{
     format_private_asset_rows_from_snapshot, should_show_pending_poi_amount,
 };
+use super::ui_helpers::format_binary_bytes;
 use super::utxo::{
     blocked_shield_rescue_display_rows, ppoi_workflow_status_detail, ppoi_workflow_status_title,
     recoverable_poi_candidate_count, should_focus_utxo_table,
@@ -57,9 +58,8 @@ use super::utxo::{
 use super::{
     Activity, ChainUtxoState, HERO_CARD_MAX_WIDTH, HERO_MEDIUM_BREAKPOINT, HERO_STAGE_MAX_WIDTH,
     HERO_WIDE_BREAKPOINT, LOGS_DRAWER_HEIGHT, LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT,
-    SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState,
-    WalletRoot, WalletStartupRoot, app_status_tag, chain_load_overrides, count_label,
-    rgb_with_alpha, should_apply_background_focus,
+    SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot, app_status_tag,
+    chain_load_overrides, count_label, rgb_with_alpha, should_apply_background_focus,
 };
 
 pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
@@ -1842,10 +1842,9 @@ fn render_balance_sync_tip_section(sync_tip: WalletSyncTip, now_secs: u64) -> gp
             |this, advanced_at| {
                 this.child(render_balance_sync_tip_row(
                     "Head advanced",
-                    format!(
-                        "{} ago",
-                        format_duration_compact(now_secs.saturating_sub(advanced_at))
-                    ),
+                    ui::format::format_relative_age(Duration::from_secs(
+                        now_secs.saturating_sub(advanced_at),
+                    )),
                 ))
             },
         )
@@ -1893,7 +1892,7 @@ pub(super) fn balance_sync_issue_detail(
             threshold_secs: _,
         } => format!(
             "RPC head has not advanced for {}. {}",
-            format_duration_compact(stale_secs),
+            ui::format::format_compact_duration(Duration::from_secs(stale_secs)),
             balance_sync_issue_suggestion(network_mode)
         ),
         BalanceSyncIssue::Lagging {
@@ -1939,19 +1938,6 @@ fn balance_pending_detail(counts: WalletStatusCounts) -> Option<String> {
 
 fn format_block_label(block: Option<u64>) -> String {
     block.map_or_else(|| "Waiting".to_string(), |block| format!("block {block}"))
-}
-
-fn format_duration_compact(secs: u64) -> String {
-    if secs < SECONDS_PER_MINUTE {
-        return format!("{secs}s");
-    }
-    if secs < SECONDS_PER_HOUR {
-        return format!("{}m", secs / SECONDS_PER_MINUTE);
-    }
-    if secs < SECONDS_PER_DAY {
-        return format!("{}h", secs / SECONDS_PER_HOUR);
-    }
-    format!("{}d", secs / SECONDS_PER_DAY)
 }
 
 pub(super) fn ppoi_hover_heading(
@@ -2078,14 +2064,14 @@ pub(super) fn ppoi_chunk_progress_label(progress: &PoiArtifactCacheProgress) -> 
         let _ = write!(
             label,
             " · {}/{}",
-            format_byte_count(progress.graph.verified_encoded_bytes.min(total_bytes)),
-            format_byte_count(total_bytes)
+            format_binary_bytes(progress.graph.verified_encoded_bytes.min(total_bytes)),
+            format_binary_bytes(total_bytes)
         );
     } else if progress.graph.verified_encoded_bytes > 0 {
         let _ = write!(
             label,
             " · {} verified",
-            format_byte_count(progress.graph.verified_encoded_bytes)
+            format_binary_bytes(progress.graph.verified_encoded_bytes)
         );
     }
     Some(label)
@@ -2102,18 +2088,6 @@ pub(super) fn ppoi_replay_progress_label(progress: &PoiArtifactCacheProgress) ->
         "Events {start}-{end} · {replayed}/{} replayed",
         progress.graph.total_replay_event_count
     ))
-}
-
-fn format_byte_count(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    if bytes >= MIB {
-        return format!("{} MiB", bytes / MIB);
-    }
-    if bytes >= KIB {
-        return format!("{} KiB", bytes / KIB);
-    }
-    format!("{bytes} B")
 }
 
 fn ppoi_event_progress_label(progress: &PoiArtifactCacheProgress) -> String {

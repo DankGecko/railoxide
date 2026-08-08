@@ -12,8 +12,9 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_custom_toast};
+use ui::format::format_compact_latency;
 use ui::theme;
-use wallet_ops::ProverCacheBuildProgress;
+use wallet_ops::{ProverCacheBuildProgress, WalletNetworkHealth, WalletNetworkMode};
 
 use crate::assets::{
     LOGO_ICON_PATH, RailgunNetworkStatusIcon, RailgunSidebarIcon, RailgunSocialIcon,
@@ -25,6 +26,7 @@ use super::shell::{
     COPY_URL_TOOLTIP, LINK_COPIED_MESSAGE, RAILOXIDE_REPOSITORY_URL, TELEGRAM_URL,
     wallet_build_label,
 };
+use super::ui_helpers::format_decimal_byte_rate;
 use super::{
     SIDEBAR_WIDTH, WalletRoot, WalletTab, app_status_tag, rgb_with_alpha, should_focus_utxo_table,
 };
@@ -221,7 +223,14 @@ impl WalletRoot {
         let health = self.network_health.clone();
         let color = network_health_color(&health);
         let label = health.label();
-        let tooltip = health.detail.to_string();
+        let tor_metrics_visible = health.mode == WalletNetworkMode::Tor;
+        let activity = self.tor_bridge_activity.clone();
+        let download_rate = self.tor_download_rate;
+        let setup = activity
+            .as_ref()
+            .and_then(|snapshot| snapshot.median_setup_duration);
+        let setup_label = setup.map_or_else(|| "--".to_owned(), format_compact_latency);
+        let tooltip = network_status_tooltip(&health, &setup_label, download_rate);
         let popover_root = root.clone();
         let content_root = root.clone();
         let network_status_error = self.network_status_error.clone();
@@ -232,7 +241,14 @@ impl WalletRoot {
             .text()
             .tab_stop(false)
             .tooltip(tooltip)
-            .child(Self::render_network_status_chip(collapsed, color, label));
+            .child(Self::render_network_status_chip(
+                collapsed,
+                color,
+                label,
+                &setup_label,
+                download_rate,
+                tor_metrics_visible,
+            ));
 
         Popover::new("wallet-network-status-popover")
             .open(self.network_status_popover_open)
@@ -250,6 +266,8 @@ impl WalletRoot {
                     network_status_error.clone(),
                     tor_exit_ip_query.clone(),
                     tor_state_reset_confirming,
+                    activity.clone(),
+                    download_rate,
                 )
             })
     }
@@ -258,6 +276,9 @@ impl WalletRoot {
         collapsed: bool,
         color: u32,
         label: &'static str,
+        setup_label: &str,
+        rate: Option<u64>,
+        tor_metrics_visible: bool,
     ) -> gpui::AnyElement {
         if collapsed {
             return div()
@@ -282,9 +303,42 @@ impl WalletRoot {
                 .into_any_element();
         }
 
+        if !tor_metrics_visible {
+            return div()
+                .id("wallet-network-status-pill")
+                .h_7()
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(color))
+                .bg(rgb_with_alpha(color, 0.08))
+                .text_color(rgb(color))
+                .cursor_pointer()
+                .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
+                .child(
+                    Icon::new(RailgunNetworkStatusIcon::Tor)
+                        .small()
+                        .text_color(rgb(color)),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .line_height(gpui::relative(1.0))
+                        .text_color(rgb(color))
+                        .child(label),
+                )
+                .into_any_element();
+        }
+
         div()
             .id("wallet-network-status-pill")
-            .h_7()
+            .h_auto()
             .px_2()
             .flex()
             .items_center()
@@ -303,13 +357,21 @@ impl WalletRoot {
             )
             .child(
                 div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .min_w_0()
                     .truncate()
                     .text_size(px(13.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .line_height(gpui::relative(1.0))
                     .text_color(rgb(color))
-                    .child(label),
+                    .child(div().child(format!("{label}  setup {setup_label}")))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .child(format!("download {}", format_decimal_byte_rate(rate))),
+                    ),
             )
             .into_any_element()
     }
@@ -673,5 +735,50 @@ impl WalletRoot {
             .w(px(154.0))
             .h(px(21.3))
             .flex_none()
+    }
+}
+
+fn network_status_tooltip(
+    health: &WalletNetworkHealth,
+    setup_label: &str,
+    rate: Option<u64>,
+) -> String {
+    if health.mode != WalletNetworkMode::Tor {
+        return health.detail.to_string();
+    }
+    format!(
+        "{} | setup: {} | rate: {}",
+        health.detail,
+        setup_label,
+        format_decimal_byte_rate(rate),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::network_status_tooltip;
+    use wallet_ops::{WalletNetworkHealth, WalletNetworkHealthState, WalletNetworkMode};
+
+    #[test]
+    fn network_status_tooltip_enriches_only_tor() {
+        let proxy = WalletNetworkHealth::new(
+            WalletNetworkMode::Proxy,
+            WalletNetworkHealthState::Ready,
+            "HTTP is routed through socks5h://proxy.example:9050",
+        );
+        assert_eq!(
+            network_status_tooltip(&proxy, "2s", Some(1_000)),
+            "HTTP is routed through socks5h://proxy.example:9050"
+        );
+
+        let tor = WalletNetworkHealth::new(
+            WalletNetworkMode::Tor,
+            WalletNetworkHealthState::Ready,
+            "Ready. HTTP/RPC session #1 is routed through socks5h://127.0.0.1:1234",
+        );
+        assert_eq!(
+            network_status_tooltip(&tor, "--", None),
+            "Ready. HTTP/RPC session #1 is routed through socks5h://127.0.0.1:1234 | setup: -- | rate: --"
+        );
     }
 }

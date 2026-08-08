@@ -2513,7 +2513,6 @@ dependencies = [
  "broadcaster-monitor",
  "gpui",
  "gpui-component",
- "humantime",
  "railgun-ui",
  "ruint",
  "tokio",

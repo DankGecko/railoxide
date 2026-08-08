@@ -122,11 +122,11 @@ pub use anchors::{
 };
 pub use desktop::*;
 pub use http::{
-    HttpContext, WalletNetworkConfig, WalletNetworkHealth, WalletNetworkHealthState,
-    WalletNetworkMode, WalletNetworkProgress, WalletNetworkProgressStage, WalletTorClient,
-    WalletTorClientProvider, build_http_client, build_wallet_network_context,
-    build_wallet_network_context_with_progress, request_tor_state_reset,
-    resolve_wallet_network_mode,
+    HttpContext, TorBridgeActivitySnapshot, TorRuntimeHealth, WalletNetworkConfig,
+    WalletNetworkHealth, WalletNetworkHealthCause, WalletNetworkHealthState, WalletNetworkMode,
+    WalletNetworkProgress, WalletNetworkProgressStage, WalletTorClient, WalletTorClientProvider,
+    build_http_client, build_wallet_network_context, build_wallet_network_context_with_progress,
+    request_tor_state_reset, resolve_wallet_network_mode,
 };
 pub use native_topup::{
     DesktopNativeTopUpPlan, DesktopNativeTopUpRequest, NATIVE_TOP_UP_ARBITRUM_AMOUNT,

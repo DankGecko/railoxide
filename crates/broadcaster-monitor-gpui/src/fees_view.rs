@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use alloy::primitives::{Address, U256};
 use gpui::{
@@ -21,6 +21,7 @@ use railgun_ui::{
     lookup_token, short_address, token_icon_asset_path,
 };
 use ui::clipboard::clipboard_with_toast;
+use ui::format::{format_compact_duration, format_relative_age};
 use ui::icons;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
@@ -797,34 +798,29 @@ impl TableDelegate for FeesDelegate {
                     .into_any_element()
             }
             7 => {
-                let age = humantime::Duration::from(Duration::from_secs(
-                    SystemTime::now()
-                        .duration_since(row.last_seen)
-                        .unwrap_or_default()
-                        .as_secs(),
-                ));
+                let age = SystemTime::now()
+                    .duration_since(row.last_seen)
+                    .unwrap_or_default();
                 div()
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .child(SharedString::from(format!("{age} ago")))
+                    .child(SharedString::from(format_relative_age(age)))
                     .into_any_element()
             }
             8 => {
                 let now = SystemTime::now();
                 if let Ok(d) = row.fee_expiration.duration_since(now) {
-                    let expires = humantime::Duration::from(Duration::from_secs(d.as_secs()));
                     div()
                         .text_color(rgb(theme::TEXT_MUTED))
-                        .child(SharedString::from(expires.to_string()))
+                        .child(SharedString::from(format_compact_duration(d)))
                         .into_any_element()
                 } else {
-                    let age = humantime::Duration::from(Duration::from_secs(
-                        now.duration_since(row.fee_expiration)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    ));
+                    let age = now.duration_since(row.fee_expiration).unwrap_or_default();
                     div()
                         .text_color(rgb(theme::DANGER))
-                        .child(SharedString::from(format!("expired {age} ago")))
+                        .child(SharedString::from(format!(
+                            "expired {}",
+                            format_relative_age(age)
+                        )))
                         .into_any_element()
                 }
             }

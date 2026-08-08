@@ -1,19 +1,22 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{
-    Arc, RwLock, Weak,
+    Arc, Mutex, RwLock, Weak,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use std::{io, pin::Pin};
 
 use arti_client::TorClient;
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::status::BootstrapStatus;
 use eyre::{Result, WrapErr, eyre};
 use reqwest::Url;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -162,11 +165,20 @@ pub enum WalletNetworkHealthState {
     Degraded,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalletNetworkHealthCause {
+    None,
+    TorBootstrap,
+    TorRuntimeSlow,
+    TorRuntimeUnreliable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalletNetworkHealth {
     pub mode: WalletNetworkMode,
     pub state: WalletNetworkHealthState,
     pub detail: Arc<str>,
+    pub cause: WalletNetworkHealthCause,
 }
 
 impl WalletNetworkHealth {
@@ -180,6 +192,22 @@ impl WalletNetworkHealth {
             mode,
             state,
             detail: detail.into(),
+            cause: WalletNetworkHealthCause::None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_cause(
+        mode: WalletNetworkMode,
+        state: WalletNetworkHealthState,
+        detail: impl Into<Arc<str>>,
+        cause: WalletNetworkHealthCause,
+    ) -> Self {
+        Self {
+            mode,
+            state,
+            detail: detail.into(),
+            cause,
         }
     }
 
@@ -191,6 +219,382 @@ impl WalletNetworkHealth {
             (WalletNetworkMode::Tor, WalletNetworkHealthState::Degraded) => "Tor degraded",
             (WalletNetworkMode::Proxy, _) => "Proxy mode",
             (WalletNetworkMode::Direct, _) => "Direct mode",
+        }
+    }
+}
+
+const TOR_OBSERVATION_LIMIT: usize = 64;
+const TOR_OBSERVATION_AGE: Duration = Duration::from_mins(2);
+const TOR_MIN_OBSERVATIONS: usize = 8;
+const TOR_FAILURE_MINIMUM: usize = 4;
+const TOR_SETUP_THRESHOLD: Duration = Duration::from_secs(8);
+const TOR_RECOVERY_SUCCESS_STREAK: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TorConnectionObservation {
+    generation: u64,
+    succeeded: bool,
+    completed_at: Instant,
+    setup_duration: Duration,
+    admitted_sequence: u64,
+}
+
+impl TorConnectionObservation {
+    const fn new(
+        generation: u64,
+        succeeded: bool,
+        completed_at: Instant,
+        setup_duration: Duration,
+    ) -> Self {
+        Self {
+            generation,
+            succeeded,
+            completed_at,
+            setup_duration,
+            admitted_sequence: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TorRuntimeHealth {
+    Ready,
+    Slow,
+    Unreliable,
+}
+
+#[derive(Debug)]
+struct TorRuntimeHealthTracker {
+    generation: u64,
+    observations: VecDeque<TorConnectionObservation>,
+    last_admitted_completed_at: Option<Instant>,
+    next_admitted_sequence: u64,
+    episode_boundary_sequence: Option<u64>,
+    latched_cause: Option<TorRuntimeHealth>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TorRuntimeHealthReport {
+    health: TorRuntimeHealth,
+    recent_attempt_count: usize,
+    recent_failed_attempt_count: usize,
+    recent_successful_sample_count: usize,
+}
+
+impl TorRuntimeHealthTracker {
+    const fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            observations: VecDeque::new(),
+            last_admitted_completed_at: None,
+            next_admitted_sequence: 1,
+            episode_boundary_sequence: None,
+            latched_cause: None,
+        }
+    }
+
+    fn record_at(&mut self, mut observation: TorConnectionObservation, now: Instant) -> bool {
+        if observation.generation != self.generation {
+            return false;
+        }
+        if observation.completed_at > now {
+            return false;
+        }
+        if self
+            .last_admitted_completed_at
+            .is_some_and(|last| observation.completed_at < last)
+        {
+            return false;
+        }
+        self.expire(now);
+        if now.saturating_duration_since(observation.completed_at) > TOR_OBSERVATION_AGE {
+            return false;
+        }
+        let Some(next_admitted_sequence) = self.next_admitted_sequence.checked_add(1) else {
+            return false;
+        };
+        observation.admitted_sequence = self.next_admitted_sequence;
+        self.next_admitted_sequence = next_admitted_sequence;
+        self.last_admitted_completed_at = Some(observation.completed_at);
+        self.observations.push_back(observation);
+        if self.observations.len() > TOR_OBSERVATION_LIMIT {
+            self.observations.pop_front();
+        }
+        self.transition(now);
+        true
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.observations.retain(|observation| {
+            observation.completed_at <= now
+                && now.duration_since(observation.completed_at) <= TOR_OBSERVATION_AGE
+        });
+        if self.observations.is_empty() {
+            self.latched_cause = None;
+            self.episode_boundary_sequence = None;
+        }
+    }
+
+    fn classify(&self, now: Instant) -> TorRuntimeHealth {
+        let (attempts, failures, successful_samples) = self.current_evidence(now);
+        if attempts < TOR_MIN_OBSERVATIONS {
+            return TorRuntimeHealth::Ready;
+        }
+        if failures >= TOR_FAILURE_MINIMUM && failures * 2 >= attempts {
+            return TorRuntimeHealth::Unreliable;
+        }
+
+        if successful_samples.len() >= TOR_MIN_OBSERVATIONS {
+            let mut setup = successful_samples;
+            setup.sort_unstable();
+            let index = (setup.len() * 3).div_ceil(4).saturating_sub(1);
+            if setup[index] >= TOR_SETUP_THRESHOLD {
+                return TorRuntimeHealth::Slow;
+            }
+        }
+        TorRuntimeHealth::Ready
+    }
+
+    #[cfg(test)]
+    fn health(&mut self, now: Instant) -> TorRuntimeHealth {
+        self.health_report(now).health
+    }
+
+    fn health_report(&mut self, now: Instant) -> TorRuntimeHealthReport {
+        self.expire(now);
+        self.transition(now);
+
+        let health = self.latched_cause.unwrap_or(TorRuntimeHealth::Ready);
+        let (recent_attempt_count, recent_failed_attempt_count, successful_samples) =
+            self.current_evidence(now);
+        TorRuntimeHealthReport {
+            health,
+            recent_attempt_count,
+            recent_failed_attempt_count,
+            recent_successful_sample_count: successful_samples.len(),
+        }
+    }
+
+    fn observations(&mut self, now: Instant) -> Vec<TorConnectionObservation> {
+        self.expire(now);
+        self.observations.iter().copied().collect()
+    }
+
+    fn current_evidence(&self, now: Instant) -> (usize, usize, Vec<Duration>) {
+        let mut attempts = 0;
+        let mut failures = 0;
+        let mut successful_samples = Vec::new();
+        for observation in &self.observations {
+            if observation.completed_at > now
+                || now.duration_since(observation.completed_at) > TOR_OBSERVATION_AGE
+            {
+                continue;
+            }
+            attempts += 1;
+            if observation.succeeded {
+                successful_samples.push(observation.setup_duration);
+            } else {
+                failures += 1;
+            }
+        }
+        (attempts, failures, successful_samples)
+    }
+
+    fn transition(&mut self, now: Instant) {
+        match self.classify(now) {
+            TorRuntimeHealth::Ready => {
+                if self.latched_cause.is_some()
+                    && self.trailing_post_boundary_successes() >= TOR_RECOVERY_SUCCESS_STREAK
+                {
+                    self.latched_cause = None;
+                    self.episode_boundary_sequence = None;
+                }
+            }
+            cause => {
+                if self.latched_cause.is_none() {
+                    self.episode_boundary_sequence = self
+                        .observations
+                        .back()
+                        .map(|observation| observation.admitted_sequence);
+                }
+                self.latched_cause = Some(cause);
+            }
+        }
+    }
+
+    fn trailing_post_boundary_successes(&self) -> usize {
+        let Some(boundary) = self.episode_boundary_sequence else {
+            return 0;
+        };
+        let mut successes = 0_usize;
+        for observation in self.observations.iter().rev() {
+            if observation.admitted_sequence <= boundary || !observation.succeeded {
+                break;
+            }
+            successes = successes.saturating_add(1);
+        }
+        successes.min(TOR_RECOVERY_SUCCESS_STREAK)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TorBridgeActivitySnapshot {
+    pub generation: u64,
+    pub downloaded_bytes: u64,
+    pub connecting_streams: u64,
+    pub active_streams: u64,
+    pub successful_connections: u64,
+    pub failed_connections: u64,
+    pub recent_connection_sample_count: usize,
+    pub recent_successful_sample_count: usize,
+    pub median_setup_duration: Option<Duration>,
+    pub last_activity_age: Option<Duration>,
+}
+
+struct TorBridgeActivity {
+    generation: u64,
+    activity_origin: Instant,
+    downloaded_bytes: AtomicU64,
+    connecting_streams: AtomicU64,
+    active_streams: AtomicU64,
+    successful_connections: AtomicU64,
+    failed_connections: AtomicU64,
+    last_activity_tick: AtomicU64,
+    tracker: Mutex<TorRuntimeHealthTracker>,
+}
+
+impl TorBridgeActivity {
+    fn new(generation: u64) -> Arc<Self> {
+        Arc::new(Self {
+            generation,
+            activity_origin: Instant::now(),
+            downloaded_bytes: AtomicU64::new(0),
+            connecting_streams: AtomicU64::new(0),
+            active_streams: AtomicU64::new(0),
+            successful_connections: AtomicU64::new(0),
+            failed_connections: AtomicU64::new(0),
+            last_activity_tick: AtomicU64::new(0),
+            tracker: Mutex::new(TorRuntimeHealthTracker::new(generation)),
+        })
+    }
+
+    fn begin_connection(self: &Arc<Self>) -> TorConnectingGuard {
+        self.connecting_streams.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+        TorConnectingGuard {
+            activity: Arc::clone(self),
+            started_at: Instant::now(),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed_nanos = Instant::now()
+            .saturating_duration_since(self.activity_origin)
+            .as_nanos();
+        let tick = u64::try_from(elapsed_nanos).unwrap_or(u64::MAX).max(1);
+        self.last_activity_tick.fetch_max(tick, Ordering::Relaxed);
+    }
+
+    fn record_connection(&self, succeeded: bool, setup_duration: Duration) {
+        if succeeded {
+            self.successful_connections.fetch_add(1, Ordering::Relaxed);
+            self.active_streams.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_connections.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut tracker) = self.tracker.lock() {
+            let completed_at = Instant::now();
+            let _ = tracker.record_at(
+                TorConnectionObservation::new(
+                    self.generation,
+                    succeeded,
+                    completed_at,
+                    setup_duration,
+                ),
+                completed_at,
+            );
+        }
+        self.touch();
+    }
+
+    fn finish_active_stream(&self) {
+        let _ = self
+            .active_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_sub(1)
+            });
+        self.touch();
+    }
+
+    fn add_downloaded_bytes(&self, bytes: usize) {
+        self.downloaded_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.touch();
+    }
+
+    fn snapshot(&self) -> TorBridgeActivitySnapshot {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> TorBridgeActivitySnapshot {
+        let observations = self
+            .tracker
+            .lock()
+            .map(|mut tracker| tracker.observations(now))
+            .unwrap_or_default();
+        let mut successful: Vec<_> = observations
+            .iter()
+            .filter(|observation| observation.succeeded)
+            .map(|observation| observation.setup_duration)
+            .collect();
+        successful.sort_unstable();
+        let median_setup_duration = median_duration(&successful);
+        let last_activity_age = self.last_activity_age(now);
+        TorBridgeActivitySnapshot {
+            generation: self.generation,
+            downloaded_bytes: self.downloaded_bytes.load(Ordering::Relaxed),
+            connecting_streams: self.connecting_streams.load(Ordering::Relaxed),
+            active_streams: self.active_streams.load(Ordering::Relaxed),
+            successful_connections: self.successful_connections.load(Ordering::Relaxed),
+            failed_connections: self.failed_connections.load(Ordering::Relaxed),
+            recent_connection_sample_count: observations.len(),
+            recent_successful_sample_count: successful.len(),
+            median_setup_duration,
+            last_activity_age,
+        }
+    }
+
+    fn runtime_health_report(&self) -> TorRuntimeHealthReport {
+        let default_report = TorRuntimeHealthReport {
+            health: TorRuntimeHealth::Ready,
+            recent_attempt_count: 0,
+            recent_failed_attempt_count: 0,
+            recent_successful_sample_count: 0,
+        };
+        self.tracker.lock().map_or(default_report, |mut tracker| {
+            tracker.health_report(Instant::now())
+        })
+    }
+
+    fn last_activity_age(&self, now: Instant) -> Option<Duration> {
+        let tick = self.last_activity_tick.load(Ordering::Relaxed);
+        if tick == 0 {
+            return None;
+        }
+        let elapsed_since_origin = now.saturating_duration_since(self.activity_origin);
+        Some(elapsed_since_origin.saturating_sub(Duration::from_nanos(tick)))
+    }
+}
+
+fn median_duration(values: &[Duration]) -> Option<Duration> {
+    let middle = values.len() / 2;
+    match values.len() {
+        0 => None,
+        length if length % 2 == 1 => values.get(middle).copied(),
+        _ => {
+            let lower = values.get(middle - 1).copied()?;
+            let upper = values.get(middle).copied()?;
+            Some(lower + upper.saturating_sub(lower) / 2)
         }
     }
 }
@@ -249,6 +653,13 @@ impl HttpContext {
         }
     }
 
+    #[must_use]
+    pub fn tor_bridge_activity_snapshot(&self) -> Option<TorBridgeActivitySnapshot> {
+        self.socks_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.activity_snapshot())
+    }
+
     fn configured_network_status_detail(&self) -> String {
         match self.mode {
             WalletNetworkMode::Tor => match self.proxy_url.as_ref() {
@@ -274,10 +685,11 @@ impl HttpContext {
 
     fn tor_network_health(&self) -> WalletNetworkHealth {
         let Some(arti_client) = self.arti_client() else {
-            return WalletNetworkHealth::new(
+            return WalletNetworkHealth::with_cause(
                 WalletNetworkMode::Tor,
                 WalletNetworkHealthState::Degraded,
                 "Degraded. Tor client is unavailable",
+                WalletNetworkHealthCause::TorBootstrap,
             );
         };
 
@@ -286,6 +698,35 @@ impl HttpContext {
 
     fn tor_network_health_for_status(&self, status: &BootstrapStatus) -> WalletNetworkHealth {
         if status.ready_for_traffic() {
+            if let Some(activity) = self.socks_bridge.as_ref() {
+                let report = activity.runtime_health_report();
+                match report.health {
+                    TorRuntimeHealth::Slow => {
+                        return WalletNetworkHealth::with_cause(
+                            WalletNetworkMode::Tor,
+                            WalletNetworkHealthState::Degraded,
+                            format!(
+                                "Degraded. Recent Tor connections are slow ({} successful setup samples; p75 threshold is at least {}s)",
+                                report.recent_successful_sample_count,
+                                TOR_SETUP_THRESHOLD.as_secs(),
+                            ),
+                            WalletNetworkHealthCause::TorRuntimeSlow,
+                        );
+                    }
+                    TorRuntimeHealth::Unreliable => {
+                        return WalletNetworkHealth::with_cause(
+                            WalletNetworkMode::Tor,
+                            WalletNetworkHealthState::Degraded,
+                            format!(
+                                "Degraded. Recent Tor connections are unreliable ({} of {} recent Tor connection attempts failed)",
+                                report.recent_failed_attempt_count, report.recent_attempt_count,
+                            ),
+                            WalletNetworkHealthCause::TorRuntimeUnreliable,
+                        );
+                    }
+                    TorRuntimeHealth::Ready => {}
+                }
+            }
             return WalletNetworkHealth::new(
                 WalletNetworkMode::Tor,
                 WalletNetworkHealthState::Ready,
@@ -299,7 +740,12 @@ impl HttpContext {
             (WalletNetworkHealthState::Reconnecting, "Reconnecting")
         };
 
-        WalletNetworkHealth::new(WalletNetworkMode::Tor, state, format!("{prefix}. {status}"))
+        WalletNetworkHealth::with_cause(
+            WalletNetworkMode::Tor,
+            state,
+            format!("{prefix}. {status}"),
+            WalletNetworkHealthCause::TorBootstrap,
+        )
     }
 
     #[must_use]
@@ -318,11 +764,12 @@ impl HttpContext {
     #[must_use]
     pub fn arti_client_provider(&self) -> Option<WalletTorClientProvider> {
         if let Some(socks_bridge) = self.socks_bridge.as_ref() {
-            let active_client: Weak<RwLock<WalletTorClient>> =
-                Arc::downgrade(&socks_bridge.active_client);
+            let session: Weak<RwLock<TorBridgeSession>> = Arc::downgrade(&socks_bridge.session);
             return Some(Arc::new(move || {
-                active_client.upgrade().and_then(|active_client| {
-                    active_client.read().ok().map(|client| client.clone())
+                session.upgrade().and_then(|session| {
+                    ArtiSocksBridge::capture_session(&session)
+                        .ok()
+                        .map(|captured| captured.client)
                 })
             }));
         }
@@ -758,10 +1205,22 @@ pub(crate) fn redact_url_for_display(url: &Url) -> String {
 
 struct ArtiSocksBridge {
     local_addr: SocketAddr,
-    active_client: Arc<RwLock<WalletTorClient>>,
-    session_generation: AtomicU64,
+    session: Arc<RwLock<TorBridgeSession>>,
     shutdown_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
+}
+
+struct TorBridgeSession {
+    client: WalletTorClient,
+    generation: u64,
+    activity: Arc<TorBridgeActivity>,
+}
+
+#[derive(Clone)]
+struct CapturedTorBridgeSession {
+    client: WalletTorClient,
+    generation: u64,
+    activity: Arc<TorBridgeActivity>,
 }
 
 impl ArtiSocksBridge {
@@ -773,19 +1232,35 @@ impl ArtiSocksBridge {
             .local_addr()
             .wrap_err("read internal Arti SOCKS bridge address")?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let active_client = Arc::new(RwLock::new(arti_client));
+        let session = Arc::new(RwLock::new(TorBridgeSession {
+            client: arti_client,
+            generation: 1,
+            activity: TorBridgeActivity::new(1),
+        }));
         let task = tokio::spawn(run_arti_socks_bridge(
             listener,
-            Arc::clone(&active_client),
+            Arc::clone(&session),
             shutdown_rx,
         ));
         Ok(Self {
             local_addr,
-            active_client,
-            session_generation: AtomicU64::new(1),
+            session,
             shutdown_tx,
             task,
         })
+    }
+
+    fn capture_session(
+        session: &Arc<RwLock<TorBridgeSession>>,
+    ) -> Result<CapturedTorBridgeSession> {
+        session
+            .read()
+            .map(|session| CapturedTorBridgeSession {
+                client: session.client.clone(),
+                generation: session.generation,
+                activity: Arc::clone(&session.activity),
+            })
+            .map_err(|_| eyre!("active Tor session client lock is poisoned"))
     }
 
     const fn local_addr(&self) -> SocketAddr {
@@ -793,24 +1268,45 @@ impl ArtiSocksBridge {
     }
 
     fn active_client(&self) -> Result<WalletTorClient> {
-        self.active_client
-            .read()
-            .map(|client| client.clone())
-            .map_err(|_| eyre!("active Tor session client lock is poisoned"))
+        Self::capture_session(&self.session).map(|captured| captured.client)
     }
 
     fn new_isolated_session(&self) -> Result<u64> {
-        let isolated_client = self.active_client()?.isolated_client();
-        let mut active_client = self
-            .active_client
+        let mut session = self
+            .session
             .write()
             .map_err(|_| eyre!("active Tor session client lock is poisoned"))?;
-        *active_client = isolated_client;
-        Ok(self.session_generation.fetch_add(1, Ordering::Relaxed) + 1)
+        let generation = session.generation.saturating_add(1);
+        let isolated_client = session.client.isolated_client();
+        *session = TorBridgeSession {
+            client: isolated_client,
+            generation,
+            activity: TorBridgeActivity::new(generation),
+        };
+        Ok(generation)
     }
 
     fn session_generation(&self) -> u64 {
-        self.session_generation.load(Ordering::Relaxed)
+        self.session.read().map_or(0, |session| session.generation)
+    }
+
+    fn activity_snapshot(&self) -> Option<TorBridgeActivitySnapshot> {
+        self.session
+            .read()
+            .ok()
+            .map(|session| session.activity.snapshot())
+    }
+
+    fn runtime_health_report(&self) -> TorRuntimeHealthReport {
+        let default_report = TorRuntimeHealthReport {
+            health: TorRuntimeHealth::Ready,
+            recent_attempt_count: 0,
+            recent_failed_attempt_count: 0,
+            recent_successful_sample_count: 0,
+        };
+        self.session.read().map_or(default_report, |session| {
+            session.activity.runtime_health_report()
+        })
     }
 }
 
@@ -823,7 +1319,7 @@ impl Drop for ArtiSocksBridge {
 
 async fn run_arti_socks_bridge(
     listener: TcpListener,
-    active_client: Arc<RwLock<WalletTorClient>>,
+    session: Arc<RwLock<TorBridgeSession>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -835,17 +1331,17 @@ async fn run_arti_socks_bridge(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, peer_addr)) => {
-                        let arti_client = match active_client.read() {
-                            Ok(arti_client) => arti_client.clone(),
+                    Ok((stream, _)) => {
+                        let captured = match ArtiSocksBridge::capture_session(&session) {
+                            Ok(captured) => captured,
                             Err(error) => {
-                                tracing::warn!(%peer_addr, %error, "active Tor session client lock is poisoned");
+                                tracing::warn!(%error, "active Tor session client lock is poisoned");
                                 continue;
                             }
                         };
                         tokio::spawn(async move {
-                            if let Err(error) = handle_socks_connection(stream, arti_client).await {
-                                tracing::debug!(%peer_addr, ?error, "internal Arti SOCKS connection failed");
+                            if let Err(error) = handle_socks_connection(stream, captured).await {
+                                tracing::debug!(?error, "internal Arti SOCKS connection failed");
                             }
                         });
                     }
@@ -870,34 +1366,123 @@ async fn wait_after_socks_accept_error(shutdown_rx: &mut watch::Receiver<bool>) 
 
 async fn handle_socks_connection(
     mut inbound: TcpStream,
-    arti_client: WalletTorClient,
+    captured: CapturedTorBridgeSession,
 ) -> Result<()> {
+    let CapturedTorBridgeSession {
+        client: arti_client,
+        generation,
+        activity,
+    } = captured;
+    debug_assert_eq!(generation, activity.generation);
     negotiate_socks_no_auth(&mut inbound).await?;
     let target = read_socks_connect_target(&mut inbound).await?;
+    let connecting = activity.begin_connection();
     let outbound = match arti_client
         .connect((target.host.as_str(), target.port))
         .await
     {
         Ok(outbound) => outbound,
-        Err(error) => {
+        Err(_error) => {
+            connecting.finish_failure();
             send_socks_reply(&mut inbound, SOCKS_REPLY_GENERAL_FAILURE).await?;
-            return Err(eyre!(
-                "connect to {}:{} over Arti: {error}",
-                target.host,
-                target.port
-            ));
+            return Err(eyre!("Tor connection failed"));
         }
     };
+    let _active_stream = connecting.finish_success();
     send_socks_reply(&mut inbound, SOCKS_REPLY_SUCCEEDED).await?;
-    let mut outbound = outbound;
+    let mut outbound = DownloadCounter::new(outbound, Arc::clone(&activity));
     match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(error) if is_expected_socks_stream_close(&error) => {
             tracing::trace!(%error, "internal Arti SOCKS stream closed");
+            Ok(())
         }
-        Err(error) => return Err(error).wrap_err("relay SOCKS stream through Arti"),
+        Err(error) => Err(error).wrap_err("relay SOCKS stream through Arti"),
     }
-    Ok(())
+}
+
+struct TorConnectingGuard {
+    activity: Arc<TorBridgeActivity>,
+    started_at: Instant,
+}
+
+impl TorConnectingGuard {
+    fn finish_success(self) -> TorActiveStreamGuard {
+        let activity = Arc::clone(&self.activity);
+        activity.record_connection(true, self.started_at.elapsed());
+        TorActiveStreamGuard { activity }
+    }
+
+    fn finish_failure(self) {
+        self.activity
+            .record_connection(false, self.started_at.elapsed());
+    }
+}
+
+impl Drop for TorConnectingGuard {
+    fn drop(&mut self) {
+        let _ = self.activity.connecting_streams.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |count| count.checked_sub(1),
+        );
+        self.activity.touch();
+    }
+}
+
+struct TorActiveStreamGuard {
+    activity: Arc<TorBridgeActivity>,
+}
+
+impl Drop for TorActiveStreamGuard {
+    fn drop(&mut self) {
+        self.activity.finish_active_stream();
+    }
+}
+
+struct DownloadCounter<S> {
+    stream: S,
+    activity: Arc<TorBridgeActivity>,
+}
+
+impl<S> DownloadCounter<S> {
+    const fn new(stream: S, activity: Arc<TorBridgeActivity>) -> Self {
+        Self { stream, activity }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for DownloadCounter<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.stream).poll_read(cx, buf);
+        if matches!(&result, Poll::Ready(Ok(()))) {
+            self.activity
+                .add_downloaded_bytes(buf.filled().len().saturating_sub(before));
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for DownloadCounter<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 fn is_expected_socks_stream_close(error: &std::io::Error) -> bool {
@@ -1082,6 +1667,328 @@ mod tests {
         assert_eq!(health.mode, WalletNetworkMode::Direct);
         assert_eq!(health.state, WalletNetworkHealthState::Ready);
         assert_eq!(health.label(), "Direct mode");
+        assert_eq!(health.cause, WalletNetworkHealthCause::None);
+        assert!(
+            HttpContext::direct_for_tests()
+                .tor_bridge_activity_snapshot()
+                .is_none()
+        );
+    }
+
+    fn record_observation(
+        tracker: &mut TorRuntimeHealthTracker,
+        generation: u64,
+        succeeded: bool,
+        completed_at: Instant,
+        setup_duration: Duration,
+    ) -> bool {
+        tracker.record_at(
+            TorConnectionObservation::new(generation, succeeded, completed_at, setup_duration),
+            completed_at,
+        )
+    }
+
+    #[test]
+    fn runtime_health_rejects_wrong_generation_and_caps_recent_observations() {
+        let start = Instant::now();
+        let mut tracker = TorRuntimeHealthTracker::new(7);
+        record_observation(&mut tracker, 8, true, start, Duration::from_millis(10));
+        assert!(tracker.observations(start).is_empty());
+
+        for index in 0..65 {
+            let at = start + Duration::from_secs(index);
+            record_observation(&mut tracker, 7, true, at, Duration::from_millis(10));
+        }
+
+        let observations = tracker.observations(start + Duration::from_secs(65));
+        assert_eq!(observations.len(), TOR_OBSERVATION_LIMIT);
+        assert_eq!(observations[0].completed_at, start + Duration::from_secs(1));
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.generation == 7)
+        );
+
+        let at_exact_expiry = tracker.observations(start + Duration::from_secs(121));
+        assert_eq!(at_exact_expiry.len(), TOR_OBSERVATION_LIMIT);
+        assert_eq!(
+            at_exact_expiry[0].completed_at,
+            start + Duration::from_secs(1)
+        );
+        let after_expiry = tracker.observations(start + Duration::from_secs(122));
+        assert_eq!(after_expiry.len(), TOR_OBSERVATION_LIMIT - 1);
+        assert_eq!(after_expiry[0].completed_at, start + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn runtime_health_preserves_equal_time_admission_order_for_failure_reset() {
+        let start = Instant::now();
+        let mut tracker = TorRuntimeHealthTracker::new(1);
+        for index in 0..8 {
+            record_observation(
+                &mut tracker,
+                1,
+                true,
+                start + Duration::from_secs(index),
+                if index >= 5 {
+                    Duration::from_secs(8)
+                } else {
+                    Duration::from_millis(1)
+                },
+            );
+        }
+        let equal_time = start + Duration::from_secs(8);
+        for _ in 0..3 {
+            record_observation(&mut tracker, 1, true, equal_time, Duration::from_millis(1));
+        }
+        record_observation(&mut tracker, 1, false, equal_time, Duration::ZERO);
+        for _ in 0..3 {
+            record_observation(&mut tracker, 1, true, equal_time, Duration::from_millis(1));
+        }
+        assert_eq!(tracker.health(equal_time), TorRuntimeHealth::Slow);
+
+        record_observation(&mut tracker, 1, true, equal_time, Duration::from_millis(1));
+        assert_eq!(tracker.health(equal_time), TorRuntimeHealth::Ready);
+    }
+
+    #[test]
+    fn runtime_health_requires_sufficient_evidence_and_ignores_isolated_failures() {
+        let start = Instant::now();
+        let mut insufficient = TorRuntimeHealthTracker::new(7);
+        for index in 0..7 {
+            record_observation(
+                &mut insufficient,
+                7,
+                false,
+                start + Duration::from_secs(index),
+                Duration::from_millis(10),
+            );
+        }
+        assert_eq!(
+            insufficient.health(start + Duration::from_secs(7)),
+            TorRuntimeHealth::Ready
+        );
+
+        let mut isolated = TorRuntimeHealthTracker::new(7);
+        for index in 0..8 {
+            record_observation(
+                &mut isolated,
+                7,
+                index >= 3,
+                start + Duration::from_secs(index),
+                Duration::from_millis(10),
+            );
+        }
+        assert_eq!(
+            isolated.classify(start + Duration::from_secs(8)),
+            TorRuntimeHealth::Ready
+        );
+
+        let mut sustained = TorRuntimeHealthTracker::new(7);
+        for index in 0..8 {
+            record_observation(
+                &mut sustained,
+                7,
+                false,
+                start + Duration::from_secs(index),
+                Duration::from_millis(10),
+            );
+        }
+        assert_eq!(
+            sustained.health(start + Duration::from_secs(8)),
+            TorRuntimeHealth::Unreliable
+        );
+    }
+
+    #[test]
+    fn runtime_health_does_not_credit_establishing_success_and_recovers_after_four_more() {
+        let start = Instant::now();
+        let mut tracker = TorRuntimeHealthTracker::new(1);
+        for index in 0..8 {
+            record_observation(
+                &mut tracker,
+                1,
+                index >= 4,
+                start + Duration::from_secs(index),
+                Duration::from_millis(10),
+            );
+        }
+        assert_eq!(
+            tracker.health(start + Duration::from_secs(8)),
+            TorRuntimeHealth::Unreliable
+        );
+
+        for index in 0..3 {
+            let at =
+                start + Duration::from_secs(u64::try_from(8 + index).expect("test index fits"));
+            record_observation(&mut tracker, 1, true, at, Duration::from_millis(10));
+            assert_eq!(tracker.health(at), TorRuntimeHealth::Unreliable);
+        }
+        let recovered_at = start + Duration::from_secs(11);
+        record_observation(
+            &mut tracker,
+            1,
+            true,
+            recovered_at,
+            Duration::from_millis(10),
+        );
+        assert_eq!(tracker.health(recovered_at), TorRuntimeHealth::Ready);
+    }
+
+    #[test]
+    fn runtime_health_detects_p75_setup_delay_and_preserves_slow_cause() {
+        let start = Instant::now();
+        let mut tracker = TorRuntimeHealthTracker::new(1);
+        for index in 0..8 {
+            record_observation(
+                &mut tracker,
+                1,
+                true,
+                start + Duration::from_secs(index),
+                if index >= 5 {
+                    Duration::from_secs(8)
+                } else {
+                    Duration::from_millis(1)
+                },
+            );
+        }
+        let failed_at = start + Duration::from_secs(8);
+        record_observation(&mut tracker, 1, false, failed_at, Duration::ZERO);
+        assert_eq!(tracker.health(failed_at), TorRuntimeHealth::Slow);
+
+        for index in 0..3 {
+            let at = start + Duration::from_secs(9 + index);
+            record_observation(&mut tracker, 1, true, at, Duration::from_millis(1));
+            assert_eq!(tracker.health(at), TorRuntimeHealth::Slow);
+        }
+        let recovered_at = start + Duration::from_secs(12);
+        record_observation(
+            &mut tracker,
+            1,
+            true,
+            recovered_at,
+            Duration::from_millis(1),
+        );
+        assert_eq!(tracker.health(recovered_at), TorRuntimeHealth::Ready);
+    }
+
+    #[test]
+    fn runtime_health_expires_stale_observations_and_resets_success_streak() {
+        let start = Instant::now();
+        let mut tracker = TorRuntimeHealthTracker::new(1);
+        for index in 0..8 {
+            record_observation(
+                &mut tracker,
+                1,
+                index < 4,
+                start + Duration::from_secs(index),
+                Duration::from_millis(1),
+            );
+        }
+        assert_eq!(
+            tracker.health(start + Duration::from_secs(8)),
+            TorRuntimeHealth::Unreliable
+        );
+        let stale_at = start + Duration::from_secs(200);
+        assert_eq!(tracker.health(stale_at), TorRuntimeHealth::Ready);
+        assert!(tracker.observations(stale_at).is_empty());
+
+        for index in 0..3 {
+            let at = stale_at + Duration::from_secs(index);
+            record_observation(&mut tracker, 1, true, at, Duration::from_millis(1));
+        }
+        assert_eq!(
+            tracker.health(stale_at + Duration::from_secs(3)),
+            TorRuntimeHealth::Ready
+        );
+    }
+
+    #[test]
+    fn runtime_health_clamps_credited_successes_after_partial_expiry() {
+        let start = Instant::now();
+        let mut tracker = TorRuntimeHealthTracker::new(1);
+        for index in 0..8 {
+            let at = start + Duration::from_secs(100 + index);
+            record_observation(&mut tracker, 1, true, at, Duration::from_secs(8));
+        }
+        for index in 108..=110 {
+            let at = start + Duration::from_secs(index);
+            record_observation(&mut tracker, 1, true, at, Duration::from_millis(1));
+        }
+
+        let after_expiry = start + Duration::from_secs(229);
+        let retained = tracker.observations(after_expiry);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(tracker.health(after_expiry), TorRuntimeHealth::Slow);
+        assert!(!tracker.observations(after_expiry).is_empty());
+
+        let first_fresh_success = after_expiry;
+        record_observation(
+            &mut tracker,
+            1,
+            true,
+            first_fresh_success,
+            Duration::from_millis(1),
+        );
+        assert_eq!(tracker.health(first_fresh_success), TorRuntimeHealth::Slow);
+
+        let second_fresh_success = after_expiry;
+        record_observation(
+            &mut tracker,
+            1,
+            true,
+            second_fresh_success,
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            tracker.health(second_fresh_success),
+            TorRuntimeHealth::Ready
+        );
+    }
+
+    #[test]
+    fn runtime_health_updates_current_cause_through_ready_hysteresis() {
+        let start = Instant::now();
+        let mut tracker = TorRuntimeHealthTracker::new(1);
+        for index in 0..8 {
+            record_observation(
+                &mut tracker,
+                1,
+                true,
+                start + Duration::from_secs(200 + index),
+                Duration::from_secs(8),
+            );
+        }
+        let keep_alive_at = start + Duration::from_secs(210);
+        record_observation(&mut tracker, 1, true, keep_alive_at, Duration::from_secs(8));
+        assert_eq!(tracker.health(keep_alive_at), TorRuntimeHealth::Slow);
+
+        let ready_at = start + Duration::from_secs(330);
+        assert_eq!(tracker.health(ready_at), TorRuntimeHealth::Slow);
+
+        for index in 0..8 {
+            let at = ready_at + Duration::from_secs(index);
+            record_observation(&mut tracker, 1, false, at, Duration::ZERO);
+        }
+        assert_eq!(
+            tracker.health(ready_at + Duration::from_secs(7)),
+            TorRuntimeHealth::Unreliable
+        );
+
+        for index in 0..8 {
+            let at = ready_at + Duration::from_secs(8 + index);
+            record_observation(&mut tracker, 1, true, at, Duration::from_secs(8));
+        }
+        let boundary_report = tracker.health_report(ready_at + Duration::from_secs(15));
+        assert_eq!(boundary_report.health, TorRuntimeHealth::Unreliable);
+        assert_eq!(boundary_report.recent_failed_attempt_count, 8);
+        assert_eq!(boundary_report.recent_attempt_count, 16);
+
+        let next_at = ready_at + Duration::from_secs(16);
+        record_observation(&mut tracker, 1, true, next_at, Duration::from_secs(8));
+        let report = tracker.health_report(next_at);
+        assert_eq!(report.health, TorRuntimeHealth::Slow);
+        assert_eq!(report.recent_successful_sample_count, 9);
     }
 
     #[test]
@@ -1250,6 +2157,198 @@ mod tests {
             std::fs::read(&wallet_file).expect("read wallet file"),
             b"wallet"
         );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn download_counter_counts_live_reads_but_not_writes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (mut peer, stream) = tokio::io::duplex(64);
+            let activity = TorBridgeActivity::new(1);
+            let mut counted = DownloadCounter::new(stream, Arc::clone(&activity));
+            peer.write_all(b"download").await.expect("write download");
+            let mut buffer = [0_u8; 8];
+            counted
+                .read_exact(&mut buffer)
+                .await
+                .expect("read download");
+            assert_eq!(activity.snapshot().downloaded_bytes, 8);
+            counted.write_all(b"upload").await.expect("write upload");
+            let mut upload = [0_u8; 6];
+            peer.read_exact(&mut upload).await.expect("read upload");
+            assert_eq!(activity.snapshot().downloaded_bytes, 8);
+        });
+    }
+
+    #[test]
+    fn activity_snapshot_reports_recent_samples_and_preserves_cumulative_counts() {
+        let activity = TorBridgeActivity::new(7);
+        let origin = activity.activity_origin;
+        activity.downloaded_bytes.store(23, Ordering::Relaxed);
+        activity.successful_connections.store(2, Ordering::Relaxed);
+        activity.failed_connections.store(1, Ordering::Relaxed);
+        activity.last_activity_tick.store(
+            u64::try_from(Duration::from_secs(15).as_nanos()).expect("activity tick fits"),
+            Ordering::Relaxed,
+        );
+
+        {
+            let mut tracker = activity.tracker.lock().expect("lock activity tracker");
+            record_observation(
+                &mut tracker,
+                7,
+                true,
+                origin + Duration::from_secs(10),
+                Duration::from_secs(2),
+            );
+            record_observation(
+                &mut tracker,
+                7,
+                false,
+                origin + Duration::from_secs(12),
+                Duration::ZERO,
+            );
+            record_observation(
+                &mut tracker,
+                7,
+                true,
+                origin + Duration::from_secs(14),
+                Duration::from_secs(4),
+            );
+        }
+
+        let snapshot = activity.snapshot_at(origin + Duration::from_secs(20));
+        assert_eq!(snapshot.generation, 7);
+        assert_eq!(snapshot.downloaded_bytes, 23);
+        assert_eq!(snapshot.successful_connections, 2);
+        assert_eq!(snapshot.failed_connections, 1);
+        assert_eq!(snapshot.recent_connection_sample_count, 3);
+        assert_eq!(snapshot.recent_successful_sample_count, 2);
+        assert_eq!(snapshot.median_setup_duration, Some(Duration::from_secs(3)));
+        assert_eq!(snapshot.last_activity_age, Some(Duration::from_secs(5)));
+
+        let stale_snapshot = activity.snapshot_at(origin + Duration::from_secs(135));
+        assert_eq!(stale_snapshot.recent_connection_sample_count, 0);
+        assert_eq!(stale_snapshot.recent_successful_sample_count, 0);
+        assert_eq!(stale_snapshot.median_setup_duration, None);
+        assert_eq!(stale_snapshot.successful_connections, 2);
+        assert_eq!(stale_snapshot.failed_connections, 1);
+    }
+
+    #[test]
+    fn activity_guards_clean_up_connecting_and_active_streams() {
+        let activity = TorBridgeActivity::new(1);
+
+        {
+            let connecting = activity.begin_connection();
+            assert_eq!(activity.snapshot().connecting_streams, 1);
+            drop(connecting);
+        }
+        assert_eq!(activity.snapshot().connecting_streams, 0);
+        assert_eq!(activity.snapshot().successful_connections, 0);
+        assert_eq!(activity.snapshot().failed_connections, 0);
+
+        let active = activity.begin_connection().finish_success();
+        let snapshot = activity.snapshot();
+        assert_eq!(snapshot.connecting_streams, 0);
+        assert_eq!(snapshot.active_streams, 1);
+        assert_eq!(snapshot.successful_connections, 1);
+        drop(active);
+        assert_eq!(activity.snapshot().active_streams, 0);
+
+        activity.begin_connection().finish_failure();
+        let snapshot = activity.snapshot();
+        assert_eq!(snapshot.connecting_streams, 0);
+        assert_eq!(snapshot.active_streams, 0);
+        assert_eq!(snapshot.failed_connections, 1);
+    }
+
+    #[test]
+    fn isolated_session_replaces_real_bridge_activity_without_cross_contamination() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let data_dir = test_data_dir("bridge-session");
+        let arti_dir = data_dir.join(ARTI_DIR);
+        let state_dir = arti_dir.join(ARTI_STATE_DIR);
+        let cache_dir = arti_dir.join(ARTI_CACHE_DIR);
+        std::fs::create_dir_all(&state_dir).expect("create Arti state directory");
+        std::fs::create_dir_all(&cache_dir).expect("create Arti cache directory");
+
+        let result: Result<()> = runtime.block_on(async {
+            let tor_config = TorClientConfigBuilder::from_directories(&state_dir, &cache_dir)
+                .build()
+                .expect("build Arti client config");
+            let arti_client = TorClient::builder()
+                .config(tor_config)
+                .create_unbootstrapped_async()
+                .await
+                .expect("create unbootstrapped Arti client");
+            let bridge = ArtiSocksBridge::start(arti_client)
+                .await
+                .expect("start loopback Arti SOCKS bridge");
+            assert!(bridge.local_addr().ip().is_loopback());
+
+            let old_capture = ArtiSocksBridge::capture_session(&bridge.session)
+                .expect("capture initial bridge session");
+            assert_eq!(old_capture.generation, 1);
+            assert_eq!(old_capture.generation, old_capture.activity.generation);
+            let old_connection = old_capture.activity.begin_connection();
+
+            let new_generation = bridge
+                .new_isolated_session()
+                .expect("replace bridge session with isolated client");
+            assert_eq!(new_generation, old_capture.generation + 1);
+            let new_capture = ArtiSocksBridge::capture_session(&bridge.session)
+                .expect("capture replacement bridge session");
+            assert_eq!(new_capture.generation, new_generation);
+            assert_eq!(new_capture.generation, new_capture.activity.generation);
+            assert!(!Arc::ptr_eq(&old_capture.activity, &new_capture.activity));
+            let fresh_snapshot = bridge
+                .activity_snapshot()
+                .expect("snapshot replacement activity");
+            assert_eq!(fresh_snapshot.generation, new_generation);
+            assert_eq!(fresh_snapshot.downloaded_bytes, 0);
+            assert_eq!(fresh_snapshot.connecting_streams, 0);
+            assert_eq!(fresh_snapshot.active_streams, 0);
+            assert_eq!(fresh_snapshot.successful_connections, 0);
+            assert_eq!(fresh_snapshot.failed_connections, 0);
+            assert_eq!(new_capture.activity.snapshot().generation, new_generation);
+
+            let old_active = old_connection.finish_success();
+            old_capture.activity.add_downloaded_bytes(8);
+            drop(old_active);
+            let old_snapshot = old_capture.activity.snapshot();
+            assert_eq!(old_snapshot.downloaded_bytes, 8);
+            assert_eq!(old_snapshot.connecting_streams, 0);
+            assert_eq!(old_snapshot.active_streams, 0);
+            assert_eq!(old_snapshot.successful_connections, 1);
+            assert_eq!(new_capture.activity.snapshot().downloaded_bytes, 0);
+            assert_eq!(new_capture.activity.snapshot().connecting_streams, 0);
+            assert_eq!(new_capture.activity.snapshot().active_streams, 0);
+            assert_eq!(new_capture.activity.snapshot().successful_connections, 0);
+
+            let current_snapshot = bridge
+                .activity_snapshot()
+                .expect("snapshot current activity after old completion");
+            assert_eq!(current_snapshot.generation, new_generation);
+            assert_eq!(current_snapshot.downloaded_bytes, 0);
+            assert_eq!(current_snapshot.connecting_streams, 0);
+            assert_eq!(current_snapshot.active_streams, 0);
+            assert_eq!(current_snapshot.successful_connections, 0);
+            assert_eq!(current_snapshot.failed_connections, 0);
+            assert_eq!(current_snapshot.recent_connection_sample_count, 0);
+            assert_eq!(current_snapshot.recent_successful_sample_count, 0);
+            assert_eq!(current_snapshot.median_setup_duration, None);
+            assert_eq!(current_snapshot.last_activity_age, None);
+            Ok(())
+        });
+        result.expect("bridge session replacement test");
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

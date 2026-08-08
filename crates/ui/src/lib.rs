@@ -3,6 +3,7 @@
 
 pub mod clipboard;
 pub mod controls;
+pub mod format;
 pub mod icons;
 pub mod logs;
 pub mod style;
