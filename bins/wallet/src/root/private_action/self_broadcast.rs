@@ -1479,6 +1479,18 @@ pub(in crate::root) fn effective_self_broadcast_funding_mode(
     }
 }
 
+pub(in crate::root) fn effective_delivery_funding_mode(
+    delivery_mode: DeliveryMode,
+    chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
+    selected: SelfBroadcastFundingMode,
+) -> SelfBroadcastFundingMode {
+    if delivery_mode == DeliveryMode::SelfBroadcast {
+        effective_self_broadcast_funding_mode(chain, selected)
+    } else {
+        SelfBroadcastFundingMode::PublicBalance
+    }
+}
+
 pub(in crate::root) fn sponsored_incentive_from_text(
     selected: SponsoredIncentive,
     custom: &str,

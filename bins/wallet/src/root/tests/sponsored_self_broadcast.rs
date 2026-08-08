@@ -1,12 +1,13 @@
 use super::*;
 use crate::root::private_action::{
-    BLOCK_BUILDER_SPONSORSHIP_LABEL, SelfBroadcastFundingMode, SponsoredAssetFee,
+    BLOCK_BUILDER_SPONSORSHIP_LABEL, DeliveryMode, SelfBroadcastFundingMode, SponsoredAssetFee,
     SponsoredAuthorizationDisplay, SponsoredFundingEstimate, SponsoredFundingEstimateState,
     append_sponsorship_authorization_rows, apply_sponsored_authorization_review,
-    effective_self_broadcast_funding_mode, sponsored_authorization_display,
-    sponsored_estimate_allows_submission, sponsored_estimate_failure_state,
-    sponsored_funding_choice_visible, sponsored_incentive_from_text,
-    sponsored_self_broadcast_availability_reason, sponsored_signer_balance_snapshot_changed,
+    effective_delivery_funding_mode, effective_self_broadcast_funding_mode,
+    sponsored_authorization_display, sponsored_estimate_allows_submission,
+    sponsored_estimate_failure_state, sponsored_funding_choice_visible,
+    sponsored_incentive_from_text, sponsored_self_broadcast_availability_reason,
+    sponsored_signer_balance_snapshot_changed,
 };
 use crate::root::spend_authorization::SpendAuthorizationSummaryRow;
 use alloy::primitives::FixedBytes;
@@ -47,6 +48,37 @@ fn sponsored_funding_choice_requires_a_configured_relay() {
         ),
         SelfBroadcastFundingMode::PublicBalance,
     );
+}
+
+#[test]
+fn delivery_mode_isolates_sponsorship_funding() {
+    let settings = WalletSettings::default();
+    let chain = build_effective_chain_configs(&settings)
+        .expect("effective settings")
+        .remove(&1)
+        .expect("Ethereum config");
+
+    assert_eq!(
+        effective_delivery_funding_mode(
+            DeliveryMode::SelfBroadcast,
+            Some(&chain),
+            SelfBroadcastFundingMode::PrivateSponsorship,
+        ),
+        SelfBroadcastFundingMode::PrivateSponsorship,
+    );
+    for delivery_mode in [
+        DeliveryMode::PublicBroadcaster,
+        DeliveryMode::ManualCalldata,
+    ] {
+        assert_eq!(
+            effective_delivery_funding_mode(
+                delivery_mode,
+                Some(&chain),
+                SelfBroadcastFundingMode::PrivateSponsorship,
+            ),
+            SelfBroadcastFundingMode::PublicBalance,
+        );
+    }
 }
 
 #[test]

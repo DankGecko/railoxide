@@ -98,7 +98,8 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
-        let self_broadcast_funding = effective_self_broadcast_funding_mode(
+        let self_broadcast_funding = effective_delivery_funding_mode(
+            delivery_mode,
             self.effective_chain_configs.get(&asset.chain_id),
             form.self_broadcast_funding,
         );
@@ -939,7 +940,8 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
-        let self_broadcast_funding = effective_self_broadcast_funding_mode(
+        let self_broadcast_funding = effective_delivery_funding_mode(
+            delivery_mode,
             self.effective_chain_configs.get(&asset.chain_id),
             form.self_broadcast_funding,
         );
