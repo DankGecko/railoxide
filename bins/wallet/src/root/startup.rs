@@ -69,6 +69,31 @@ enum StartupNetworkContext {
     Reuse(Box<HttpContext>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum NetworkContextPlan {
+    Build,
+    ReuseActive,
+    RetainActiveAndBuild,
+    ReuseRetained,
+}
+
+pub(in crate::root) fn network_context_plan(
+    active_mode: Option<WalletNetworkMode>,
+    target_mode: WalletNetworkMode,
+    has_retained_tor: bool,
+) -> NetworkContextPlan {
+    if active_mode == Some(target_mode) {
+        return NetworkContextPlan::ReuseActive;
+    }
+    if target_mode == WalletNetworkMode::Tor && has_retained_tor {
+        return NetworkContextPlan::ReuseRetained;
+    }
+    if active_mode == Some(WalletNetworkMode::Tor) {
+        return NetworkContextPlan::RetainActiveAndBuild;
+    }
+    NetworkContextPlan::Build
+}
+
 const TOR_BOOTSTRAP_RECOVERY_DELAY: Duration = Duration::from_secs(5);
 const TOR_RESET_TOOLTIP: &str = "The wallet closes now and rebuilds its Tor connections when you reopen it. Only Tor's cached data is cleared.";
 type WalletActivityCallback = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
@@ -96,6 +121,7 @@ pub(super) struct WalletStartupRoot {
     wallet_root: Option<Entity<WalletRoot>>,
     maintenance_controller: Entity<WalletMaintenanceController>,
     startup_generation: u64,
+    retained_tor_http: Option<HttpContext>,
     tor_bootstrap_recovery_available: bool,
     tor_reset_error: Option<Arc<str>>,
     _activity_keystroke_interceptor: Subscription,
@@ -166,6 +192,7 @@ impl WalletStartupRoot {
             wallet_root: None,
             maintenance_controller,
             startup_generation: 1,
+            retained_tor_http: None,
             tor_bootstrap_recovery_available: false,
             tor_reset_error: None,
             _activity_keystroke_interceptor: activity_keystroke_interceptor,
@@ -297,6 +324,7 @@ impl WalletStartupRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let ready_is_tor = ready.http.network_mode() == WalletNetworkMode::Tor;
         let event_rx = self.event_rx.clone();
         let logs = self.logs.clone();
         let monitor_state = self.monitor_state.clone();
@@ -378,7 +406,26 @@ impl WalletStartupRoot {
         });
         self.error = None;
         self.wallet_root = Some(root);
+        if ready_is_tor {
+            self.retained_tor_http = None;
+        }
         cx.notify();
+    }
+
+    fn retain_tor_context(&mut self, http: HttpContext) {
+        if !is_retained_tor_context(&http) {
+            return;
+        }
+        let generation = http.tor_session_generation();
+        tracing::debug!(generation, "retaining warm Tor network context");
+        let _ = self.retained_tor_http.replace(http);
+    }
+
+    fn reuse_retained_tor_context(&self) -> Option<HttpContext> {
+        let http = self.retained_tor_http.as_ref()?.clone();
+        let generation = http.tor_session_generation();
+        tracing::debug!(generation, "reusing retained Tor network context");
+        Some(http)
     }
 
     fn fail_startup(&mut self, message: String, cx: &mut Context<'_, Self>) {
@@ -434,10 +481,66 @@ impl WalletStartupRoot {
                 return;
             }
         };
-        let cleanup = self
+        let settings = match load_validated_startup_settings(&vault_store) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.fail_startup(format_report_chain(&error), cx);
+                return;
+            }
+        };
+        let replacement = self
             .wallet_root
             .as_ref()
-            .map(|root| root.update(cx, WalletRoot::begin_root_replacement_sync_shutdown));
+            .map(|root| root.update(cx, super::WalletRoot::begin_root_replacement_sync_shutdown));
+        let (cleanup, outgoing_http) =
+            replacement.map_or((None, None), |(cleanup, http)| (Some(cleanup), Some(http)));
+        let active_http = match outgoing_http {
+            Some(http) => {
+                drop(reusable_http);
+                Some(http)
+            }
+            None => reusable_http,
+        };
+        let active_mode = active_http.as_ref().map(HttpContext::network_mode);
+        let has_retained_tor = self
+            .retained_tor_http
+            .as_ref()
+            .is_some_and(is_retained_tor_context);
+        if self
+            .retained_tor_http
+            .as_ref()
+            .is_some_and(|http| !is_retained_tor_context(http))
+        {
+            self.retained_tor_http = None;
+        }
+        let target_mode = settings.wallet_network_mode();
+        let network_context = match network_context_plan(active_mode, target_mode, has_retained_tor)
+        {
+            NetworkContextPlan::Build => {
+                drop(active_http);
+                StartupNetworkContext::Build
+            }
+            NetworkContextPlan::ReuseActive => {
+                let http = active_http.expect("active network context required for reuse");
+                if target_mode == WalletNetworkMode::Tor {
+                    self.retained_tor_http = Some(http.clone());
+                }
+                StartupNetworkContext::Reuse(Box::new(http))
+            }
+            NetworkContextPlan::RetainActiveAndBuild => {
+                if let Some(http) = active_http {
+                    self.retain_tor_context(http);
+                }
+                StartupNetworkContext::Build
+            }
+            NetworkContextPlan::ReuseRetained => {
+                drop(active_http);
+                self.reuse_retained_tor_context()
+                    .map_or(StartupNetworkContext::Build, |http| {
+                        StartupNetworkContext::Reuse(Box::new(http))
+                    })
+            }
+        };
         self.startup_generation = self.startup_generation.saturating_add(1);
         self.maintenance_controller.update(cx, |controller, _cx| {
             controller.clear_active_root();
@@ -452,9 +555,6 @@ impl WalletStartupRoot {
             publish_revision(&self.event_tx, rev);
         }
         let (progress_tx, progress_rx) = watch::channel(self.progress.clone());
-        let network_context = reusable_http.map_or(StartupNetworkContext::Build, |http| {
-            StartupNetworkContext::Reuse(Box::new(http))
-        });
         self.spawn_startup_tasks(
             self.startup_generation,
             self.event_tx.clone(),
@@ -896,6 +996,10 @@ impl Render for WalletStartupRoot {
     }
 }
 
+fn is_retained_tor_context(http: &HttpContext) -> bool {
+    http.network_mode() == WalletNetworkMode::Tor
+}
+
 fn register_wallet_activity_listeners(window: &mut Window, callback: WalletActivityCallback) {
     let move_callback = Rc::clone(&callback);
     window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
@@ -1287,5 +1391,41 @@ mod activity_tests {
 
         assert_eq!(count.get(), 1);
         assert_eq!(content_clicks.get(), 0);
+    }
+
+    #[test]
+    fn network_context_transition_planner_retains_only_for_tor() {
+        assert_eq!(
+            network_context_plan(
+                Some(WalletNetworkMode::Tor),
+                WalletNetworkMode::Direct,
+                false,
+            ),
+            NetworkContextPlan::RetainActiveAndBuild,
+        );
+        assert_eq!(
+            network_context_plan(
+                Some(WalletNetworkMode::Tor),
+                WalletNetworkMode::Proxy,
+                false,
+            ),
+            NetworkContextPlan::RetainActiveAndBuild,
+        );
+        assert_eq!(
+            network_context_plan(
+                Some(WalletNetworkMode::Direct),
+                WalletNetworkMode::Tor,
+                true,
+            ),
+            NetworkContextPlan::ReuseRetained,
+        );
+        assert_eq!(
+            network_context_plan(Some(WalletNetworkMode::Tor), WalletNetworkMode::Tor, true),
+            NetworkContextPlan::ReuseActive,
+        );
+        assert_eq!(
+            network_context_plan(None, WalletNetworkMode::Direct, true),
+            NetworkContextPlan::Build,
+        );
     }
 }
