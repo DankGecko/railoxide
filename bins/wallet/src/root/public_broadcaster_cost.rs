@@ -225,7 +225,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         anchor_cache: &TokenAnchorRateCache,
     ) -> String {
         let token_value = self.native_gas_cost_value(breakdown);
-        self.value_with_usd(
+        Self::value_with_usd(
             token_value,
             breakdown.native_gas_cost,
             Some(18),
@@ -305,7 +305,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         amount: U256,
         negative: bool,
     ) -> String {
-        self.value_with_usd(
+        Self::value_with_usd(
             token_value,
             amount,
             token_display_metadata(self.registry, self.chain_id, &token)
@@ -316,7 +316,6 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
     }
 
     fn value_with_usd(
-        &self,
         token_value: String,
         amount: U256,
         decimals: Option<u8>,

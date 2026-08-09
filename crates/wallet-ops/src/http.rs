@@ -279,6 +279,7 @@ struct TorRuntimeHealthReport {
     recent_attempt_count: usize,
     recent_failed_attempt_count: usize,
     recent_successful_sample_count: usize,
+    recent_successful_setup_p75: Option<Duration>,
 }
 
 impl TorRuntimeHealthTracker {
@@ -336,7 +337,7 @@ impl TorRuntimeHealthTracker {
     }
 
     fn classify(&self, now: Instant) -> TorRuntimeHealth {
-        let (attempts, failures, successful_samples) = self.current_evidence(now);
+        let (attempts, failures, mut successful_samples) = self.current_evidence(now);
         if attempts < TOR_MIN_OBSERVATIONS {
             return TorRuntimeHealth::Ready;
         }
@@ -344,13 +345,10 @@ impl TorRuntimeHealthTracker {
             return TorRuntimeHealth::Unreliable;
         }
 
-        if successful_samples.len() >= TOR_MIN_OBSERVATIONS {
-            let mut setup = successful_samples;
-            setup.sort_unstable();
-            let index = (setup.len() * 3).div_ceil(4).saturating_sub(1);
-            if setup[index] >= TOR_SETUP_THRESHOLD {
-                return TorRuntimeHealth::Slow;
-            }
+        if successful_samples.len() >= TOR_MIN_OBSERVATIONS
+            && tor_setup_p75(&mut successful_samples).is_some_and(|p75| p75 >= TOR_SETUP_THRESHOLD)
+        {
+            return TorRuntimeHealth::Slow;
         }
         TorRuntimeHealth::Ready
     }
@@ -365,13 +363,15 @@ impl TorRuntimeHealthTracker {
         self.transition(now);
 
         let health = self.latched_cause.unwrap_or(TorRuntimeHealth::Ready);
-        let (recent_attempt_count, recent_failed_attempt_count, successful_samples) =
+        let (recent_attempt_count, recent_failed_attempt_count, mut successful_samples) =
             self.current_evidence(now);
+        let recent_successful_setup_p75 = tor_setup_p75(&mut successful_samples);
         TorRuntimeHealthReport {
             health,
             recent_attempt_count,
             recent_failed_attempt_count,
             recent_successful_sample_count: successful_samples.len(),
+            recent_successful_setup_p75,
         }
     }
 
@@ -437,9 +437,19 @@ impl TorRuntimeHealthTracker {
     }
 }
 
+fn tor_setup_p75(successful_samples: &mut [Duration]) -> Option<Duration> {
+    if successful_samples.is_empty() {
+        return None;
+    }
+    successful_samples.sort_unstable();
+    let rank = (successful_samples.len() * 3).div_ceil(4);
+    Some(successful_samples[rank - 1])
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TorBridgeActivitySnapshot {
     pub generation: u64,
+    pub session_duration: Duration,
     pub downloaded_bytes: u64,
     pub connecting_streams: u64,
     pub active_streams: u64,
@@ -552,6 +562,7 @@ impl TorBridgeActivity {
         let last_activity_age = self.last_activity_age(now);
         TorBridgeActivitySnapshot {
             generation: self.generation,
+            session_duration: now.saturating_duration_since(self.activity_origin),
             downloaded_bytes: self.downloaded_bytes.load(Ordering::Relaxed),
             connecting_streams: self.connecting_streams.load(Ordering::Relaxed),
             active_streams: self.active_streams.load(Ordering::Relaxed),
@@ -570,6 +581,7 @@ impl TorBridgeActivity {
             recent_attempt_count: 0,
             recent_failed_attempt_count: 0,
             recent_successful_sample_count: 0,
+            recent_successful_setup_p75: None,
         };
         self.tracker.lock().map_or(default_report, |mut tracker| {
             tracker.health_report(Instant::now())
@@ -705,11 +717,7 @@ impl HttpContext {
                         return WalletNetworkHealth::with_cause(
                             WalletNetworkMode::Tor,
                             WalletNetworkHealthState::Degraded,
-                            format!(
-                                "Degraded. Recent Tor connections are slow ({} successful setup samples; p75 threshold is at least {}s)",
-                                report.recent_successful_sample_count,
-                                TOR_SETUP_THRESHOLD.as_secs(),
-                            ),
+                            format_tor_runtime_health_detail("slow", report),
                             WalletNetworkHealthCause::TorRuntimeSlow,
                         );
                     }
@@ -717,10 +725,7 @@ impl HttpContext {
                         return WalletNetworkHealth::with_cause(
                             WalletNetworkMode::Tor,
                             WalletNetworkHealthState::Degraded,
-                            format!(
-                                "Degraded. Recent Tor connections are unreliable ({} of {} recent Tor connection attempts failed)",
-                                report.recent_failed_attempt_count, report.recent_attempt_count,
-                            ),
+                            format_tor_runtime_health_detail("unreliable", report),
                             WalletNetworkHealthCause::TorRuntimeUnreliable,
                         );
                     }
@@ -826,6 +831,22 @@ impl HttpContext {
             fail_closed: false,
         }
     }
+}
+
+fn format_tor_runtime_health_detail(cause: &'static str, report: TorRuntimeHealthReport) -> String {
+    let setup_duration = report
+        .recent_successful_setup_p75
+        .map_or_else(String::new, |p75| {
+            format!(
+                "; measured p75 connection setup: {} ms ({} successful samples)",
+                p75.as_millis(),
+                report.recent_successful_sample_count,
+            )
+        });
+    format!(
+        "Degraded. Recent Tor connections are {cause} ({} of {} recent Tor connection attempts failed{setup_duration})",
+        report.recent_failed_attempt_count, report.recent_attempt_count,
+    )
 }
 
 /// Compatibility constructor for non-wallet call sites. Wallet binaries should
@@ -1303,6 +1324,7 @@ impl ArtiSocksBridge {
             recent_attempt_count: 0,
             recent_failed_attempt_count: 0,
             recent_successful_sample_count: 0,
+            recent_successful_setup_p75: None,
         };
         self.session.read().map_or(default_report, |session| {
             session.activity.runtime_health_report()
@@ -1388,9 +1410,21 @@ async fn handle_socks_connection(
             return Err(eyre!("Tor connection failed"));
         }
     };
-    let _active_stream = connecting.finish_success();
+    let active_stream = connecting.finish_success();
     send_socks_reply(&mut inbound, SOCKS_REPLY_SUCCEEDED).await?;
-    let mut outbound = DownloadCounter::new(outbound, Arc::clone(&activity));
+    relay_socks_stream(inbound, outbound, active_stream).await
+}
+
+async fn relay_socks_stream<Inbound, Outbound>(
+    mut inbound: Inbound,
+    outbound: Outbound,
+    active_stream: TorActiveStreamGuard,
+) -> Result<()>
+where
+    Inbound: AsyncRead + AsyncWrite + Unpin,
+    Outbound: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut outbound = DownloadCounter::new(outbound, Arc::clone(&active_stream.activity));
     match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
         Ok(_) => Ok(()),
         Err(error) if is_expected_socks_stream_close(&error) => {
@@ -1780,7 +1814,7 @@ mod tests {
             );
         }
         assert_eq!(
-            isolated.classify(start + Duration::from_secs(8)),
+            isolated.health(start + Duration::from_secs(8)),
             TorRuntimeHealth::Ready
         );
 
@@ -1854,7 +1888,14 @@ mod tests {
         }
         let failed_at = start + Duration::from_secs(8);
         record_observation(&mut tracker, 1, false, failed_at, Duration::ZERO);
-        assert_eq!(tracker.health(failed_at), TorRuntimeHealth::Slow);
+        let report = tracker.health_report(failed_at);
+        assert_eq!(report.health, TorRuntimeHealth::Slow);
+        assert_eq!(report.health, tracker.classify(failed_at));
+        assert_eq!(report.recent_successful_sample_count, 8);
+        assert_eq!(
+            report.recent_successful_setup_p75,
+            Some(Duration::from_secs(8))
+        );
 
         for index in 0..3 {
             let at = start + Duration::from_secs(9 + index);
@@ -2160,28 +2201,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    #[test]
-    fn download_counter_counts_live_reads_but_not_writes() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .expect("runtime");
-        runtime.block_on(async {
-            let (mut peer, stream) = tokio::io::duplex(64);
-            let activity = TorBridgeActivity::new(1);
-            let mut counted = DownloadCounter::new(stream, Arc::clone(&activity));
-            peer.write_all(b"download").await.expect("write download");
-            let mut buffer = [0_u8; 8];
-            counted
-                .read_exact(&mut buffer)
-                .await
-                .expect("read download");
-            assert_eq!(activity.snapshot().downloaded_bytes, 8);
-            counted.write_all(b"upload").await.expect("write upload");
-            let mut upload = [0_u8; 6];
-            peer.read_exact(&mut upload).await.expect("read upload");
-            assert_eq!(activity.snapshot().downloaded_bytes, 8);
-        });
+    #[tokio::test]
+    async fn relay_socks_stream_counts_only_downloads_and_releases_active_stream() {
+        let activity = TorBridgeActivity::new(1);
+        let active_stream = activity.begin_connection().finish_success();
+
+        let (mut client, inbound) = tokio::io::duplex(64);
+        let (outbound, mut tor) = tokio::io::duplex(64);
+        let relay = tokio::spawn(relay_socks_stream(inbound, outbound, active_stream));
+
+        let upload = b"client-to-tor";
+        client
+            .write_all(upload)
+            .await
+            .expect("write client payload");
+        let mut received_upload = vec![0_u8; upload.len()];
+        tor.read_exact(&mut received_upload)
+            .await
+            .expect("read client payload on Tor side");
+        assert_eq!(received_upload, upload);
+
+        let after_upload = activity.snapshot();
+        assert_eq!(after_upload.downloaded_bytes, 0);
+        assert_eq!(after_upload.active_streams, 1);
+
+        let download = b"tor-to-client";
+        tor.write_all(download).await.expect("write Tor payload");
+        let mut received_download = vec![0_u8; download.len()];
+        client
+            .read_exact(&mut received_download)
+            .await
+            .expect("read Tor payload on client side");
+        assert_eq!(received_download, download);
+        assert!(!relay.is_finished());
+
+        let while_open = activity.snapshot();
+        assert_eq!(while_open.downloaded_bytes, download.len() as u64);
+        assert_eq!(while_open.active_streams, 1);
+
+        client.shutdown().await.expect("shutdown client side");
+        tor.shutdown().await.expect("shutdown Tor side");
+        relay
+            .await
+            .expect("relay task panicked")
+            .expect("relay failed");
+
+        let after_relay = activity.snapshot();
+        assert_eq!(after_relay.downloaded_bytes, download.len() as u64);
+        assert_eq!(after_relay.active_streams, 0);
     }
 
     #[test]
@@ -2223,6 +2290,7 @@ mod tests {
 
         let snapshot = activity.snapshot_at(origin + Duration::from_secs(20));
         assert_eq!(snapshot.generation, 7);
+        assert_eq!(snapshot.session_duration, Duration::from_secs(20));
         assert_eq!(snapshot.downloaded_bytes, 23);
         assert_eq!(snapshot.successful_connections, 2);
         assert_eq!(snapshot.failed_connections, 1);
@@ -2232,6 +2300,7 @@ mod tests {
         assert_eq!(snapshot.last_activity_age, Some(Duration::from_secs(5)));
 
         let stale_snapshot = activity.snapshot_at(origin + Duration::from_secs(135));
+        assert_eq!(stale_snapshot.session_duration, Duration::from_secs(135));
         assert_eq!(stale_snapshot.recent_connection_sample_count, 0);
         assert_eq!(stale_snapshot.recent_successful_sample_count, 0);
         assert_eq!(stale_snapshot.median_setup_duration, None);

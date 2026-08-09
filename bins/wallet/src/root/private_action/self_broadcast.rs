@@ -554,17 +554,19 @@ impl WalletRoot {
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
             )
-            .map(|cost| {
-                SponsoredFundingEstimateState::PublicBalanceReady(Box::new(
-                    PublicBalanceFundingEstimate {
-                        chain_id: asset.chain_id,
-                        cost,
-                    },
-                ))
-            })
-            .unwrap_or(SponsoredFundingEstimateState::PublicBalanceUnavailable)
+            .map_or(
+                SponsoredFundingEstimateState::PublicBalanceUnavailable,
+                |cost| {
+                    SponsoredFundingEstimateState::PublicBalanceReady(Box::new(
+                        PublicBalanceFundingEstimate {
+                            chain_id: asset.chain_id,
+                            cost,
+                        },
+                    ))
+                },
+            )
         });
-        self.finish_public_balance_estimate(DeliveryFormKind::Send, key, estimate_id, join, cx);
+        Self::finish_public_balance_estimate(DeliveryFormKind::Send, key, estimate_id, join, cx);
     }
 
     fn start_public_balance_unshield_estimate(
@@ -661,26 +663,33 @@ impl WalletRoot {
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
             )
-            .map(|cost| {
-                SponsoredFundingEstimateState::PublicBalanceReady(Box::new(
-                    PublicBalanceFundingEstimate {
-                        chain_id: asset.chain_id,
-                        cost,
-                    },
-                ))
-            })
-            .unwrap_or(SponsoredFundingEstimateState::PublicBalanceUnavailable)
+            .map_or(
+                SponsoredFundingEstimateState::PublicBalanceUnavailable,
+                |cost| {
+                    SponsoredFundingEstimateState::PublicBalanceReady(Box::new(
+                        PublicBalanceFundingEstimate {
+                            chain_id: asset.chain_id,
+                            cost,
+                        },
+                    ))
+                },
+            )
         });
-        self.finish_public_balance_estimate(DeliveryFormKind::Unshield, key, estimate_id, join, cx);
+        Self::finish_public_balance_estimate(
+            DeliveryFormKind::Unshield,
+            key,
+            estimate_id,
+            join,
+            cx,
+        );
     }
 
     fn finish_public_balance_estimate(
-        &self,
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
         estimate_id: u64,
         join: tokio::task::JoinHandle<SponsoredFundingEstimateState>,
-        cx: &mut Context<'_, Self>,
+        cx: &Context<'_, Self>,
     ) {
         cx.spawn(async move |this, cx| {
             let estimate = join

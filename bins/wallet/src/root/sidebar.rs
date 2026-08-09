@@ -1,6 +1,7 @@
 use gpui::{
-    Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _, px, rgb,
+    Corner, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _, px,
+    rgb,
 };
 use gpui_component::{
     Icon, IconName, Sizable,
@@ -14,7 +15,7 @@ use gpui_component::{
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_custom_toast};
 use ui::format::format_compact_latency;
 use ui::theme;
-use wallet_ops::{ProverCacheBuildProgress, WalletNetworkHealth, WalletNetworkMode};
+use wallet_ops::{ProverCacheBuildProgress, WalletNetworkHealthState, WalletNetworkMode};
 
 use crate::assets::{
     LOGO_ICON_PATH, RailgunNetworkStatusIcon, RailgunSidebarIcon, RailgunSocialIcon,
@@ -30,6 +31,8 @@ use super::ui_helpers::format_decimal_byte_rate;
 use super::{
     SIDEBAR_WIDTH, WalletRoot, WalletTab, app_status_tag, rgb_with_alpha, should_focus_utxo_table,
 };
+
+const SIDEBAR_FOOTER_HORIZONTAL_INSET: Pixels = px(12.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Activity {
@@ -224,13 +227,15 @@ impl WalletRoot {
         let color = network_health_color(&health);
         let label = health.label();
         let tor_metrics_visible = health.mode == WalletNetworkMode::Tor;
+        let tor_reconnecting = health.mode == WalletNetworkMode::Tor
+            && health.state == WalletNetworkHealthState::Reconnecting;
+        let expanded_tor = !collapsed && tor_metrics_visible;
         let activity = self.tor_bridge_activity.clone();
         let download_rate = self.tor_download_rate;
         let setup = activity
             .as_ref()
             .and_then(|snapshot| snapshot.median_setup_duration);
         let setup_label = setup.map_or_else(|| "--".to_owned(), format_compact_latency);
-        let tooltip = network_status_tooltip(&health, &setup_label, download_rate);
         let popover_root = root.clone();
         let content_root = root.clone();
         let network_status_error = self.network_status_error.clone();
@@ -240,7 +245,6 @@ impl WalletRoot {
         let trigger = Button::new("wallet-network-status-pill-trigger")
             .text()
             .tab_stop(false)
-            .tooltip(tooltip)
             .child(Self::render_network_status_chip(
                 collapsed,
                 color,
@@ -248,9 +252,22 @@ impl WalletRoot {
                 &setup_label,
                 download_rate,
                 tor_metrics_visible,
+                tor_reconnecting,
             ));
 
-        Popover::new("wallet-network-status-popover")
+        let trigger = if expanded_tor {
+            trigger
+                .w(SIDEBAR_WIDTH
+                    - SIDEBAR_FOOTER_HORIZONTAL_INSET
+                    - SIDEBAR_FOOTER_HORIZONTAL_INSET)
+                .min_w(px(0.0))
+                .flex_shrink()
+        } else {
+            trigger
+        };
+
+        let popover = Popover::new("wallet-network-status-popover")
+            .anchor(Corner::BottomLeft)
             .open(self.network_status_popover_open)
             .on_open_change(move |open, _window, cx| {
                 popover_root.update(cx, |root, cx| {
@@ -266,10 +283,22 @@ impl WalletRoot {
                     network_status_error.clone(),
                     tor_exit_ip_query.clone(),
                     tor_state_reset_confirming,
-                    activity.clone(),
+                    activity.as_ref(),
                     download_rate,
                 )
-            })
+            });
+
+        if expanded_tor {
+            div()
+                .w(SIDEBAR_WIDTH
+                    - SIDEBAR_FOOTER_HORIZONTAL_INSET
+                    - SIDEBAR_FOOTER_HORIZONTAL_INSET)
+                .min_w(px(0.0))
+                .child(popover)
+                .into_any_element()
+        } else {
+            popover.into_any_element()
+        }
     }
 
     fn render_network_status_chip(
@@ -279,6 +308,7 @@ impl WalletRoot {
         setup_label: &str,
         rate: Option<u64>,
         tor_metrics_visible: bool,
+        tor_reconnecting: bool,
     ) -> gpui::AnyElement {
         if collapsed {
             return div()
@@ -336,10 +366,13 @@ impl WalletRoot {
                 .into_any_element();
         }
 
+        let displayed_label = if tor_reconnecting { "Tor" } else { label };
+
         div()
             .id("wallet-network-status-pill")
             .h_auto()
-            .px_2()
+            .w(SIDEBAR_WIDTH - SIDEBAR_FOOTER_HORIZONTAL_INSET - SIDEBAR_FOOTER_HORIZONTAL_INSET)
+            .p_2()
             .flex()
             .items_center()
             .gap_2()
@@ -351,26 +384,76 @@ impl WalletRoot {
             .cursor_pointer()
             .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
             .child(
-                Icon::new(RailgunNetworkStatusIcon::Tor)
-                    .small()
-                    .text_color(rgb(color)),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(RailgunNetworkStatusIcon::Tor)
+                            .small()
+                            .flex_none()
+                            .text_color(rgb(color)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .when(!tor_reconnecting, gpui::Styled::flex_1)
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .line_height(px(16.0))
+                                    .text_color(rgb(color))
+                                    .child(displayed_label),
+                            )
+                            .children(tor_reconnecting.then(|| {
+                                div().flex_none().child(
+                                    Spinner::new()
+                                        .icon(IconName::LoaderCircle)
+                                        .color(rgb(color).into())
+                                        .with_size(px(12.0)),
+                                )
+                            })),
+                    ),
             )
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(13.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .items_end()
+                    .gap(px(2.0))
+                    .text_size(px(11.0))
                     .line_height(gpui::relative(1.0))
                     .text_color(rgb(color))
-                    .child(div().child(format!("{label}  setup {setup_label}")))
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .child(format!("download {}", format_decimal_byte_rate(rate))),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .whitespace_nowrap()
+                            .child(
+                                Icon::new(RailgunNetworkStatusIcon::ConnectionSetup)
+                                    .with_size(px(9.0)),
+                            )
+                            .child(setup_label.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .whitespace_nowrap()
+                            .child(Icon::new(RailgunNetworkStatusIcon::Download).with_size(px(9.0)))
+                            .child(format_decimal_byte_rate(rate)),
                     ),
             )
             .into_any_element()
@@ -735,50 +818,5 @@ impl WalletRoot {
             .w(px(154.0))
             .h(px(21.3))
             .flex_none()
-    }
-}
-
-fn network_status_tooltip(
-    health: &WalletNetworkHealth,
-    setup_label: &str,
-    rate: Option<u64>,
-) -> String {
-    if health.mode != WalletNetworkMode::Tor {
-        return health.detail.to_string();
-    }
-    format!(
-        "{} | setup: {} | rate: {}",
-        health.detail,
-        setup_label,
-        format_decimal_byte_rate(rate),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::network_status_tooltip;
-    use wallet_ops::{WalletNetworkHealth, WalletNetworkHealthState, WalletNetworkMode};
-
-    #[test]
-    fn network_status_tooltip_enriches_only_tor() {
-        let proxy = WalletNetworkHealth::new(
-            WalletNetworkMode::Proxy,
-            WalletNetworkHealthState::Ready,
-            "HTTP is routed through socks5h://proxy.example:9050",
-        );
-        assert_eq!(
-            network_status_tooltip(&proxy, "2s", Some(1_000)),
-            "HTTP is routed through socks5h://proxy.example:9050"
-        );
-
-        let tor = WalletNetworkHealth::new(
-            WalletNetworkMode::Tor,
-            WalletNetworkHealthState::Ready,
-            "Ready. HTTP/RPC session #1 is routed through socks5h://127.0.0.1:1234",
-        );
-        assert_eq!(
-            network_status_tooltip(&tor, "--", None),
-            "Ready. HTTP/RPC session #1 is routed through socks5h://127.0.0.1:1234 | setup: -- | rate: --"
-        );
     }
 }

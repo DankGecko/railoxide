@@ -36,6 +36,8 @@ const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
 const TOR_STATUS_ICON_PATH: &str = "railgun/icons/tor-status.svg";
+const ARROW_RIGHT_LEFT_ICON_PATH: &str = "railgun/icons/arrow-right-left.svg";
+const ARROW_DOWN_TO_LINE_ICON_PATH: &str = "railgun/icons/arrow-down-to-line.svg";
 const UI_ASSET_PREFIX: &str = "ui/";
 const RAILGUN_UI_ASSET_PREFIX: &str = "railgun-ui/";
 
@@ -70,6 +72,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
     TOR_STATUS_ICON_PATH,
+    ARROW_RIGHT_LEFT_ICON_PATH,
+    ARROW_DOWN_TO_LINE_ICON_PATH,
 ];
 
 const LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/logo.svg");
@@ -105,6 +109,9 @@ const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.sv
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
 const TOR_STATUS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tor-status.svg");
+const ARROW_RIGHT_LEFT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/arrow-right-left.svg");
+const ARROW_DOWN_TO_LINE_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/arrow-down-to-line.svg");
 
 pub(crate) struct WalletAssets;
 
@@ -345,12 +352,16 @@ impl IconNamed for RailgunSidebarIcon {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RailgunNetworkStatusIcon {
     Tor,
+    ConnectionSetup,
+    Download,
 }
 
 impl IconNamed for RailgunNetworkStatusIcon {
     fn path(self) -> SharedString {
         match self {
             Self::Tor => TOR_STATUS_ICON_PATH,
+            Self::ConnectionSetup => ARROW_RIGHT_LEFT_ICON_PATH,
+            Self::Download => ARROW_DOWN_TO_LINE_ICON_PATH,
         }
         .into()
     }
@@ -402,6 +413,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
         TOR_STATUS_ICON_PATH => Some(TOR_STATUS_ICON_BYTES),
+        ARROW_RIGHT_LEFT_ICON_PATH => Some(ARROW_RIGHT_LEFT_ICON_BYTES),
+        ARROW_DOWN_TO_LINE_ICON_PATH => Some(ARROW_DOWN_TO_LINE_ICON_BYTES),
         _ => None,
     }
 }

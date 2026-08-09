@@ -25,23 +25,22 @@ enum ByteScale {
 }
 
 impl ByteScale {
-    fn base(self) -> u64 {
+    const fn base(self) -> u64 {
         match self {
             Self::Decimal => 1_000,
             Self::Binary => 1_024,
         }
     }
 
-    fn unit(self, index: usize) -> &'static str {
+    const fn unit(self, index: usize) -> &'static str {
         match (self, index) {
-            (Self::Decimal, 0) => "B",
+            (Self::Decimal | Self::Binary, 0) => "B",
             (Self::Decimal, 1) => "kB",
             (Self::Decimal, 2) => "MB",
             (Self::Decimal, 3) => "GB",
             (Self::Decimal, 4) => "TB",
             (Self::Decimal, 5) => "PB",
             (Self::Decimal, _) => "EB",
-            (Self::Binary, 0) => "B",
             (Self::Binary, 1) => "KiB",
             (Self::Binary, 2) => "MiB",
             (Self::Binary, 3) => "GiB",
@@ -51,7 +50,7 @@ impl ByteScale {
         }
     }
 
-    fn max_unit(self) -> usize {
+    const fn max_unit() -> usize {
         6
     }
 }
@@ -62,9 +61,10 @@ struct ScaledBytes {
     unit_index: usize,
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn scale_bytes(bytes: u64, scale: ByteScale) -> ScaledBytes {
     let base = scale.base();
-    let max_unit = scale.max_unit();
+    let max_unit = ByteScale::max_unit();
     let mut unit_factor: u64 = 1;
     let mut unit_index = 0;
     while bytes >= unit_factor.saturating_mul(base) && unit_index < max_unit {

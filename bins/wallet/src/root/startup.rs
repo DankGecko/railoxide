@@ -70,7 +70,7 @@ enum StartupNetworkContext {
 }
 
 const TOR_BOOTSTRAP_RECOVERY_DELAY: Duration = Duration::from_secs(5);
-const TOR_RESET_TOOLTIP: &str = "Quit RailOxide and clear built-in Tor cache and guard state on next launch. Wallet data is not affected.";
+const TOR_RESET_TOOLTIP: &str = "The wallet closes now and rebuilds its Tor connections when you reopen it. Only Tor's cached data is cleared.";
 type WalletActivityCallback = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
 pub(in crate::root) const fn tor_bootstrap_recovery_is_current(
