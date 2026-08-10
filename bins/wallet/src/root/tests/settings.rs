@@ -327,6 +327,13 @@ fn settings_apply_classifier_tracks_restart_and_request_changes() {
         SettingsApplyMode::NewRequests
     );
 
+    let mut privacy_draft = saved.clone();
+    privacy_draft.privacy.mimic_railway_shields_by_default = true;
+    assert_eq!(
+        classify_settings_apply_mode(&saved, &privacy_draft),
+        SettingsApplyMode::NewRequests
+    );
+
     let mut walletconnect_draft = saved.clone();
     walletconnect_draft.walletconnect.project_id_override = Some("project-override".to_owned());
     assert_eq!(

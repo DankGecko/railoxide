@@ -61,6 +61,7 @@ struct WalletStartupReady {
     public_broadcaster_response_timeout: Duration,
     public_broadcaster_republish_interval: Duration,
     default_allow_suspicious_broadcasters: bool,
+    mimic_railway_shields_by_default: bool,
     poi_read_source: PoiReadSource,
 }
 
@@ -388,6 +389,7 @@ impl WalletStartupRoot {
                 ready.public_broadcaster_response_timeout,
                 ready.public_broadcaster_republish_interval,
                 ready.default_allow_suspicious_broadcasters,
+                ready.mimic_railway_shields_by_default,
                 ready.poi_read_source,
                 self.runtime.clone(),
                 monitor_state,
@@ -1127,6 +1129,7 @@ async fn build_wallet_startup(
         default_allow_suspicious_broadcasters: settings
             .broadcaster
             .allow_suspicious_broadcasters_by_default,
+        mimic_railway_shields_by_default: settings.privacy.mimic_railway_shields_by_default,
         poi_read_source,
     })
 }

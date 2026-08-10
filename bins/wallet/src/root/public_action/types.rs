@@ -136,6 +136,45 @@ pub(in crate::root) const fn advanced_public_send_estimate_required_message(
     }
 }
 
+pub(in crate::root) fn authorized_public_action_gas_fee_selection(
+    selection: PublicActionGasFeeSelection,
+    quote: Option<PublicActionGasFeeQuote>,
+    profile: PublicShieldTransactionProfile,
+    chain_id: u64,
+) -> Result<PublicActionGasFeeSelection, String> {
+    match selection {
+        PublicActionGasFeeSelection::Auto => {
+            let quote = quote.ok_or_else(|| "Wait for the gas fee quote".to_string())?;
+            let (max_fee_per_gas, max_priority_fee_per_gas) =
+                if profile.uses_legacy_envelope(chain_id) {
+                    (quote.rpc_gas_price, 0)
+                } else {
+                    (
+                        quote.suggested_max_fee_per_gas,
+                        quote.suggested_max_priority_fee_per_gas,
+                    )
+                };
+            Ok(PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            })
+        }
+        custom @ PublicActionGasFeeSelection::Custom { .. } => Ok(custom),
+    }
+}
+
+pub(in crate::root) fn public_action_uses_railway_authorization_ceiling(
+    mode: PublicActionMode,
+    profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
+    gas_fee_mode: PublicActionGasFeeMode,
+) -> bool {
+    mode == PublicActionMode::Shield
+        && profile == PublicShieldTransactionProfile::Railway
+        && matches!(asset, PublicAssetId::Erc20(_))
+        && gas_fee_mode == PublicActionGasFeeMode::Auto
+}
+
 #[derive(Clone)]
 pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) chain_id: u64,
@@ -149,12 +188,16 @@ pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) view_session: Arc<DesktopViewSession>,
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) amount: U256,
+    pub(in crate::root) profile: PublicShieldTransactionProfile,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
+    pub(in crate::root) gas_fee_mode: PublicActionGasFeeMode,
+    pub(in crate::root) authorized_fee_ceiling: PublicActionGasFeeSelection,
     pub(in crate::root) fee_display: PublicActionFeeDisplay,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::root) struct PublicActionFeeDisplay {
+    pub(in crate::root) gas_limit: Option<u64>,
     pub(in crate::root) expected_gas_cost: Option<String>,
     pub(in crate::root) maximum_gas_cost: Option<String>,
     pub(in crate::root) show_maximum_gas_cost: bool,
@@ -321,12 +364,20 @@ pub(in crate::root) fn advanced_public_send_review_metadata(
 pub(in crate::root) fn public_shield_authorization_summary(
     draft: &PublicShieldDraft,
 ) -> SpendAuthorizationSummary {
-    let mut rows = vec![
+    let mut rows = Vec::new();
+    if let Some(gas_limit) = draft.fee_display.gas_limit {
+        rows.push(SpendAuthorizationSummaryRow::new(
+            "Gas limit",
+            format_gas_limit(gas_limit),
+        ));
+    }
+    rows.extend([
         SpendAuthorizationSummaryRow::new("Amount", public_shield_amount_label(draft))
             .with_icon(draft.asset_icon_path.clone()),
         SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
         SpendAuthorizationSummaryRow::new("Recipient", "Selected private wallet"),
-    ];
+        SpendAuthorizationSummaryRow::new("Profile", draft.profile.display_name()),
+    ]);
     rows.extend(public_action_authorization_fee_rows(&draft.fee_display));
     SpendAuthorizationSummary::new(
         "Public shield",
@@ -423,6 +474,28 @@ pub(in crate::root) struct PublicActionStepState {
     pub(in crate::root) status: PublicActionStepStatus,
     pub(in crate::root) tx_hash: Option<Arc<str>>,
     pub(in crate::root) message: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct PublicActionFeeAuthorizationReview {
+    pub(in crate::root) step: PublicActionProgressStep,
+    pub(in crate::root) max_fee_per_gas: u128,
+    pub(in crate::root) max_priority_fee_per_gas: u128,
+    pub(in crate::root) message: Arc<str>,
+}
+
+pub(in crate::root) fn public_action_fee_authorization_review(
+    step: PublicActionProgressStep,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    message: String,
+) -> PublicActionFeeAuthorizationReview {
+    PublicActionFeeAuthorizationReview {
+        step,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        message: Arc::from(message),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,6 +622,7 @@ pub(in crate::root) enum PublicActionGasRetryKind {
     RetryStep,
     RetryEstimate,
     SpeedUp,
+    FeeAuthorization,
 }
 
 pub(in crate::root) struct PublicActionGasRetryDialogContent {
@@ -596,6 +670,7 @@ impl gpui::Render for PublicActionGasRetryDialogContent {
             PublicActionGasRetryKind::RetryStep => "Retry step",
             PublicActionGasRetryKind::RetryEstimate => "Retry with custom gas",
             PublicActionGasRetryKind::SpeedUp => "Speed up transaction",
+            PublicActionGasRetryKind::FeeAuthorization => "Authorize and continue",
         };
         let detail = match self.retry_kind {
             PublicActionGasRetryKind::RetryStep => {
@@ -606,6 +681,9 @@ impl gpui::Render for PublicActionGasRetryDialogContent {
             }
             PublicActionGasRetryKind::SpeedUp => {
                 "Uses the same nonce to replace the pending transaction. Values are prefilled +12.5%."
+            }
+            PublicActionGasRetryKind::FeeAuthorization => {
+                "Network fees changed. Review the updated Railway Standard fee to continue."
             }
         };
         let submit_root = self.root.clone();
@@ -639,27 +717,34 @@ impl gpui::Render for PublicActionGasRetryDialogContent {
                             }),
                     )
                     .child(
-                        app_button("public-action-gas-retry-confirm", "Submit")
-                            .primary()
-                            .flex_none()
-                            .on_click(move |_event, window, cx| {
-                                let (max_fee, max_tip) = match gas_inputs.parse(cx) {
-                                    Ok(values) => values,
-                                    Err(error) => {
-                                        dialog.update(cx, |this, cx| {
-                                            this.error = Some(Arc::from(error));
-                                            cx.notify();
-                                        });
-                                        return;
-                                    }
-                                };
-                                submit_root.update(cx, |root, cx| {
-                                    root.submit_public_action_gas_retry(
-                                        generation, retry_kind, max_fee, max_tip, cx,
-                                    );
-                                });
-                                window.close_dialog(cx);
-                            }),
+                        app_button(
+                            "public-action-gas-retry-confirm",
+                            if retry_kind == PublicActionGasRetryKind::FeeAuthorization {
+                                "Authorize and continue"
+                            } else {
+                                "Submit"
+                            },
+                        )
+                        .primary()
+                        .flex_none()
+                        .on_click(move |_event, window, cx| {
+                            let (max_fee, max_tip) = match gas_inputs.parse(cx) {
+                                Ok(values) => values,
+                                Err(error) => {
+                                    dialog.update(cx, |this, cx| {
+                                        this.error = Some(Arc::from(error));
+                                        cx.notify();
+                                    });
+                                    return;
+                                }
+                            };
+                            submit_root.update(cx, |root, cx| {
+                                root.submit_public_action_gas_retry(
+                                    generation, retry_kind, max_fee, max_tip, cx,
+                                );
+                            });
+                            window.close_dialog(cx);
+                        }),
                     ),
             )
     }

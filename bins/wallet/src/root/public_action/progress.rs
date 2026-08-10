@@ -178,6 +178,7 @@ pub(in crate::root) fn public_action_retry_button_id(
         PublicActionGasRetryKind::RetryStep => "retry-step",
         PublicActionGasRetryKind::RetryEstimate => "retry-gas",
         PublicActionGasRetryKind::SpeedUp => "speed-up",
+        PublicActionGasRetryKind::FeeAuthorization => "authorize-fee",
     };
     SharedString::from(format!(
         "wallet-public-action-{}-{action}",

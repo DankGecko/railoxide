@@ -1,5 +1,99 @@
 use super::*;
 
+const MIMIC_RAILWAY_TITLE: &str = "Mimic Railway";
+const MIMIC_RAILWAY_INTRO: &str = "Construct this shield like Railway so on-chain observers cannot easily identify which wallet created it.";
+const MIMIC_RAILWAY_TRADEOFF_ALLOWANCE: &str =
+    "ERC-20 shields may grant the RAILGUN contract an unlimited token allowance.";
+const MIMIC_RAILWAY_TRADEOFF_GAS: &str = "Gas limits and maximum fee estimates may be higher.";
+const MIMIC_RAILWAY_PUBLIC_VALUES: &str = "Public address, token, or amount";
+const MIMIC_RAILWAY_TIMING: &str = "Transaction timing or later unshield behavior";
+
+fn render_mimic_railway_tooltip_body() -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(MIMIC_RAILWAY_INTRO),
+        )
+        .child(render_mimic_railway_tooltip_section(
+            "Tradeoffs",
+            [MIMIC_RAILWAY_TRADEOFF_ALLOWANCE, MIMIC_RAILWAY_TRADEOFF_GAS],
+        ))
+        .child(render_mimic_railway_tooltip_section(
+            "Does not hide",
+            [MIMIC_RAILWAY_PUBLIC_VALUES, MIMIC_RAILWAY_TIMING],
+        ))
+        .into_any_element()
+}
+
+fn render_mimic_railway_tooltip_section(
+    heading: &'static str,
+    bullets: [&'static str; 2],
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEXT))
+                .child(heading),
+        )
+        .children(bullets.map(render_mimic_railway_tooltip_bullet))
+}
+
+fn render_mimic_railway_tooltip_bullet(label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .items_start()
+        .gap_1()
+        .child(div().text_color(rgb(theme::TEXT_MUTED)).child("-"))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(label),
+        )
+}
+
+pub(in crate::root) fn render_mimic_railway_shield_control(
+    root: Entity<WalletRoot>,
+    checked: bool,
+    disabled: bool,
+) -> gpui::Div {
+    let toggle_root = root;
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            Checkbox::new("wallet-public-shield-mimic-railway")
+                .label(MIMIC_RAILWAY_TITLE)
+                .checked(checked)
+                .small()
+                .disabled(disabled)
+                .on_click(move |checked, _window, cx| {
+                    toggle_root.update(cx, |root, cx| {
+                        root.public_form.mimic_railway_shield = *checked;
+                        root.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
+                        root.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
+                        root.set_public_action_error(PublicActionMode::Shield, None);
+                        cx.notify();
+                    });
+                }),
+        )
+        .child(render_private_action_info_icon_with_body(
+            "wallet-public-shield-mimic-railway-info".into(),
+            MIMIC_RAILWAY_TITLE,
+            render_mimic_railway_tooltip_body,
+        ))
+}
+
 pub(in crate::root) fn render_public_action_amount_input(
     root: Entity<WalletRoot>,
     mode: PublicActionMode,
@@ -120,6 +214,12 @@ pub(in crate::root) fn render_public_action_fee_estimate(
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(app_strong_text("Estimated fees"))
+        .when_some(display.gas_limit, |this, gas_limit| {
+            this.child(public_action_fee_row(
+                "Gas limit",
+                format_gas_limit(gas_limit),
+            ))
+        })
         .child(public_action_fee_row(
             "Expected gas cost",
             expected_gas_cost,

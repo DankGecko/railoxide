@@ -645,10 +645,19 @@ fn public_native_action_gas_reserve_uses_buffered_units() {
         public_native_action_gas_units_with_buffer(&send_steps, 7),
         PUBLIC_NATIVE_SEND_GAS_UNITS + 7,
     );
+    assert_eq!(
+        public_native_action_gas_reserve_with_profile(
+            7,
+            &shield_steps,
+            PublicShieldTransactionProfile::Railway,
+            GAS_LIMIT_BUFFER,
+        ),
+        U256::from(6_000_000_u64 * 7),
+    );
 }
 
 #[test]
-fn public_action_gas_cost_uses_asset_specific_buffered_units() {
+fn public_action_gas_cost_separates_execution_and_signed_units() {
     let token = address!("0x3333333333333333333333333333333333333333");
     let quote = PublicActionGasFeeQuote {
         rpc_gas_price: 2,
@@ -667,6 +676,10 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     )
     .expect("native send estimate");
     assert_eq!(
+        native_send.expected_cost,
+        U256::from(PUBLIC_NATIVE_SEND_GAS_UNITS * 3)
+    );
+    assert_eq!(
         native_send.maximum_cost,
         U256::from((PUBLIC_NATIVE_SEND_GAS_UNITS + GAS_LIMIT_BUFFER) * 3)
     );
@@ -680,6 +693,7 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
         Some(quote),
     )
     .expect("erc20 send estimate");
+    assert_eq!(erc20_send.expected_cost, U256::from(65_000_u64 * 3));
     assert_eq!(
         erc20_send.maximum_cost,
         U256::from((65_000 + GAS_LIMIT_BUFFER) * 3)
@@ -698,6 +712,10 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     )
     .expect("native shield estimate");
     assert_eq!(
+        native_shield.expected_cost,
+        U256::from(PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS)
+    );
+    assert_eq!(
         native_shield.maximum_cost,
         U256::from(PUBLIC_NATIVE_RELAY_ADAPT_SHIELD_GAS_UNITS + GAS_LIMIT_BUFFER)
     );
@@ -714,6 +732,10 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
     )
     .expect("erc20 shield estimate");
     assert_eq!(
+        erc20_shield.expected_cost,
+        U256::from(PUBLIC_NATIVE_APPROVE_GAS_UNITS + PUBLIC_NATIVE_SHIELD_GAS_UNITS)
+    );
+    assert_eq!(
         erc20_shield.maximum_cost,
         U256::from(
             PUBLIC_NATIVE_APPROVE_GAS_UNITS
@@ -721,6 +743,305 @@ fn public_action_gas_cost_uses_asset_specific_buffered_units() {
                 + (2 * GAS_LIMIT_BUFFER),
         )
     );
+}
+
+#[test]
+fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
+    assert_eq!(railway_gas_limit(100_001), 120_001);
+    assert_eq!(
+        public_shield_approval_amount(PublicShieldTransactionProfile::Railway, U256::from(7_u64)),
+        U256::MAX
+    );
+
+    let quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 1,
+        current_base_fee_per_gas: Some(1),
+        suggested_max_fee_per_gas: 1,
+        suggested_max_priority_fee_per_gas: 0,
+    };
+    let native = estimate_public_action_gas_cost_with_profile(
+        1,
+        None,
+        PublicActionKind::Shield,
+        PublicAssetId::Native,
+        PublicShieldTransactionProfile::Railway,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("Railway native shield estimate");
+    assert_eq!(native.expected_cost, U256::from(900_000_u64));
+    assert_eq!(native.maximum_cost, U256::from(6_000_000_u64));
+    let native_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
+        1,
+        None,
+        PublicActionKind::Shield,
+        PublicAssetId::Native,
+        PublicShieldTransactionProfile::Railway,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+        Some(PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 2,
+            max_priority_fee_per_gas: 0,
+        }),
+    )
+    .expect("Railway native shield estimate with ceiling");
+    assert_eq!(native_with_ceiling.expected_cost, U256::from(900_000_u64));
+    assert_eq!(
+        native_with_ceiling.maximum_cost,
+        U256::from(6_000_000_u64 * 2)
+    );
+
+    let token = address!("0x3333333333333333333333333333333333333333");
+    let erc20 = estimate_public_action_gas_cost_with_profile(
+        1,
+        None,
+        PublicActionKind::Shield,
+        PublicAssetId::Erc20(token),
+        PublicShieldTransactionProfile::Railway,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("Railway ERC-20 shield estimate");
+    assert_eq!(erc20.expected_cost, U256::from(715_000_u64));
+    assert_eq!(erc20.maximum_cost, U256::from(858_000_u64));
+}
+
+#[test]
+fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
+    let quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 7,
+        current_base_fee_per_gas: Some(5),
+        suggested_max_fee_per_gas: 12,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+    let auto = super::gas::resolve_public_action_gas_fee(
+        56,
+        PublicShieldTransactionProfile::Railway,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("Railway BNB auto fee");
+    assert_eq!(auto.max_fee_per_gas, 7);
+    assert_eq!(auto.max_priority_fee_per_gas, 0);
+
+    let railoxide = super::gas::resolve_public_action_gas_fee(
+        56,
+        PublicShieldTransactionProfile::Railoxide,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("Railoxide generic fee");
+    assert_eq!(railoxide.max_fee_per_gas, 12);
+    assert_eq!(railoxide.max_priority_fee_per_gas, 2);
+
+    let custom = super::gas::resolve_public_action_gas_fee(
+        56,
+        PublicShieldTransactionProfile::Railway,
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 11,
+            max_priority_fee_per_gas: 3,
+        },
+        Some(quote),
+    )
+    .expect("Railway BNB custom fee");
+    assert_eq!(custom.max_fee_per_gas, 11);
+    assert_eq!(custom.max_priority_fee_per_gas, 0);
+
+    let projection = estimate_public_action_gas_cost_with_profile(
+        56,
+        None,
+        PublicActionKind::Shield,
+        PublicAssetId::Native,
+        PublicShieldTransactionProfile::Railway,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("Railway BNB gas projection");
+    assert_eq!(projection.expected_fee_per_gas, 7);
+    assert_eq!(projection.maximum_fee_per_gas, 7);
+    assert_eq!(projection.expected_cost, U256::from(900_000_u64 * 7));
+    assert_eq!(projection.maximum_cost, U256::from(6_000_000_u64 * 7));
+    let projection_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
+        56,
+        None,
+        PublicActionKind::Shield,
+        PublicAssetId::Native,
+        PublicShieldTransactionProfile::Railway,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+        Some(PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 13,
+            max_priority_fee_per_gas: 0,
+        }),
+    )
+    .expect("Railway BNB gas projection with ceiling");
+    assert_eq!(
+        projection_with_ceiling.expected_cost,
+        U256::from(900_000_u64 * 7)
+    );
+    assert_eq!(
+        projection_with_ceiling.maximum_cost,
+        U256::from(6_000_000_u64 * 13)
+    );
+}
+
+#[test]
+fn railway_standard_quote_uses_lower_median_60th_rewards_and_110_percent_base() {
+    let base_fees = [80, 90, 100, 101];
+    let rewards = vec![
+        vec![1, 40, 80, 95],
+        vec![1, 10, 80, 95],
+        vec![1, 30, 80, 95],
+        vec![1, 20, 80, 95],
+    ];
+    let quote = railway_standard_gas_fee_quote(&base_fees, Some(rewards.as_slice()))
+        .expect("Railway standard quote");
+    assert_eq!(quote.suggested_max_priority_fee_per_gas, 20);
+    assert_eq!(quote.suggested_max_fee_per_gas, 131);
+    assert_eq!(quote.current_base_fee_per_gas, Some(100));
+    let bundle = railway_standard_gas_fee_quote_bundle(&base_fees, Some(rewards.as_slice()))
+        .expect("Railway standard and aggressive quote");
+    assert_eq!(bundle.standard, quote);
+    assert_eq!(
+        bundle.authorization_ceiling,
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 236,
+            max_priority_fee_per_gas: 95,
+        }
+    );
+}
+
+#[test]
+fn railway_bnb_quote_caps_provider_gas_price_before_110_percent_floor() {
+    assert_eq!(
+        railway_bnb_gas_fee_quote(60_000_000).rpc_gas_price,
+        55_000_000
+    );
+    assert_eq!(
+        railway_bnb_gas_fee_quote(40_000_000).rpc_gas_price,
+        44_000_000
+    );
+    assert_eq!(
+        railway_bnb_gas_fee_quote_bundle(60_000_000).authorization_ceiling,
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 70_000_000,
+            max_priority_fee_per_gas: 0,
+        }
+    );
+    assert_eq!(
+        railway_bnb_gas_fee_quote_bundle(40_000_000).authorization_ceiling,
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 56_000_000,
+            max_priority_fee_per_gas: 0,
+        }
+    );
+}
+
+#[test]
+fn railway_auto_fee_ceiling_allows_decreases_but_rejects_increases() {
+    let ceiling = PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 130,
+        max_priority_fee_per_gas: 20,
+    };
+    assert!(railway_auto_fee_within_authorized_ceiling(
+        1,
+        ceiling,
+        &crate::SelfBroadcastResolvedGasFee {
+            rpc_gas_price: 0,
+            max_fee_per_gas: 130,
+            max_priority_fee_per_gas: 20,
+        },
+    ));
+    assert!(railway_auto_fee_within_authorized_ceiling(
+        1,
+        ceiling,
+        &crate::SelfBroadcastResolvedGasFee {
+            rpc_gas_price: 0,
+            max_fee_per_gas: 129,
+            max_priority_fee_per_gas: 19,
+        },
+    ));
+    assert!(!railway_auto_fee_within_authorized_ceiling(
+        1,
+        ceiling,
+        &crate::SelfBroadcastResolvedGasFee {
+            rpc_gas_price: 0,
+            max_fee_per_gas: 131,
+            max_priority_fee_per_gas: 20,
+        },
+    ));
+    assert!(!railway_auto_fee_within_authorized_ceiling(
+        1,
+        ceiling,
+        &crate::SelfBroadcastResolvedGasFee {
+            rpc_gas_price: 0,
+            max_fee_per_gas: 130,
+            max_priority_fee_per_gas: 21,
+        },
+    ));
+    assert!(railway_auto_fee_within_authorized_ceiling(
+        56,
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 55,
+            max_priority_fee_per_gas: 0,
+        },
+        &crate::SelfBroadcastResolvedGasFee {
+            rpc_gas_price: 0,
+            max_fee_per_gas: 55,
+            max_priority_fee_per_gas: 999,
+        },
+    ));
+}
+
+#[test]
+fn railway_auto_approval_and_shield_steps_start_from_auto_independently() {
+    let authorized_fee = PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 130,
+        max_priority_fee_per_gas: 20,
+    };
+    assert_eq!(
+        public_action_step_initial_gas_fee_selection(
+            PublicShieldTransactionProfile::Railway,
+            PublicActionStepFeePolicy::RefreshRailwayStandard,
+            authorized_fee,
+        ),
+        PublicActionGasFeeSelection::Auto
+    );
+    assert_eq!(
+        public_action_step_initial_gas_fee_selection(
+            PublicShieldTransactionProfile::Railway,
+            PublicActionStepFeePolicy::Captured,
+            authorized_fee,
+        ),
+        authorized_fee
+    );
+    assert_eq!(
+        public_action_step_initial_gas_fee_selection(
+            PublicShieldTransactionProfile::Railoxide,
+            PublicActionStepFeePolicy::RefreshRailwayStandard,
+            authorized_fee,
+        ),
+        authorized_fee
+    );
+}
+
+#[test]
+fn public_shield_approval_decision_matches_profile_and_allowance() {
+    assert!(public_shield_approval_required(
+        PublicShieldTransactionProfile::Railoxide,
+        U256::MAX,
+        U256::from(1_u64),
+    ));
+    assert!(public_shield_approval_required(
+        PublicShieldTransactionProfile::Railway,
+        U256::from(9_u64),
+        U256::from(10_u64),
+    ));
+    assert!(!public_shield_approval_required(
+        PublicShieldTransactionProfile::Railway,
+        U256::from(10_u64),
+        U256::from(10_u64),
+    ));
 }
 
 #[test]
@@ -1124,6 +1445,30 @@ fn public_action_eip1559_request_sets_fee_caps_and_nonce() {
 }
 
 #[test]
+fn railway_profile_uses_legacy_envelope_only_on_bnb() {
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let recipient = address!("0x2222222222222222222222222222222222222222");
+    let base = public_send_transaction_request(
+        56,
+        from,
+        &PublicTransactionIntent::Transfer {
+            asset: PublicAssetId::Native,
+            amount: U256::from(5_u64),
+            recipient,
+        },
+    )
+    .expect("native transfer request");
+    let legacy = public_action_legacy_transaction_request(base, 56, from, 42, 9);
+    assert_eq!(legacy.gas_price, Some(42));
+    assert_eq!(legacy.max_fee_per_gas, None);
+    assert_eq!(legacy.max_priority_fee_per_gas, None);
+    assert!(PublicShieldTransactionProfile::Railway.uses_legacy_envelope(56));
+    for chain_id in [1, 137, 42161] {
+        assert!(!PublicShieldTransactionProfile::Railway.uses_legacy_envelope(chain_id));
+    }
+}
+
+#[test]
 fn walletconnect_transaction_fill_preserves_supplied_fee_and_nonce_fields() {
     let from = address!("0x1111111111111111111111111111111111111111");
     let recipient = address!("0x2222222222222222222222222222222222222222");
@@ -1251,7 +1596,13 @@ fn public_actions_reject_zero_amount_before_signing() {
             public_account_uuid: "unused".to_string(),
             asset: PublicAssetId::Native,
             amount: U256::ZERO,
+            profile: PublicShieldTransactionProfile::Railoxide,
             gas_fee: PublicActionGasFeeSelection::Auto,
+            gas_fee_mode: PublicActionGasFeeMode::Auto,
+            authorized_fee_ceiling: PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+            },
             command_rx: None,
             event_tx: None,
         },

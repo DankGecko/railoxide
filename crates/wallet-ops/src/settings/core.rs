@@ -6,7 +6,7 @@ use super::{
 };
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
-pub const WALLET_SETTINGS_VERSION: u32 = 3;
+pub const WALLET_SETTINGS_VERSION: u32 = 4;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 1;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
@@ -85,6 +85,7 @@ impl std::error::Error for WalletSettingsValidationError {}
 pub struct WalletSettings {
     pub version: u32,
     pub network: NetworkSettings,
+    pub privacy: PrivacySettings,
     pub chains: ChainSettings,
     pub indexed_artifacts: IndexedArtifactSettings,
     pub poi: PoiSettings,
@@ -94,6 +95,12 @@ pub struct WalletSettings {
     pub runtime: RuntimeSettings,
     pub waku: WakuSettings,
     pub walletconnect: WalletConnectSettings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacySettings {
+    pub mimic_railway_shields_by_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +126,7 @@ impl Default for WalletSettings {
         Self {
             version: WALLET_SETTINGS_VERSION,
             network: NetworkSettings::default(),
+            privacy: PrivacySettings::default(),
             chains: ChainSettings::default(),
             indexed_artifacts: IndexedArtifactSettings::default(),
             poi: PoiSettings::default(),
@@ -160,6 +168,10 @@ impl WalletSettings {
 
     pub fn reset_network(&mut self) {
         self.network = NetworkSettings::default();
+    }
+
+    pub fn reset_privacy(&mut self) {
+        self.privacy = PrivacySettings::default();
     }
 
     pub fn reset_chains(&mut self) {

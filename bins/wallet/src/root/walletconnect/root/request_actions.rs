@@ -548,6 +548,7 @@ impl WalletRoot {
                 #[cfg(not(feature = "hardware"))]
                 let _ = session;
             }
+            PublicActionSessionEvent::FeeAuthorizationRequired { .. } => {}
         }
         cx.notify();
     }

@@ -649,8 +649,23 @@ impl Render for WalletSettingsEditor {
                     .description("Lock the vault after this long without wallet activity."),
             ),
         );
-        let mut privacy_group =
-            settings_group().item(SettingItem::new("Network mode", network_mode));
+        let mut privacy_group = settings_group()
+            .item(SettingItem::new("Network mode", network_mode))
+            .item(
+                Self::settings_switch_item(
+                    "wallet-settings-mimic-railway-by-default",
+                    "Mimic Railway by default",
+                    editor.clone(),
+                    None,
+                    |settings| settings.privacy.mimic_railway_shields_by_default,
+                    |settings, value| {
+                        settings.privacy.mimic_railway_shields_by_default = value;
+                    },
+                )
+                .description(
+                    "Preselects Mimic Railway for new shields. ERC-20 shields may grant an unlimited token allowance.",
+                ),
+            );
         if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
             privacy_group = privacy_group.item(SettingItem::render(|_options, _window, _cx| {
                 settings_warning_banner(PROXY_WAKU_DISCLAIMER)

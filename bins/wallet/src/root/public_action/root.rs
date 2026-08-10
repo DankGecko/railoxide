@@ -204,6 +204,11 @@ impl WalletRoot {
                         max_label,
                         disabled || self.public_form.shielding,
                     ))
+                    .child(render_mimic_railway_shield_control(
+                        submit_root.clone(),
+                        self.public_form.mimic_railway_shield,
+                        self.public_form.shielding,
+                    ))
                     .child(render_eip1559_gas_fee_editor(
                         gas_fee_root,
                         Eip1559GasFeeTarget::Public {
@@ -709,6 +714,24 @@ impl WalletRoot {
             gas_fee.error = None;
             gas_fee.quote_error = None;
         }
+        self.public_form.shield_gas_fee_authorization_ceiling = None;
+    }
+
+    pub(in crate::root) fn invalidate_public_action_gas_fee_quote(
+        &mut self,
+        action_mode: PublicActionMode,
+    ) {
+        let gas_fee = match action_mode {
+            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
+            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
+        };
+        gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
+        gas_fee.refreshing = false;
+        gas_fee.quote = None;
+        gas_fee.quote_error = None;
+        if action_mode == PublicActionMode::Shield {
+            self.public_form.shield_gas_fee_authorization_ceiling = None;
+        }
     }
 
     pub(in crate::root) fn set_public_action_mode(
@@ -751,6 +774,7 @@ impl WalletRoot {
         self.public_form.action_command_tx = None;
         self.public_form.action_attempts.clear();
         self.public_form.action_current_gas_fee = None;
+        self.public_form.action_fee_authorization_review = None;
         self.public_form.action_fees_authorized = false;
         self.public_form.action_action_error = None;
         self.public_form.action_contract_address = None;
@@ -832,33 +856,82 @@ impl WalletRoot {
         let chain_id = self.selected_chain;
         let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
         let http = self.http.clone();
+        let profile =
+            if action_mode == PublicActionMode::Shield && self.public_form.mimic_railway_shield {
+                PublicShieldTransactionProfile::Railway
+            } else {
+                PublicShieldTransactionProfile::Railoxide
+            };
         cx.spawn(async move |this, cx| {
-            let result =
-                quote_public_action_gas_fee(chain_id, effective_chain.as_ref(), &http).await;
+            let result = quote_public_action_gas_fee_bundle_with_profile(
+                chain_id,
+                effective_chain.as_ref(),
+                profile,
+                &http,
+            )
+            .await;
             let _ = this.update(cx, |root, cx| {
-                let gas_fee = match action_mode {
-                    PublicActionMode::Shield => &mut root.public_form.shield_gas_fee,
-                    PublicActionMode::Send => &mut root.public_form.send_gas_fee,
+                let current_refresh_id = match action_mode {
+                    PublicActionMode::Shield => root.public_form.shield_gas_fee.refresh_id,
+                    PublicActionMode::Send => root.public_form.send_gas_fee.refresh_id,
                 };
-                if gas_fee.refresh_id != refresh_id {
+                if current_refresh_id != refresh_id {
                     return;
                 }
-                gas_fee.refreshing = false;
                 match result {
-                    Ok(quote) => {
-                        gas_fee.quote = Some(quote);
-                        gas_fee.quote_error = None;
+                    Ok(bundle) => {
+                        let standard = bundle.standard;
+                        let authorization_ceiling = bundle.authorization_ceiling;
+                        match action_mode {
+                            PublicActionMode::Shield => {
+                                root.public_form.shield_gas_fee.refreshing = false;
+                                root.public_form.shield_gas_fee.quote = Some(standard);
+                            }
+                            PublicActionMode::Send => {
+                                root.public_form.send_gas_fee.refreshing = false;
+                                root.public_form.send_gas_fee.quote = Some(standard);
+                            }
+                        }
+                        if action_mode == PublicActionMode::Shield {
+                            root.public_form.shield_gas_fee_authorization_ceiling =
+                                Some(authorization_ceiling);
+                        }
+                        match action_mode {
+                            PublicActionMode::Shield => {
+                                root.public_form.shield_gas_fee.quote_error = None;
+                            }
+                            PublicActionMode::Send => {
+                                root.public_form.send_gas_fee.quote_error = None;
+                            }
+                        }
                         if action_mode == PublicActionMode::Send {
                             root.invalidate_advanced_public_send_estimate();
                         }
                         root.set_public_action_error(action_mode, None);
                     }
                     Err(_error) => {
-                        gas_fee.quote_error = Some(Arc::from(if gas_fee.quote.is_some() {
+                        let quote_available = match action_mode {
+                            PublicActionMode::Shield => {
+                                root.public_form.shield_gas_fee.quote.is_some()
+                            }
+                            PublicActionMode::Send => root.public_form.send_gas_fee.quote.is_some(),
+                        };
+                        let error = if quote_available {
                             "Gas quote refresh failed; using the last successful quote."
                         } else {
                             "Gas quote is unavailable."
-                        }));
+                        };
+                        match action_mode {
+                            PublicActionMode::Shield => {
+                                root.public_form.shield_gas_fee.refreshing = false;
+                                root.public_form.shield_gas_fee.quote_error =
+                                    Some(Arc::from(error));
+                            }
+                            PublicActionMode::Send => {
+                                root.public_form.send_gas_fee.refreshing = false;
+                                root.public_form.send_gas_fee.quote_error = Some(Arc::from(error));
+                            }
+                        }
                     }
                 }
                 cx.notify();
@@ -893,6 +966,7 @@ impl WalletRoot {
         self.public_form.action_command_tx = command_tx;
         self.public_form.action_attempts.clear();
         self.public_form.action_current_gas_fee = initial_gas_fee;
+        self.public_form.action_fee_authorization_review = None;
         self.public_form.action_fees_authorized = fees_authorized;
         self.public_form.action_action_error = None;
         self.public_form.action_contract_address = None;
@@ -1090,6 +1164,30 @@ impl WalletRoot {
                 self.discard_active_trezor_session_if_stale(&message, cx);
                 self.public_form.action_action_error = Some(Arc::from(message));
             }
+            PublicActionSessionEvent::FeeAuthorizationRequired {
+                step,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                message,
+            } => {
+                self.public_form.action_fee_authorization_review =
+                    Some(public_action_fee_authorization_review(
+                        step,
+                        max_fee_per_gas,
+                        max_priority_fee_per_gas,
+                        message.clone(),
+                    ));
+                self.public_form.action_action_error = None;
+                if let Some(progress_step) = self
+                    .public_form
+                    .action_progress
+                    .iter_mut()
+                    .find(|progress_step| progress_step.step == step)
+                {
+                    progress_step.status = PublicActionStepStatus::Pending;
+                    progress_step.message = Some(Arc::from(message));
+                }
+            }
             PublicActionSessionEvent::HardwareApprovalStarted
             | PublicActionSessionEvent::HardwareApprovalCompleted => {}
             PublicActionSessionEvent::HardwareProfileSessionRefreshed { session } => {
@@ -1171,6 +1269,7 @@ impl WalletRoot {
         self.clear_trezor_pin_matrix_prompt(cx);
         self.public_form.action_command_tx = None;
         self.public_form.action_action_error = None;
+        self.public_form.action_fee_authorization_review = None;
         self.public_form.action_stop_available = false;
         self.public_form.action_stopped = true;
         match self.public_form.action_mode {
@@ -1262,6 +1361,7 @@ impl WalletRoot {
                     self.public_form.action_current_gas_fee,
                     self.public_form.action_fees_authorized,
                     self.public_form.action_action_error.as_deref(),
+                    self.public_form.action_fee_authorization_review.as_ref(),
                     self.public_form.action_generation,
                 ));
 
@@ -1331,6 +1431,12 @@ impl WalletRoot {
             PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI,
             PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI,
         ));
+        if retry_kind == PublicActionGasRetryKind::FeeAuthorization
+            && let Some(review) = self.public_form.action_fee_authorization_review.as_ref()
+        {
+            max_fee = review.max_fee_per_gas;
+            max_tip = review.max_priority_fee_per_gas;
+        }
         if retry_kind == PublicActionGasRetryKind::SpeedUp {
             max_fee = public_action_replacement_bumped_fee(max_fee);
             max_tip = public_action_replacement_bumped_fee(max_tip);
@@ -1374,6 +1480,7 @@ impl WalletRoot {
                 PublicActionCommandKind::Retry
             }
             PublicActionGasRetryKind::SpeedUp => PublicActionCommandKind::Replacement,
+            PublicActionGasRetryKind::FeeAuthorization => PublicActionCommandKind::Retry,
         };
         let send_result = command_tx.send(PublicActionCommand {
             kind,
@@ -1382,9 +1489,13 @@ impl WalletRoot {
                 max_priority_fee_per_gas,
             },
         });
+        let send_ok = send_result.is_ok();
         self.public_form.action_action_error = send_result
             .err()
             .map(|_| Arc::from("Public action is no longer accepting retry commands."));
+        if send_ok && retry_kind == PublicActionGasRetryKind::FeeAuthorization {
+            self.public_form.action_fee_authorization_review = None;
+        }
         cx.notify();
     }
 
@@ -1458,6 +1569,11 @@ impl WalletRoot {
         let symbol = entry.asset.symbol;
         let http = self.http.clone();
         let steps = public_action_progress_steps(mode, PublicAssetId::Native);
+        let profile = if mode == PublicActionMode::Shield && self.public_form.mimic_railway_shield {
+            PublicShieldTransactionProfile::Railway
+        } else {
+            PublicShieldTransactionProfile::Railoxide
+        };
         let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
         let gas_fee = match self.public_action_gas_fee_selection(mode, cx) {
             Ok(selection) => selection,
@@ -1468,12 +1584,14 @@ impl WalletRoot {
             }
         };
         let join = self.runtime.spawn(async move {
-            estimate_public_native_action_gas_reserve(
+            estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
                 chain_id,
                 &steps,
+                profile,
                 effective_chain.as_ref(),
                 gas_fee,
                 &http,
+                None,
             )
             .await
         });
@@ -1569,6 +1687,7 @@ impl WalletRoot {
     fn public_action_authorized_gas_fee_selection(
         &self,
         mode: PublicActionMode,
+        profile: PublicShieldTransactionProfile,
         cx: &App,
     ) -> Result<PublicActionGasFeeSelection, String> {
         let (selection, quote) = match mode {
@@ -1581,16 +1700,7 @@ impl WalletRoot {
                 self.public_form.send_gas_fee.quote,
             ),
         };
-        match selection {
-            PublicActionGasFeeSelection::Auto => {
-                let quote = quote.ok_or_else(|| "Wait for the gas fee quote".to_string())?;
-                Ok(PublicActionGasFeeSelection::Custom {
-                    max_fee_per_gas: quote.suggested_max_fee_per_gas,
-                    max_priority_fee_per_gas: quote.suggested_max_priority_fee_per_gas,
-                })
-            }
-            custom @ PublicActionGasFeeSelection::Custom { .. } => Ok(custom),
-        }
+        authorized_public_action_gas_fee_selection(selection, quote, profile, self.selected_chain)
     }
 
     pub(in crate::root) fn public_action_fee_display(
@@ -1601,6 +1711,7 @@ impl WalletRoot {
     ) -> PublicActionFeeDisplay {
         let Some(asset) = self.public_form.selected_asset else {
             return PublicActionFeeDisplay {
+                gas_limit: None,
                 expected_gas_cost: None,
                 maximum_gas_cost: None,
                 show_maximum_gas_cost: false,
@@ -1665,6 +1776,10 @@ impl WalletRoot {
             None
         };
         PublicActionFeeDisplay {
+            gas_limit: (mode == PublicActionMode::Shield
+                && asset == PublicAssetId::Native
+                && self.public_form.mimic_railway_shield)
+                .then_some(6_000_000),
             expected_gas_cost,
             maximum_gas_cost,
             show_maximum_gas_cost,
@@ -1684,13 +1799,28 @@ impl WalletRoot {
             }
             PublicActionMode::Send => (PublicActionKind::Send, &self.public_form.send_gas_fee),
         };
-        estimate_public_action_gas_cost(
+        let profile = if mode == PublicActionMode::Shield && self.public_form.mimic_railway_shield {
+            PublicShieldTransactionProfile::Railway
+        } else {
+            PublicShieldTransactionProfile::Railoxide
+        };
+        let gas_fee_mode = match gas_fee.mode {
+            Eip1559GasFeeMode::Auto => PublicActionGasFeeMode::Auto,
+            Eip1559GasFeeMode::Custom => PublicActionGasFeeMode::Custom,
+        };
+        let authorization_ceiling =
+            public_action_uses_railway_authorization_ceiling(mode, profile, asset, gas_fee_mode)
+                .then_some(self.public_form.shield_gas_fee_authorization_ceiling)
+                .flatten();
+        estimate_public_action_gas_cost_with_profile_and_ceiling(
             self.selected_chain,
             self.effective_chain_configs.get(&self.selected_chain),
             kind,
             asset,
+            profile,
             gas_fee.selection(cx).ok()?,
             gas_fee.quote,
+            authorization_ceiling,
         )
         .ok()
     }
@@ -1838,6 +1968,7 @@ impl WalletRoot {
                     .public_broadcaster_anchor_cache
                     .cached_native_usd_micro_value(chain_id, estimate.max_gas_cost);
                 let fee_display = PublicActionFeeDisplay {
+                    gas_limit: None,
                     expected_gas_cost: Some(format_value_with_usd_label(
                         expected_token_value,
                         estimate.expected_gas_cost,
@@ -1902,9 +2033,11 @@ impl WalletRoot {
                     cx.notify();
                     return None;
                 };
-                let gas_fee = match self
-                    .public_action_authorized_gas_fee_selection(PublicActionMode::Send, cx)
-                {
+                let gas_fee = match self.public_action_authorized_gas_fee_selection(
+                    PublicActionMode::Send,
+                    PublicShieldTransactionProfile::Railoxide,
+                    cx,
+                ) {
                     Ok(selection) => selection,
                     Err(error) => {
                         self.public_form.send_error = Some(Arc::from(error));
@@ -2202,15 +2335,43 @@ impl WalletRoot {
                 return None;
             }
         };
-        let gas_fee =
-            match self.public_action_authorized_gas_fee_selection(PublicActionMode::Shield, cx) {
-                Ok(selection) => selection,
-                Err(error) => {
-                    self.public_form.shield_error = Some(Arc::from(error));
-                    cx.notify();
-                    return None;
-                }
+        let profile = if self.public_form.mimic_railway_shield {
+            PublicShieldTransactionProfile::Railway
+        } else {
+            PublicShieldTransactionProfile::Railoxide
+        };
+        let gas_fee_mode = match self.public_form.shield_gas_fee.mode {
+            Eip1559GasFeeMode::Auto => PublicActionGasFeeMode::Auto,
+            Eip1559GasFeeMode::Custom => PublicActionGasFeeMode::Custom,
+        };
+        let gas_fee = match self.public_action_authorized_gas_fee_selection(
+            PublicActionMode::Shield,
+            profile,
+            cx,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.public_form.shield_error = Some(Arc::from(error));
+                cx.notify();
+                return None;
+            }
+        };
+        let authorized_fee_ceiling = if public_action_uses_railway_authorization_ceiling(
+            PublicActionMode::Shield,
+            profile,
+            asset,
+            gas_fee_mode,
+        ) {
+            let Some(ceiling) = self.public_form.shield_gas_fee_authorization_ceiling else {
+                self.public_form.shield_error =
+                    Some(Arc::from("Wait for the Railway authorization ceiling"));
+                cx.notify();
+                return None;
             };
+            ceiling
+        } else {
+            gas_fee
+        };
         let fee_display =
             self.public_action_fee_display(PublicActionMode::Shield, Some(amount), cx);
         if fee_display.expected_gas_cost.is_none()
@@ -2235,7 +2396,10 @@ impl WalletRoot {
             view_session,
             vault_store,
             amount,
+            profile,
             gas_fee,
+            gas_fee_mode,
+            authorized_fee_ceiling,
             fee_display,
         })
     }
@@ -2260,7 +2424,10 @@ impl WalletRoot {
             view_session,
             vault_store,
             amount,
+            profile,
             gas_fee,
+            gas_fee_mode,
+            authorized_fee_ceiling,
             ..
         } = draft;
         #[cfg(feature = "hardware")]
@@ -2325,7 +2492,10 @@ impl WalletRoot {
             public_account_uuid: public_account_uuid.to_string(),
             asset,
             amount,
+            profile,
             gas_fee,
+            gas_fee_mode,
+            authorized_fee_ceiling,
             command_rx: Some(command_rx),
             event_tx: Some(event_tx),
         };
@@ -2356,6 +2526,8 @@ impl WalletRoot {
                     Ok(Ok(_result)) => {
                         root.public_form.action_command_tx = None;
                         root.public_form.action_action_error = None;
+                        root.public_form.mimic_railway_shield =
+                            root.mimic_railway_shields_by_default;
                         match root
                             .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
                             .map(|account| account.status)

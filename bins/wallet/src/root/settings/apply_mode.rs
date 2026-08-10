@@ -72,7 +72,8 @@ pub(in crate::root) fn classify_settings_apply_mode(
         || draft.waku != saved.waku
     {
         SettingsApplyMode::NetworkingRestart
-    } else if draft.broadcaster != saved.broadcaster
+    } else if draft.privacy != saved.privacy
+        || draft.broadcaster != saved.broadcaster
         || draft.gas != saved.gas
         || draft.walletconnect != saved.walletconnect
     {

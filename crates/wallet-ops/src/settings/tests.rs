@@ -250,6 +250,7 @@ fn missing_settings_synthesizes_official_indexed_artifact_defaults() {
 
     let settings = load_wallet_settings(&store).expect("load settings");
     assert_eq!(settings.version, WALLET_SETTINGS_VERSION);
+    assert!(!settings.privacy.mimic_railway_shields_by_default);
     assert_eq!(
         settings.runtime.auto_lock_timeout_secs,
         Some(DEFAULT_AUTO_LOCK_TIMEOUT_SECS)
@@ -505,10 +506,12 @@ fn settings_roundtrip_through_local_db() {
     .expect("open db");
     let mut settings = WalletSettings::default();
     settings.network.mode = super::NetworkModeSetting::Direct;
+    settings.privacy.mimic_railway_shields_by_default = true;
     settings.poi.read_source = PoiReadSourceSetting::PoiProxy;
 
     save_wallet_settings(&store, &settings).expect("save settings");
     let loaded = load_wallet_settings(&store).expect("load settings");
+    assert!(loaded.privacy.mimic_railway_shields_by_default);
     assert_eq!(loaded, settings);
 
     drop(store);
@@ -580,6 +583,64 @@ fn version_2_settings_migrate_with_sponsored_fields_unset() {
     let ethereum = effective.get(&1).expect("effective ethereum");
     assert_eq!(ethereum.sponsored_bundle_relays.len(), 2);
     assert_eq!(ethereum.coinbase_payer, super::default_coinbase_payer(1));
+    let rewritten = store
+        .get_app_settings_record(WALLET_SETTINGS_KEY)
+        .expect("read rewritten settings")
+        .expect("rewritten settings record");
+    assert_ne!(rewritten, released_payload);
+    assert_eq!(
+        decode_wallet_settings(&rewritten).expect("decode rewritten settings"),
+        migrated
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[derive(Debug, Serialize)]
+struct ReleasedV3WalletSettingsWire {
+    version: u32,
+    network: super::NetworkSettings,
+    chains: super::ChainSettings,
+    indexed_artifacts: super::IndexedArtifactSettings,
+    poi: super::PoiSettings,
+    broadcaster: super::PublicBroadcasterSettings,
+    tokens: super::TokenSettings,
+    gas: super::GasSettings,
+    runtime: super::RuntimeSettings,
+    waku: super::WakuSettings,
+    walletconnect: super::WalletConnectSettings,
+}
+
+#[test]
+fn version_3_settings_migrate_with_railway_preference_disabled() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let settings = WalletSettings::default();
+    let released_payload = rmp_serde::to_vec_named(&ReleasedV3WalletSettingsWire {
+        version: 3,
+        network: settings.network,
+        chains: settings.chains,
+        indexed_artifacts: settings.indexed_artifacts,
+        poi: settings.poi,
+        broadcaster: settings.broadcaster,
+        tokens: settings.tokens,
+        gas: settings.gas,
+        runtime: settings.runtime,
+        waku: settings.waku,
+        walletconnect: settings.walletconnect,
+    })
+    .expect("encode released v3 settings");
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &released_payload)
+        .expect("store released v3 settings");
+
+    let migrated = load_wallet_settings(&store).expect("migrate released v3 settings");
+    assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
+    assert!(!migrated.privacy.mimic_railway_shields_by_default);
     let rewritten = store
         .get_app_settings_record(WALLET_SETTINGS_KEY)
         .expect("read rewritten settings")

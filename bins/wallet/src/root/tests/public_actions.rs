@@ -1,6 +1,9 @@
 use alloy::primitives::{Bytes, U256, address, keccak256};
-use wallet_ops::PublicTransactionIntent;
 use wallet_ops::vault::PublicAccountSource;
+use wallet_ops::{
+    PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicAssetId,
+    PublicShieldTransactionProfile, PublicTransactionIntent,
+};
 
 use super::*;
 
@@ -106,6 +109,93 @@ fn advanced_public_send_hardware_warning_is_added() {
     let hardware_warnings = advanced_public_send_warnings(PublicAccountSource::HardwareDerived);
     assert_eq!(hardware_warnings.len(), 2);
     assert!(hardware_warnings[1].contains("blind signing"));
+}
+
+#[test]
+fn railway_bnb_auto_authorization_binds_rpc_gas_price_as_legacy_fee() {
+    let quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 7,
+        current_base_fee_per_gas: Some(5),
+        suggested_max_fee_per_gas: 12,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+    assert_eq!(
+        authorized_public_action_gas_fee_selection(
+            PublicActionGasFeeSelection::Auto,
+            Some(quote),
+            PublicShieldTransactionProfile::Railway,
+            56,
+        )
+        .expect("Railway BNB authorization fee"),
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 7,
+            max_priority_fee_per_gas: 0,
+        }
+    );
+    assert_eq!(
+        authorized_public_action_gas_fee_selection(
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 11,
+                max_priority_fee_per_gas: 3,
+            },
+            Some(quote),
+            PublicShieldTransactionProfile::Railway,
+            56,
+        )
+        .expect("Railway BNB custom authorization fee"),
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 11,
+            max_priority_fee_per_gas: 3,
+        }
+    );
+    assert_eq!(
+        authorized_public_action_gas_fee_selection(
+            PublicActionGasFeeSelection::Auto,
+            Some(quote),
+            PublicShieldTransactionProfile::Railway,
+            1,
+        )
+        .expect("Railway type-2 authorization fee"),
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 12,
+            max_priority_fee_per_gas: 2,
+        }
+    );
+}
+
+#[test]
+fn railway_authorization_ceiling_applies_only_to_erc20_shield_auto() {
+    let token = address!("0x3333333333333333333333333333333333333333");
+    assert!(!public_action_uses_railway_authorization_ceiling(
+        PublicActionMode::Shield,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Native,
+        PublicActionGasFeeMode::Auto,
+    ));
+    assert!(public_action_uses_railway_authorization_ceiling(
+        PublicActionMode::Shield,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Erc20(token),
+        PublicActionGasFeeMode::Auto,
+    ));
+    assert!(!public_action_uses_railway_authorization_ceiling(
+        PublicActionMode::Shield,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Erc20(token),
+        PublicActionGasFeeMode::Custom,
+    ));
+    assert!(!public_action_uses_railway_authorization_ceiling(
+        PublicActionMode::Send,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Erc20(token),
+        PublicActionGasFeeMode::Auto,
+    ));
+    assert!(!public_action_uses_railway_authorization_ceiling(
+        PublicActionMode::Shield,
+        PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Erc20(token),
+        PublicActionGasFeeMode::Auto,
+    ));
 }
 
 #[test]

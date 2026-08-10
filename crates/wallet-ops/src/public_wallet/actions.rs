@@ -1,5 +1,6 @@
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, Bytes, U256};
+use alloy::providers::Provider as _;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use eyre::{Result, WrapErr, eyre};
@@ -13,9 +14,10 @@ use super::submission::{
     public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
 };
 use super::types::{
-    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicActionSessionEvent, PublicAssetId, PublicSendRequest, PublicSendResult,
-    PublicShieldRequest, PublicTransactionIntent,
+    PublicActionGasFeeMode, PublicActionProgressStatus, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionStepFeePolicy, PublicAssetId,
+    PublicSendRequest, PublicSendResult, PublicShieldRequest, PublicShieldTransactionProfile,
+    PublicTransactionIntent,
 };
 use crate::{HttpContext, ShieldSendOutput, query_rpc_pool_with_http_client, report_chain_string};
 
@@ -55,6 +57,8 @@ pub async fn submit_public_send_with_progress(
     let tx = submit_public_action_step_session(
         PublicActionProgressStep::Send,
         tx_req,
+        PublicShieldTransactionProfile::Railoxide,
+        PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(PublicAssetId::Native),
         &signer,
         "public-send",
         &query_rpc_pool,
@@ -65,6 +69,8 @@ pub async fn submit_public_send_with_progress(
         authorized_gas_limit,
         None,
         request.gas_fee,
+        PublicActionStepFeePolicy::Custom,
+        None,
         &mut command_rx,
         request.event_tx.as_ref(),
         &mut progress,
@@ -161,6 +167,13 @@ pub async fn submit_public_shield_with_progress(
     )?;
     let mut nonce = None;
     let mut gas_fee = request.gas_fee;
+    let mut fee_policy = if request.profile == PublicShieldTransactionProfile::Railway
+        && request.gas_fee_mode == PublicActionGasFeeMode::Auto
+    {
+        PublicActionStepFeePolicy::Captured
+    } else {
+        PublicActionStepFeePolicy::Custom
+    };
     let mut command_rx = request.command_rx;
     let event_tx = request.event_tx;
     let shield_private_key = if signer.requires_device_approval() {
@@ -200,6 +213,7 @@ pub async fn submit_public_shield_with_progress(
                         return Err(error);
                     };
                     gas_fee = command.gas_fee;
+                    fee_policy = PublicActionStepFeePolicy::Custom;
                 }
             }
         }
@@ -219,12 +233,63 @@ pub async fn submit_public_shield_with_progress(
     let from_address = signer.address();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
 
+    let approval_required = if request.asset == PublicAssetId::Native {
+        false
+    } else if request.profile == PublicShieldTransactionProfile::Railoxide {
+        true
+    } else {
+        progress(public_action_progress_update(
+            PublicActionProgressStep::Approve,
+            PublicActionProgressStatus::Pending,
+            None,
+            None,
+        ));
+        match query_erc20_allowance(
+            &query_rpc_pool,
+            request.asset,
+            from_address,
+            chain.railgun_contract,
+        )
+        .await
+        {
+            Ok(allowance) => {
+                public_shield_approval_required(request.profile, allowance, request.amount)
+            }
+            Err(error) => {
+                let message = report_chain_string(&error);
+                progress(public_action_progress_update(
+                    PublicActionProgressStep::Approve,
+                    PublicActionProgressStatus::Error,
+                    None,
+                    Some(message.clone()),
+                ));
+                emit_public_action_event(
+                    event_tx.as_ref(),
+                    PublicActionSessionEvent::StepFailed {
+                        step: PublicActionProgressStep::Approve,
+                        message,
+                    },
+                );
+                return Err(error).wrap_err("check public shield ERC-20 allowance");
+            }
+        }
+    };
+
     let approve_receipt = if request.asset == PublicAssetId::Native {
         None
+    } else if !approval_required {
+        progress(public_action_progress_update(
+            PublicActionProgressStep::Approve,
+            PublicActionProgressStatus::Done,
+            None,
+            Some("Existing allowance is sufficient".to_string()),
+        ));
+        None
     } else {
+        let approval_amount = public_shield_approval_amount(request.profile, request.amount);
         let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
             chain.railgun_contract,
-            request.amount,
+            approval_amount,
         );
         let approve_tx = TransactionRequest::default()
             .with_chain_id(request.chain_id)
@@ -235,6 +300,8 @@ pub async fn submit_public_shield_with_progress(
         let approve_outcome = submit_public_action_step_session(
             PublicActionProgressStep::Approve,
             approve_tx,
+            request.profile,
+            request.profile.gas_limit_strategy(request.asset),
             &signer,
             "public-shield-approve",
             &query_rpc_pool,
@@ -245,6 +312,8 @@ pub async fn submit_public_shield_with_progress(
             None,
             nonce,
             gas_fee,
+            fee_policy,
+            Some(request.authorized_fee_ceiling),
             &mut command_rx,
             event_tx.as_ref(),
             &mut progress,
@@ -258,7 +327,15 @@ pub async fn submit_public_shield_with_progress(
             ));
         }
         nonce = Some(approve_outcome.next_nonce);
-        gas_fee = approve_outcome.gas_fee;
+        if fee_policy == PublicActionStepFeePolicy::Captured
+            && request.profile == PublicShieldTransactionProfile::Railway
+            && request.gas_fee_mode == PublicActionGasFeeMode::Auto
+        {
+            fee_policy = PublicActionStepFeePolicy::RefreshRailwayStandard;
+        } else {
+            gas_fee = approve_outcome.gas_fee;
+            fee_policy = PublicActionStepFeePolicy::Custom;
+        }
         Some(receipt)
     };
 
@@ -281,6 +358,8 @@ pub async fn submit_public_shield_with_progress(
     let shield_receipt = submit_public_action_step_session(
         PublicActionProgressStep::Shield,
         shield_tx,
+        request.profile,
+        request.profile.gas_limit_strategy(request.asset),
         &signer,
         "public-shield",
         &query_rpc_pool,
@@ -291,6 +370,8 @@ pub async fn submit_public_shield_with_progress(
         None,
         nonce,
         gas_fee,
+        fee_policy,
+        Some(request.authorized_fee_ceiling),
         &mut command_rx,
         event_tx.as_ref(),
         &mut progress,
@@ -309,6 +390,59 @@ pub async fn submit_public_shield_with_progress(
         approve: approve_receipt,
         shield: shield_receipt,
     })
+}
+
+pub(super) const fn public_shield_approval_amount(
+    profile: PublicShieldTransactionProfile,
+    amount: U256,
+) -> U256 {
+    match profile {
+        PublicShieldTransactionProfile::Railway => U256::MAX,
+        PublicShieldTransactionProfile::Railoxide => amount,
+    }
+}
+
+pub(super) fn public_shield_approval_required(
+    profile: PublicShieldTransactionProfile,
+    allowance: U256,
+    amount: U256,
+) -> bool {
+    match profile {
+        PublicShieldTransactionProfile::Railway => allowance < amount,
+        PublicShieldTransactionProfile::Railoxide => true,
+    }
+}
+
+async fn query_erc20_allowance(
+    query_rpc_pool: &broadcaster_core::query_rpc_pool::QueryRpcPool,
+    asset: PublicAssetId,
+    owner: Address,
+    spender: Address,
+) -> Result<U256> {
+    let PublicAssetId::Erc20(token) = asset else {
+        return Err(eyre!("native shield has no ERC-20 allowance"));
+    };
+    let call = TransactionRequest::default()
+        .with_to(token)
+        .with_input(PublicErc20::allowanceCall { owner, spender }.abi_encode());
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match provider_handle.provider.call(call.clone()).await {
+            Ok(output) => {
+                return PublicErc20::allowanceCall::abi_decode_returns_validate(&output)
+                    .wrap_err("decode public shield ERC-20 allowance");
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.map_or_else(
+        || eyre!("no healthy query RPC available"),
+        |error| eyre!(error),
+    ))
+    .wrap_err("query public shield ERC-20 allowance")
 }
 
 pub(super) fn public_native_shield_transaction_request(

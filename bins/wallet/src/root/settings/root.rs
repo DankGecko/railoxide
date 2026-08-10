@@ -4,6 +4,7 @@ use super::{
     begin_prover_cache_build, build_cache_with_context_and_progress_with_session,
     build_effective_chain_configs, build_wallet_network_context, watch,
 };
+use crate::root::PublicActionMode;
 
 impl WalletRoot {
     pub(in crate::root) fn apply_saved_auto_lock_policy(&mut self, settings: &WalletSettings) {
@@ -199,6 +200,16 @@ impl WalletRoot {
         self.default_allow_suspicious_broadcasters = settings
             .broadcaster
             .allow_suspicious_broadcasters_by_default;
+        let saved_mimic_railway_shield = settings.privacy.mimic_railway_shields_by_default;
+        self.mimic_railway_shields_by_default = saved_mimic_railway_shield;
+        if !self.public_form.shielding && self.public_form.action_progress.is_empty() {
+            let shield_profile_changed =
+                self.public_form.mimic_railway_shield != saved_mimic_railway_shield;
+            self.public_form.mimic_railway_shield = saved_mimic_railway_shield;
+            if shield_profile_changed {
+                self.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
+            }
+        }
 
         if fee_policy_bounds_changed {
             for form in self.send_forms.values_mut() {

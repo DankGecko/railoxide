@@ -204,6 +204,7 @@ impl WalletRoot {
                         .join(" + ")
                 });
                 SponsoredFundingEstimateDisplay::PublicBalance(PublicActionFeeDisplay {
+                    gas_limit: None,
                     expected_gas_cost: Some(format_gas_cost(gas_cost.expected_cost)),
                     maximum_gas_cost: Some(format_gas_cost(gas_cost.maximum_cost)),
                     show_maximum_gas_cost: maximum_gas_cost_is_significant(

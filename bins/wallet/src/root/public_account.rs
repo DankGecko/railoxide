@@ -313,6 +313,7 @@ impl WalletRoot {
         self.public_form.selected_account_uuid = None;
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
+        self.public_form.mimic_railway_shield = self.mimic_railway_shields_by_default;
         self.public_form.public_send_kind = PublicSendKind::Transfer;
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;
@@ -516,6 +517,8 @@ impl WalletRoot {
     ) {
         self.public_form.selected_account_uuid = Some(public_account_uuid);
         self.public_form.selected_asset = Some(asset);
+        // Selecting a balance starts a fresh shield draft, so restore the configured default.
+        self.public_form.mimic_railway_shield = self.mimic_railway_shields_by_default;
         self.public_form.public_send_kind = PublicSendKind::Transfer;
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;

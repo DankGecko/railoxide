@@ -87,6 +87,11 @@ fn decode_wallet_settings_with_migration(
             settings.version = WALLET_SETTINGS_VERSION;
             true
         }
+        3 => {
+            settings.version = WALLET_SETTINGS_VERSION;
+            settings.privacy.mimic_railway_shields_by_default = false;
+            true
+        }
         version => return Err(WalletSettingsError::UnsupportedVersion { version }),
     };
     Ok((settings, migrated))

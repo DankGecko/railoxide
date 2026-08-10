@@ -8,8 +8,8 @@ use super::submission::{
     submit_public_action_attempt,
 };
 use super::types::{
-    PublicActionProgressStep, PublicActionSessionEvent,
-    WalletConnectHardwareTypedDataCapabilityRequest,
+    PublicActionGasLimitStrategy, PublicActionProgressStep, PublicActionSessionEvent,
+    PublicShieldTransactionProfile, WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
     WalletConnectPersonalSignRequest, WalletConnectSendTransactionRequest,
@@ -181,10 +181,14 @@ pub async fn submit_walletconnect_send_transaction(
         request.tx_req,
         request.gas_fee,
         &chain.gas,
+        PublicShieldTransactionProfile::Railoxide,
+        PublicActionGasLimitStrategy::ChainBuffer,
         None,
         None,
         None,
         PublicActionPreflightMode::PreserveRequestFields,
+        None,
+        false,
     )
     .await
     .wrap_err("WalletConnect eth_sendTransaction preflight")?;

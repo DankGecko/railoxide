@@ -17,6 +17,25 @@ use crate::vault::{
 
 pub type PublicActionGasFeeQuote = crate::SelfBroadcastGasFeeQuote;
 pub type PublicActionGasFeeSelection = crate::SelfBroadcastGasFeeSelection;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicActionGasFeeQuoteBundle {
+    pub standard: PublicActionGasFeeQuote,
+    pub authorization_ceiling: PublicActionGasFeeSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicActionGasFeeMode {
+    Auto,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicActionStepFeePolicy {
+    Captured,
+    RefreshRailwayStandard,
+    Custom,
+}
 pub type PublicActionCommandKind = crate::SelfBroadcastCommandKind;
 pub type PublicActionCommand = crate::SelfBroadcastCommand;
 pub type PublicActionCommandSender = tokio::sync::mpsc::UnboundedSender<PublicActionCommand>;
@@ -33,6 +52,49 @@ pub type HardwareTrezorPinMatrixProvider = ();
 pub enum PublicAssetId {
     Native,
     Erc20(Address),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicShieldTransactionProfile {
+    Railoxide,
+    Railway,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PublicActionGasLimitStrategy {
+    ChainBuffer,
+    RailwayEstimate120,
+    RailwayNativeFixed,
+}
+
+impl PublicShieldTransactionProfile {
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Railoxide => "Railoxide",
+            Self::Railway => "Mimic Railway",
+        }
+    }
+
+    #[must_use]
+    pub const fn uses_legacy_envelope(self, chain_id: u64) -> bool {
+        matches!(self, Self::Railway) && chain_id == 56
+    }
+
+    pub(super) const fn gas_limit_strategy(
+        self,
+        asset: PublicAssetId,
+    ) -> PublicActionGasLimitStrategy {
+        match (self, asset) {
+            (Self::Railway, PublicAssetId::Native) => {
+                PublicActionGasLimitStrategy::RailwayNativeFixed
+            }
+            (Self::Railway, PublicAssetId::Erc20(_)) => {
+                PublicActionGasLimitStrategy::RailwayEstimate120
+            }
+            (Self::Railoxide, _) => PublicActionGasLimitStrategy::ChainBuffer,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +277,10 @@ pub struct PublicShieldRequest {
     pub public_account_uuid: String,
     pub asset: PublicAssetId,
     pub amount: U256,
+    pub profile: PublicShieldTransactionProfile,
     pub gas_fee: PublicActionGasFeeSelection,
+    pub gas_fee_mode: PublicActionGasFeeMode,
+    pub authorized_fee_ceiling: PublicActionGasFeeSelection,
     pub command_rx: Option<PublicActionCommandReceiver>,
     pub event_tx: Option<PublicActionSessionEventSender>,
 }
@@ -368,6 +433,12 @@ pub enum PublicActionSessionEvent {
     },
     AttemptRejected {
         step: PublicActionProgressStep,
+        message: String,
+    },
+    FeeAuthorizationRequired {
+        step: PublicActionProgressStep,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
         message: String,
     },
     HardwareApprovalStarted,

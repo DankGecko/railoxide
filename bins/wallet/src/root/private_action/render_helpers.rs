@@ -287,13 +287,23 @@ pub(in crate::root) fn render_private_action_info_icon(
     title: &'static str,
     detail: &'static str,
 ) -> impl IntoElement {
+    render_private_action_info_icon_with_body(id, title, move || {
+        div().child(detail).into_any_element()
+    })
+}
+
+pub(in crate::root) fn render_private_action_info_icon_with_body(
+    id: SharedString,
+    title: &'static str,
+    body: impl Fn() -> gpui::AnyElement + Clone + 'static,
+) -> impl IntoElement {
     render_private_action_tooltip_icon(
         id,
         IconName::Info,
         theme::TEXT_MUTED,
         theme::TEXT,
         title,
-        detail,
+        body,
     )
 }
 
@@ -303,7 +313,7 @@ fn render_private_action_tooltip_icon(
     icon_color: u32,
     title_color: u32,
     title: &'static str,
-    detail: &'static str,
+    body: impl Fn() -> gpui::AnyElement + Clone + 'static,
 ) -> impl IntoElement {
     div()
         .id(id)
@@ -324,6 +334,7 @@ fn render_private_action_tooltip_icon(
                     .border_0()
                     .build(window, cx);
             };
+            let body = body.clone();
             Tooltip::element(move |_window, _cx| {
                 div()
                     .w(width)
@@ -341,7 +352,7 @@ fn render_private_action_tooltip_icon(
                             .text_color(rgb(title_color))
                             .child(title),
                     )
-                    .child(detail)
+                    .child(body())
             })
             .build(window, cx)
         })
@@ -384,7 +395,11 @@ pub(in crate::root) fn render_self_broadcast_privacy_icon(id: SharedString) -> g
         theme::WARNING,
         theme::WARNING,
         "Privacy warning",
-        SELF_BROADCAST_PRIVACY_WARNING,
+        move || {
+            div()
+                .child(SELF_BROADCAST_PRIVACY_WARNING)
+                .into_any_element()
+        },
     )
     .into_any_element()
 }

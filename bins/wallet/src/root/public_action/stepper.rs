@@ -10,6 +10,7 @@ pub(in crate::root) fn render_public_action_stepper(
     current_gas_fee: Option<(u128, u128)>,
     fees_authorized: bool,
     action_error: Option<&str>,
+    fee_authorization_review: Option<&PublicActionFeeAuthorizationReview>,
     generation: u64,
 ) -> gpui::Div {
     let mut stepper = app_stepper_container();
@@ -26,6 +27,7 @@ pub(in crate::root) fn render_public_action_stepper(
             current_gas_fee,
             fees_authorized,
             action_error,
+            fee_authorization_review,
             generation,
         ));
     }
@@ -43,6 +45,7 @@ pub(in crate::root) fn render_public_action_step(
     current_gas_fee: Option<(u128, u128)>,
     fees_authorized: bool,
     action_error: Option<&str>,
+    fee_authorization_review: Option<&PublicActionFeeAuthorizationReview>,
     generation: u64,
 ) -> gpui::Div {
     let color = public_action_step_color(step.status);
@@ -73,6 +76,9 @@ pub(in crate::root) fn render_public_action_step(
             error_details_open,
         ));
     } else {
+        let detail = fee_authorization_review
+            .filter(|review| review.step == step.step)
+            .map_or_else(|| detail.to_string(), |review| review.message.to_string());
         body = body.child(
             app_muted_text(detail)
                 .text_color(rgb(color))
@@ -91,6 +97,7 @@ pub(in crate::root) fn render_public_action_step(
         current_gas_fee,
         fees_authorized,
         action_error,
+        fee_authorization_review,
         generation,
     ) {
         body = body.child(action);
@@ -113,25 +120,36 @@ pub(in crate::root) fn render_public_action_step_action(
     current_gas_fee: Option<(u128, u128)>,
     fees_authorized: bool,
     action_error: Option<&str>,
+    fee_authorization_review: Option<&PublicActionFeeAuthorizationReview>,
     generation: u64,
 ) -> Option<gpui::AnyElement> {
     if !command_available {
         return None;
     }
-    let retry_kind = match step.status {
-        PublicActionStepStatus::Error => public_action_error_retry_kind(step),
-        PublicActionStepStatus::Pending if step.tx_hash.is_some() && current_gas_fee.is_some() => {
-            PublicActionGasRetryKind::SpeedUp
+    let retry_kind = if fee_authorization_review.is_some_and(|review| review.step == step.step) {
+        PublicActionGasRetryKind::FeeAuthorization
+    } else {
+        match step.status {
+            PublicActionStepStatus::Error => public_action_error_retry_kind(step),
+            PublicActionStepStatus::Pending
+                if step.tx_hash.is_some() && current_gas_fee.is_some() =>
+            {
+                PublicActionGasRetryKind::SpeedUp
+            }
+            _ => return None,
         }
-        _ => return None,
     };
-    if fees_authorized && retry_kind != PublicActionGasRetryKind::RetryStep {
+    if fees_authorized
+        && retry_kind != PublicActionGasRetryKind::RetryStep
+        && retry_kind != PublicActionGasRetryKind::FeeAuthorization
+    {
         return None;
     }
     let label = match retry_kind {
         PublicActionGasRetryKind::RetryStep => "Retry step",
         PublicActionGasRetryKind::RetryEstimate => "Retry with custom gas",
         PublicActionGasRetryKind::SpeedUp => "Speed up transaction",
+        PublicActionGasRetryKind::FeeAuthorization => "Review updated gas fee",
     };
     let mut action = div()
         .pt(px(4.0))
