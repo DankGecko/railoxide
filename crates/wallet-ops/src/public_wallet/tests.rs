@@ -1524,30 +1524,6 @@ fn public_action_tip_fallback_uses_rpc_gas_price_only_for_bnb() {
 }
 
 #[test]
-fn public_action_receipt_poll_error_message_requires_all_checked_providers_to_fail() {
-    assert!(public_action_receipt_poll_error_message(0, 0, None).is_none());
-    assert!(
-        public_action_receipt_poll_error_message(
-            2,
-            1,
-            Some("https://rpc.example: rate limited".to_string()),
-        )
-        .is_none()
-    );
-
-    let message = public_action_receipt_poll_error_message(
-        2,
-        0,
-        Some("https://rpc.example: rate limited".to_string()),
-    )
-    .expect("all checked providers failed");
-
-    assert!(message.contains("all accepted RPC providers"));
-    assert!(message.contains("2 checked"));
-    assert!(message.contains("rate limited"));
-}
-
-#[test]
 fn public_actions_reject_zero_amount_before_signing() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

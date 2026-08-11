@@ -86,6 +86,6 @@ use submission::{
     public_action_before_raw_broadcast_checkpoint, public_action_current_unix_seconds,
     public_action_eip1559_transaction_request,
     public_action_fill_walletconnect_transaction_request, public_action_legacy_transaction_request,
-    public_action_native_exposure, public_action_receipt_poll_error_message,
-    public_action_step_initial_gas_fee_selection, railway_auto_fee_within_authorized_ceiling,
+    public_action_native_exposure, public_action_step_initial_gas_fee_selection,
+    railway_auto_fee_within_authorized_ceiling,
 };

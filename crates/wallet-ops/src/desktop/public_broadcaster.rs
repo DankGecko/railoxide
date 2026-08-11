@@ -4,6 +4,8 @@ use eyre::eyre;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::block_observer::resolve_transaction_sender_by_block;
+
 #[derive(Debug, Clone)]
 pub struct PublicBroadcasterCandidate {
     pub chain_id: u64,
@@ -584,7 +586,6 @@ pub(super) struct SelfBroadcastPreflight {
 }
 
 pub(super) struct SubmittedSelfBroadcastAttempt {
-    pub(super) provider_handles: Vec<ProviderHandle>,
     pub(super) tx_hash: FixedBytes<32>,
     pub(super) info: SelfBroadcastAttemptInfo,
     pub(super) rpc_gas_price: u128,
@@ -595,7 +596,6 @@ pub(super) struct SubmittedSelfBroadcastAttempt {
 pub(super) struct SelfBroadcastSentTx {
     pub(super) tx_hash: FixedBytes<32>,
     pub(super) tx_hash_string: String,
-    pub(super) provider_handles: Vec<ProviderHandle>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -824,6 +824,7 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
     let origin = match resolve_source_tx_origin(
         request.chain_id,
         request.effective_chain.as_ref(),
+        utxo.source.block_number,
         utxo.source.tx_hash,
         http,
     )
@@ -831,7 +832,7 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
     {
         Ok(origin) => origin,
         Err(error) => {
-            tracing::warn!(%error, tx_hash = %hex::encode_prefixed(utxo.source.tx_hash), "resolve blocked Shield source origin failed");
+            tracing::warn!(%error, "resolve blocked Shield source origin failed");
             return Ok(blocked_shield_rescue_disabled(
                 "Source transaction origin could not be resolved. Retry after checking RPC connectivity.",
                 None,
@@ -852,44 +853,13 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
 pub async fn resolve_source_tx_origin(
     chain_id: u64,
     effective_chain: Option<&settings::EffectiveChainConfig>,
+    source_block_number: u64,
     source_tx_hash: FixedBytes<32>,
     http: &HttpContext,
 ) -> Result<Address> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let provider_handles = query_rpc_pool.available_providers();
-    if provider_handles.is_empty() {
-        return Err(eyre!("no healthy query RPC available"));
-    }
-    let mut last_error = None;
-
-    for provider_handle in provider_handles {
-        match provider_handle
-            .provider
-            .get_transaction_by_hash(source_tx_hash)
-            .await
-        {
-            Ok(Some(tx)) => return Ok(tx.from()),
-            Ok(None) => {
-                last_error = Some(eyre!(
-                    "source transaction {} not found",
-                    hex::encode_prefixed(source_tx_hash)
-                ));
-            }
-            Err(error) => {
-                let rpc = http::redact_url_for_display(&provider_handle.url);
-                tracing::warn!(%error, %rpc, "fetch source transaction failed");
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(Report::new(error));
-            }
-        }
-    }
-
-    if let Some(error) = last_error {
-        Err(error).wrap_err("all source transaction origin lookup attempts failed")
-    } else {
-        Err(eyre!("no healthy query RPC available"))
-    }
+    resolve_transaction_sender_by_block(&query_rpc_pool, source_block_number, source_tx_hash).await
 }
 
 pub(crate) fn blocked_shield_rescue_candidate_from_records(
@@ -1562,6 +1532,7 @@ pub(super) struct EffectiveDesktopChainConfig {
     pub(super) railgun_contract: Address,
     pub(super) relay_adapt_contract: Address,
     pub(super) wrapped_native_token: Option<Address>,
+    pub(super) finality_depth: u64,
     pub(super) gas: settings::EffectiveChainGasSettings,
 }
 
@@ -1576,6 +1547,7 @@ pub(super) fn effective_desktop_chain_config(
             railgun_contract: defaults.contract,
             relay_adapt_contract: defaults.relay_adapt_contract,
             wrapped_native_token: wrapped_native_token_for_chain(chain_id),
+            finality_depth: defaults.finality_depth,
             gas: settings::EffectiveChainGasSettings {
                 gas_limit_buffer: GAS_LIMIT_BUFFER,
                 gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,
@@ -1607,6 +1579,7 @@ pub(super) fn effective_desktop_chain_config(
         railgun_contract,
         relay_adapt_contract,
         wrapped_native_token,
+        finality_depth: effective_chain.finality_depth,
         gas: effective_chain.gas.clone(),
     })
 }

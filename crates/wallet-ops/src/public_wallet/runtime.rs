@@ -28,6 +28,7 @@ pub(super) struct PublicChainRuntimeConfig {
     pub(super) relay_adapt_contract: Address,
     pub(super) wrapped_native_token: Option<Address>,
     pub(super) multicall_contract: Address,
+    pub(super) finality_depth: u64,
     pub(super) gas: EffectiveChainGasSettings,
 }
 
@@ -43,6 +44,7 @@ pub(super) fn public_chain_runtime_config(
             relay_adapt_contract: defaults.relay_adapt_contract,
             wrapped_native_token: wrapped_native_token_for_chain(chain_id),
             multicall_contract: defaults.multicall_contract,
+            finality_depth: defaults.finality_depth,
             gas: EffectiveChainGasSettings {
                 gas_limit_buffer: GAS_LIMIT_BUFFER,
                 gas_price_buffer_numerator: crate::GAS_PRICE_BUFFER_NUMERATOR as u64,
@@ -80,6 +82,7 @@ pub(super) fn public_chain_runtime_config(
         relay_adapt_contract,
         wrapped_native_token,
         multicall_contract,
+        finality_depth: effective_chain.finality_depth,
         gas: effective_chain.gas.clone(),
     })
 }

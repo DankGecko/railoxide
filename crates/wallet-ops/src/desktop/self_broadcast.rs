@@ -1,7 +1,33 @@
 use super::*;
 use async_trait::async_trait;
 use eyre::eyre;
-use futures_util::stream::{FuturesUnordered, StreamExt as _};
+
+use crate::block_observer::BlockObserver;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelfBroadcastWinnerOutput {
+    gas_limit: u64,
+    rpc_gas_price: u128,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    estimated_native_gas_cost: U256,
+    live_native_balance: U256,
+}
+
+fn self_broadcast_winner_output(
+    attempts: &[SubmittedSelfBroadcastAttempt],
+    winner_index: usize,
+) -> SelfBroadcastWinnerOutput {
+    let winner = &attempts[winner_index];
+    SelfBroadcastWinnerOutput {
+        gas_limit: winner.info.gas_limit,
+        rpc_gas_price: winner.rpc_gas_price,
+        max_fee_per_gas: winner.info.max_fee_per_gas,
+        max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
+        estimated_native_gas_cost: winner.estimated_native_gas_cost,
+        live_native_balance: winner.live_native_balance,
+    }
+}
 
 const TREZOR_APP_PASSPHRASE_ERROR_TEXT: &str =
     "Trezor requested an app-entered passphrase but none was provided";
@@ -46,6 +72,7 @@ pub(super) async fn submit_self_broadcast_plan(
     let mut next_gas_fee = gas_fee;
     let mut submitted_attempts = Vec::new();
     let mut nonce = None;
+    let mut observer = None;
 
     loop {
         update_transaction_generation_stage(
@@ -93,6 +120,12 @@ pub(super) async fn submit_self_broadcast_plan(
         };
         nonce = Some(preflight.nonce);
 
+        if observer.is_none() {
+            observer = Some(
+                BlockObserver::establish(Arc::clone(&query_rpc_pool), chain.finality_depth).await?,
+            );
+        }
+
         update_transaction_generation_stage(
             progress_tx.as_ref(),
             TransactionGenerationStage::SigningSelfBroadcast,
@@ -128,7 +161,13 @@ pub(super) async fn submit_self_broadcast_plan(
                 continue;
             }
         };
+        let attempt_id = submitted_attempts.len();
+        let tx_hash = attempt.tx_hash;
         submitted_attempts.push(attempt);
+        observer
+            .as_mut()
+            .expect("self-broadcast observer established")
+            .register(tx_hash, attempt_id);
         update_transaction_generation_stage(
             progress_tx.as_ref(),
             TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
@@ -137,8 +176,14 @@ pub(super) async fn submit_self_broadcast_plan(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(3)) => {
-                    if let Some((winner_index, receipt)) = poll_self_broadcast_attempt_receipts(&submitted_attempts).await? {
-                        let winner = &submitted_attempts[winner_index];
+                    if let Some((winner_index, receipt)) = observer
+                        .as_mut()
+                        .expect("self-broadcast observer established")
+                        .poll()
+                        .await?
+                        .receipt
+                    {
+                        let winner = self_broadcast_winner_output(&submitted_attempts, winner_index);
                         session
                             .mark_pending_spent_utxos(
                                 &pending_spent_inputs,
@@ -149,10 +194,10 @@ pub(super) async fn submit_self_broadcast_plan(
                             chain_id,
                             public_account_uuid,
                             gas_payer,
-                            gas_limit: winner.info.gas_limit,
+                            gas_limit: winner.gas_limit,
                             rpc_gas_price: winner.rpc_gas_price,
-                            max_fee_per_gas: winner.info.max_fee_per_gas,
-                            max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
+                            max_fee_per_gas: winner.max_fee_per_gas,
+                            max_priority_fee_per_gas: winner.max_priority_fee_per_gas,
                             estimated_native_gas_cost: winner.estimated_native_gas_cost,
                             live_native_balance: winner.live_native_balance,
                             tx: receipt,
@@ -217,7 +262,15 @@ pub(super) async fn submit_self_broadcast_plan(
                     )
                     .await
                     {
-                        Ok(attempt) => submitted_attempts.push(attempt),
+                        Ok(attempt) => {
+                            let attempt_id = submitted_attempts.len();
+                            let tx_hash = attempt.tx_hash;
+                            submitted_attempts.push(attempt);
+                            observer
+                                .as_mut()
+                                .expect("self-broadcast observer established")
+                                .register(tx_hash, attempt_id);
+                        }
                         Err(error) => {
                             let message = self_broadcast_signing_error_message(&error);
                             emit_self_broadcast_event(
@@ -341,41 +394,12 @@ pub(super) async fn submit_self_broadcast_attempt(
         SelfBroadcastSessionEvent::AttemptSubmitted(info.clone()),
     );
     Ok(SubmittedSelfBroadcastAttempt {
-        provider_handles: sent.provider_handles,
         tx_hash: sent.tx_hash,
         info,
         rpc_gas_price: preflight.rpc_gas_price,
         estimated_native_gas_cost: preflight.estimated_native_gas_cost,
         live_native_balance: preflight.live_native_balance,
     })
-}
-
-pub(super) async fn poll_self_broadcast_attempt_receipts(
-    attempts: &[SubmittedSelfBroadcastAttempt],
-) -> Result<Option<(usize, TxReceiptOutput)>> {
-    for (index, attempt) in attempts.iter().enumerate() {
-        for provider_handle in &attempt.provider_handles {
-            match provider_handle
-                .provider
-                .get_transaction_receipt(attempt.tx_hash)
-                .await
-            {
-                Ok(Some(receipt)) => {
-                    return Ok(Some((index, tx_receipt_output(attempt.tx_hash, &receipt))));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let url = crate::http::redact_url_for_display(&provider_handle.url);
-                    tracing::warn!(
-                        %url,
-                        %error,
-                        "self-broadcast receipt fetch failed"
-                    );
-                }
-            }
-        }
-    }
-    Ok(None)
 }
 
 pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
@@ -1092,7 +1116,6 @@ pub(super) async fn sign_send_self_broadcast_transaction(
     Ok(SelfBroadcastSentTx {
         tx_hash,
         tx_hash_string,
-        provider_handles,
     })
 }
 
@@ -1245,29 +1268,6 @@ pub(crate) fn is_self_broadcast_tx_already_known_message(message: &str) -> bool 
         || message.contains("transaction already")
 }
 
-pub(crate) fn tx_receipt_output(
-    tx_hash: FixedBytes<32>,
-    receipt: &TransactionReceipt,
-) -> TxReceiptOutput {
-    let status = receipt.status();
-    let block_number = receipt.block_number.unwrap_or(0);
-    let gas_used = receipt.gas_used;
-    if status {
-        tracing::info!(%tx_hash, block_number, gas_used, "self-broadcast transaction confirmed");
-    } else {
-        tracing::warn!(%tx_hash, block_number, gas_used, "self-broadcast transaction reverted");
-    }
-    TxReceiptOutput {
-        tx_hash: hex::encode_prefixed(tx_hash),
-        status,
-        block_number,
-        gas_used,
-        contract_address: receipt
-            .contract_address
-            .map(|address| address.to_checksum(None)),
-    }
-}
-
 pub(super) async fn mark_submitted_inputs_pending_spent(
     session: &WalletSession,
     inputs: &[Utxo],
@@ -1385,6 +1385,9 @@ pub async fn run_sponsored_self_broadcast_session(
         http,
         relays: &request.effective_chain.sponsored_bundle_relays,
         query_rpc_pool,
+        finality_depth: request.effective_chain.finality_depth,
+        tx_hash,
+        observer: tokio::sync::Mutex::new(None),
         session: &request.session,
         pending_spent_inputs: &request.pending_spent_inputs,
     };
@@ -1577,6 +1580,9 @@ fn sponsored_pending_stop_reason(
 
 #[async_trait]
 trait SponsoredSelfBroadcastBackend {
+    async fn establish_observation(&self) -> Result<()> {
+        Ok(())
+    }
     async fn submit_bundle(&self, signed_raw_transaction: &str, tx_hash: FixedBytes<32>) -> bool;
     async fn canonical_state(&self, tx_hash: FixedBytes<32>) -> SponsoredCanonicalState;
     async fn mark_inputs_pending_spent(&self, tx_hash: FixedBytes<32>) -> Result<()>;
@@ -1586,18 +1592,34 @@ trait SponsoredSelfBroadcastBackend {
 struct SponsoredCanonicalState {
     receipt: Option<TxReceiptOutput>,
     head: Option<(usize, u64)>,
+    confirmation_error: Option<&'static str>,
 }
 
 struct LiveSponsoredSelfBroadcastBackend<'a> {
     http: &'a HttpContext,
     relays: &'a [SensitiveUrl],
     query_rpc_pool: Arc<QueryRpcPool>,
+    finality_depth: u64,
+    tx_hash: FixedBytes<32>,
+    observer: tokio::sync::Mutex<Option<BlockObserver>>,
     session: &'a WalletSession,
     pending_spent_inputs: &'a [Utxo],
 }
 
 #[async_trait]
 impl SponsoredSelfBroadcastBackend for LiveSponsoredSelfBroadcastBackend<'_> {
+    async fn establish_observation(&self) -> Result<()> {
+        let mut observer = self.observer.lock().await;
+        if observer.is_none() {
+            let mut created =
+                BlockObserver::establish(Arc::clone(&self.query_rpc_pool), self.finality_depth)
+                    .await?;
+            created.register(self.tx_hash, 0);
+            *observer = Some(created);
+        }
+        Ok(())
+    }
+
     async fn submit_bundle(&self, signed_raw_transaction: &str, tx_hash: FixedBytes<32>) -> bool {
         match submit_sponsored_bundle_with_acceptance(
             self.http,
@@ -1652,47 +1674,25 @@ impl SponsoredSelfBroadcastBackend for LiveSponsoredSelfBroadcastBackend<'_> {
         }
     }
 
-    async fn canonical_state(&self, tx_hash: FixedBytes<32>) -> SponsoredCanonicalState {
-        let providers = self.query_rpc_pool.available_providers();
-        let mut polls = FuturesUnordered::new();
-        for provider_handle in providers {
-            polls.push(async move {
-                let receipt_provider = provider_handle.provider.clone();
-                let head_provider = provider_handle.provider.clone();
-                let (receipt, head) = tokio::join!(
-                    receipt_provider.get_transaction_receipt(tx_hash),
-                    head_provider.get_block_number(),
-                );
-                (provider_handle, receipt, head)
-            });
+    async fn canonical_state(&self, _tx_hash: FixedBytes<32>) -> SponsoredCanonicalState {
+        let mut observer = self.observer.lock().await;
+        let Some(observer) = observer.as_mut() else {
+            return SponsoredCanonicalState {
+                confirmation_error: Some("observer was not established"),
+                ..SponsoredCanonicalState::default()
+            };
+        };
+        match observer.poll().await {
+            Ok(observation) => SponsoredCanonicalState {
+                receipt: observation.receipt.map(|(_, receipt)| receipt),
+                head: observation.head,
+                ..SponsoredCanonicalState::default()
+            },
+            Err(_) => SponsoredCanonicalState {
+                confirmation_error: Some("block-scoped confirmation is unavailable"),
+                ..SponsoredCanonicalState::default()
+            },
         }
-
-        while let Some((provider_handle, receipt, head)) = polls.next().await {
-            let rpc = crate::http::redact_url_for_display(&provider_handle.url);
-            if let Err(error) = &receipt {
-                tracing::warn!(%rpc, %error, "sponsored self-broadcast receipt poll failed");
-            }
-            if let Err(error) = &head {
-                tracing::warn!(%rpc, %error, "sponsored self-broadcast head poll failed");
-            }
-            if receipt.is_err() && head.is_err() {
-                self.query_rpc_pool.mark_bad_provider(&provider_handle);
-                continue;
-            }
-            if let Ok(Some(receipt)) = receipt {
-                return SponsoredCanonicalState {
-                    receipt: Some(tx_receipt_output(tx_hash, &receipt)),
-                    head: head.ok().map(|head| (provider_handle.index, head)),
-                };
-            }
-            if let Ok(head) = head {
-                return SponsoredCanonicalState {
-                    receipt: None,
-                    head: Some((provider_handle.index, head)),
-                };
-            }
-        }
-        SponsoredCanonicalState::default()
     }
 
     async fn mark_inputs_pending_spent(&self, tx_hash: FixedBytes<32>) -> Result<()> {
@@ -1765,7 +1765,7 @@ async fn mark_sponsored_inputs_with_command(
 }
 
 async fn run_sponsored_self_broadcast_session_with_backend(
-    backend: &impl SponsoredSelfBroadcastBackend,
+    backend: &(impl SponsoredSelfBroadcastBackend + Sync),
     block_time: Duration,
     tx_hash: FixedBytes<32>,
     signed_raw_transaction: &str,
@@ -1781,6 +1781,8 @@ async fn run_sponsored_self_broadcast_session_with_backend(
             bundle_was_accepted: false,
         });
     }
+
+    backend.establish_observation().await?;
 
     let mut last_submission_started = tokio::time::Instant::now();
     let mut bundle_was_accepted = submit_sponsored_bundle_latching_stop(
@@ -1879,6 +1881,11 @@ async fn run_sponsored_self_broadcast_session_with_backend(
             let Some(state) = state else {
                 continue;
             };
+            if state.confirmation_error.is_some() {
+                return Err(eyre!(
+                    "privacy-preserving sponsored confirmation is unavailable"
+                ));
+            }
             if let Some(receipt) = state.receipt {
                 return Ok(SponsoredSelfBroadcastSessionOutcome::CanonicalReceipt(
                     receipt,
@@ -2196,6 +2203,7 @@ mod tests {
         state: Mutex<MockSponsoredBackendState>,
         active_submissions: AtomicUsize,
         max_active_submissions: AtomicUsize,
+        observation_establishments: AtomicUsize,
     }
 
     #[derive(Default)]
@@ -2218,6 +2226,7 @@ mod tests {
                 state: Mutex::new(state),
                 active_submissions: AtomicUsize::new(0),
                 max_active_submissions: AtomicUsize::new(0),
+                observation_establishments: AtomicUsize::new(0),
             }
         }
 
@@ -2232,10 +2241,20 @@ mod tests {
         fn submissions(&self) -> Vec<String> {
             self.state.lock().expect("mock state").submissions.clone()
         }
+
+        fn observation_establishment_count(&self) -> usize {
+            self.observation_establishments.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
     impl SponsoredSelfBroadcastBackend for MockSponsoredBackend {
+        async fn establish_observation(&self) -> Result<()> {
+            self.observation_establishments
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         async fn submit_bundle(
             &self,
             signed_raw_transaction: &str,
@@ -2278,7 +2297,11 @@ mod tests {
                 .pop_front()
                 .unwrap_or(state.fallback_head)
                 .map(|head| (0, head));
-            SponsoredCanonicalState { receipt, head }
+            SponsoredCanonicalState {
+                receipt,
+                head,
+                ..SponsoredCanonicalState::default()
+            }
         }
 
         async fn mark_inputs_pending_spent(&self, tx_hash: FixedBytes<32>) -> Result<()> {
@@ -2398,6 +2421,7 @@ mod tests {
         });
 
         wait_for_submission_count(&backend, 1).await;
+        assert_eq!(backend.observation_establishment_count(), 1);
         advance_and_yield(Duration::from_secs(1)).await;
         wait_for_submission_count(&backend, 2).await;
         advance_and_yield(Duration::from_secs(1)).await;

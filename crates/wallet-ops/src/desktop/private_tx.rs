@@ -3291,6 +3291,7 @@ mod tests {
             railgun_contract: Address::ZERO,
             relay_adapt_contract: Address::ZERO,
             wrapped_native_token: Some(wrapped_native),
+            finality_depth: 1,
             gas: settings::EffectiveChainGasSettings {
                 gas_limit_buffer: GAS_LIMIT_BUFFER,
                 gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,

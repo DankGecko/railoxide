@@ -7,10 +7,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::hex;
-use alloy::network::{EthereumWallet, TransactionBuilder as _, TransactionResponse};
+use alloy::network::{EthereumWallet, TransactionBuilder as _};
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, address, keccak256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{FeeHistory, TransactionReceipt, TransactionRequest};
+use alloy::rpc::types::{FeeHistory, TransactionRequest};
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::uint;
@@ -94,6 +94,7 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
 
 mod amounts;
 mod anchors;
+mod block_observer;
 mod desktop;
 pub mod hardware;
 mod hardware_typed_data;

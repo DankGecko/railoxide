@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::TransactionBuilder as _;
@@ -16,11 +17,11 @@ use super::types::{
     PublicActionSessionEvent, PublicActionSessionEventSender, PublicActionStepFeePolicy,
     PublicShieldTransactionProfile,
 };
+use crate::block_observer::BlockObserver;
 use crate::settings::EffectiveChainGasSettings;
 use crate::{
     SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
     self_broadcast_replacement_bumped_fee, self_broadcast_send_raw_transaction_to_rpc_pool,
-    tx_receipt_output,
 };
 
 pub(super) struct PublicActionStepOutcome {
@@ -96,7 +97,6 @@ impl PublicActionPreflightError {
 }
 
 pub(super) struct SubmittedPublicActionAttempt {
-    provider_handles: Vec<ProviderHandle>,
     tx_hash: FixedBytes<32>,
     pub(super) info: PublicActionAttemptInfo,
     rpc_gas_price: u128,
@@ -107,7 +107,6 @@ pub(super) struct SubmittedPublicActionAttempt {
 struct PublicActionSentTx {
     tx_hash: FixedBytes<32>,
     tx_hash_string: String,
-    provider_handles: Vec<ProviderHandle>,
 }
 
 pub(super) async fn submit_public_action_step_session(
@@ -117,7 +116,8 @@ pub(super) async fn submit_public_action_step_session(
     gas_limit_strategy: PublicActionGasLimitStrategy,
     signer: &VaultedPublicSigner,
     label: &str,
-    query_rpc_pool: &QueryRpcPool,
+    query_rpc_pool: Arc<QueryRpcPool>,
+    finality_depth: u64,
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
     from_address: Address,
@@ -137,6 +137,7 @@ pub(super) async fn submit_public_action_step_session(
     let authorized_gas_fee = authorized_gas_limit.map(|_| gas_fee);
     let authorized_fee_ceiling = railway_auto.then_some(authorized_fee_ceiling).flatten();
     let mut submitted_attempts = Vec::new();
+    let mut observer = None;
 
     loop {
         progress(public_action_progress_update(
@@ -147,7 +148,7 @@ pub(super) async fn submit_public_action_step_session(
         ));
 
         let preflight = match public_action_preflight_from_rpc_pool(
-            query_rpc_pool,
+            query_rpc_pool.as_ref(),
             network_mode,
             chain_id,
             from_address,
@@ -222,11 +223,16 @@ pub(super) async fn submit_public_action_step_session(
         };
         nonce = Some(preflight.nonce);
 
+        if observer.is_none() {
+            observer =
+                Some(BlockObserver::establish(Arc::clone(&query_rpc_pool), finality_depth).await?);
+        }
+
         emit_public_action_event(event_tx, PublicActionSessionEvent::AttemptHandoff { step });
         let attempt = match submit_public_action_attempt(
             step,
             preflight,
-            query_rpc_pool,
+            query_rpc_pool.as_ref(),
             network_mode,
             signer,
             label,
@@ -268,13 +274,24 @@ pub(super) async fn submit_public_action_step_session(
             Some(attempt.info.tx_hash.clone()),
             None,
         ));
+        let attempt_id = submitted_attempts.len();
+        let tx_hash = attempt.tx_hash;
         submitted_attempts.push(attempt);
+        observer
+            .as_mut()
+            .expect("public action observer established")
+            .register(tx_hash, attempt_id);
 
         loop {
             let receipt = if command_rx.is_some() {
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(3)) => {
-                        poll_public_action_attempt_receipts(&submitted_attempts).await?
+                        observer
+                            .as_mut()
+                            .expect("public action observer established")
+                            .poll()
+                            .await?
+                            .receipt
                     }
                     command = recv_public_action_command(command_rx) => {
                         let Some(command) = command else {
@@ -304,7 +321,7 @@ pub(super) async fn submit_public_action_step_session(
                             .last()
                             .map_or(0, |attempt| attempt.info.gas_limit);
                         let replacement = match public_action_preflight_from_rpc_pool(
-                            query_rpc_pool,
+                            query_rpc_pool.as_ref(),
                             network_mode,
                             chain_id,
                             from_address,
@@ -340,7 +357,7 @@ pub(super) async fn submit_public_action_step_session(
                         match submit_public_action_attempt(
                             step,
                             replacement,
-                            query_rpc_pool,
+                            query_rpc_pool.as_ref(),
                             network_mode,
                             signer,
                             label,
@@ -356,7 +373,13 @@ pub(super) async fn submit_public_action_step_session(
                                     Some(attempt.info.tx_hash.clone()),
                                     None,
                                 ));
+                                let attempt_id = submitted_attempts.len();
+                                let tx_hash = attempt.tx_hash;
                                 submitted_attempts.push(attempt);
+                                observer
+                                    .as_mut()
+                                    .expect("public action observer established")
+                                    .register(tx_hash, attempt_id);
                             }
                             Err(error) => emit_public_action_event(
                                 event_tx,
@@ -371,7 +394,12 @@ pub(super) async fn submit_public_action_step_session(
                 }
             } else {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                poll_public_action_attempt_receipts(&submitted_attempts).await?
+                observer
+                    .as_mut()
+                    .expect("public action observer established")
+                    .poll()
+                    .await?
+                    .receipt
             };
 
             if let Some((winner_index, receipt)) = receipt {
@@ -403,10 +431,7 @@ pub(super) async fn submit_public_action_step_session(
                         event_tx,
                         PublicActionSessionEvent::StepFailed { step, message },
                     );
-                    let gas_fee = PublicActionGasFeeSelection::Custom {
-                        max_fee_per_gas: winner.info.max_fee_per_gas,
-                        max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
-                    };
+                    let gas_fee = public_action_winner_gas_fee(&submitted_attempts, winner_index);
                     let Some(command) = recv_public_action_command(command_rx).await else {
                         return Ok(PublicActionStepOutcome {
                             receipt,
@@ -421,12 +446,10 @@ pub(super) async fn submit_public_action_step_session(
                     nonce = Some(winner.info.nonce.saturating_add(1));
                     next_gas_fee = command.gas_fee;
                     submitted_attempts.clear();
+                    observer = None;
                     break;
                 }
-                let gas_fee = PublicActionGasFeeSelection::Custom {
-                    max_fee_per_gas: winner.info.max_fee_per_gas,
-                    max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
-                };
+                let gas_fee = public_action_winner_gas_fee(&submitted_attempts, winner_index);
                 return Ok(PublicActionStepOutcome {
                     receipt,
                     next_nonce: winner.info.nonce.saturating_add(1),
@@ -434,6 +457,17 @@ pub(super) async fn submit_public_action_step_session(
                 });
             }
         }
+    }
+}
+
+fn public_action_winner_gas_fee(
+    attempts: &[SubmittedPublicActionAttempt],
+    winner_index: usize,
+) -> PublicActionGasFeeSelection {
+    let winner = &attempts[winner_index];
+    PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: winner.info.max_fee_per_gas,
+        max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
     }
 }
 
@@ -515,7 +549,6 @@ pub(super) async fn submit_public_action_attempt(
         },
     );
     Ok(SubmittedPublicActionAttempt {
-        provider_handles: sent.provider_handles,
         tx_hash: sent.tx_hash,
         info,
         rpc_gas_price: preflight.rpc_gas_price,
@@ -967,7 +1000,6 @@ async fn sign_send_public_action_transaction(
     Ok(PublicActionSentTx {
         tx_hash,
         tx_hash_string,
-        provider_handles,
     })
 }
 
@@ -994,64 +1026,6 @@ pub(super) fn public_action_current_unix_seconds() -> u64 {
 
 pub(super) async fn public_action_before_raw_broadcast_checkpoint() {
     tokio::task::yield_now().await;
-}
-
-async fn poll_public_action_attempt_receipts(
-    attempts: &[SubmittedPublicActionAttempt],
-) -> Result<Option<(usize, TxReceiptOutput)>> {
-    let mut queried_provider_count = 0;
-    let mut pending_response_count = 0;
-    let mut last_error = None;
-    for (index, attempt) in attempts.iter().enumerate() {
-        for provider_handle in &attempt.provider_handles {
-            match provider_handle
-                .provider
-                .get_transaction_receipt(attempt.tx_hash)
-                .await
-            {
-                Ok(Some(receipt)) => {
-                    return Ok(Some((index, tx_receipt_output(attempt.tx_hash, &receipt))));
-                }
-                Ok(None) => {
-                    queried_provider_count += 1;
-                    pending_response_count += 1;
-                }
-                Err(error) => {
-                    queried_provider_count += 1;
-                    last_error = Some(format!("{}: {error}", provider_handle.url));
-                    tracing::warn!(
-                        url = %provider_handle.url,
-                        %error,
-                        "public action receipt fetch failed"
-                    );
-                }
-            }
-        }
-    }
-    if let Some(message) = public_action_receipt_poll_error_message(
-        queried_provider_count,
-        pending_response_count,
-        last_error,
-    ) {
-        return Err(eyre!("{message}"));
-    }
-    Ok(None)
-}
-
-#[must_use]
-pub(super) fn public_action_receipt_poll_error_message(
-    queried_provider_count: usize,
-    pending_response_count: usize,
-    last_error: Option<String>,
-) -> Option<String> {
-    if queried_provider_count == 0 || pending_response_count > 0 {
-        return None;
-    }
-    last_error.map(|error| {
-        format!(
-            "public action receipt fetch failed for all accepted RPC providers ({queried_provider_count} checked): {error}"
-        )
-    })
 }
 
 pub(super) fn emit_public_action_event(

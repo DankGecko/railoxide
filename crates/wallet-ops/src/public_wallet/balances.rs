@@ -14,6 +14,7 @@ use super::types::{
     PlannedPublicBalanceCall, PublicAccountBalance, PublicAssetId, PublicBalanceAmount,
     PublicBalanceAsset, PublicBalanceEntry, PublicBalanceSnapshot,
 };
+use crate::http::redact_url_for_display;
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry};
 use crate::vault::PublicAccountMetadata;
 use crate::{HttpContext, query_rpc_pool_with_http_client};
@@ -145,7 +146,8 @@ pub async fn refresh_public_balances(
                 break;
             }
             Err(error) => {
-                tracing::warn!(%error, rpc = %provider_handle.url, "refresh public balances multicall failed");
+                let rpc = redact_url_for_display(&provider_handle.url);
+                tracing::warn!(%error, %rpc, "refresh public balances multicall failed");
                 query_rpc_pool.mark_bad_provider(&provider_handle);
                 last_error = Some(eyre!("{error}"));
             }
