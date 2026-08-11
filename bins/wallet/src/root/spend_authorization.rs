@@ -18,7 +18,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_input, app_muted_text, app_strong_text, app_text};
+use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text, app_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::hardware::HardwareDerivationDescriptor;
 #[cfg(feature = "hardware")]
@@ -604,7 +604,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                     }),
             )
             .children(payload)
-            .child(app_input(&self.password_input))
+            .child(app_masked_input(&self.password_input, false))
             .child(app_muted_text("Remember authorization"))
             .child(render_spend_authorization_lifetime_buttons(
                 dialog.clone(),
@@ -733,7 +733,7 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
                                 )
                                 .whitespace_normal(),
                             )
-                            .child(app_input(&trezor_app_passphrase_input).disabled(pending)),
+                            .child(app_masked_input(&trezor_app_passphrase_input, pending)),
                     )
                 }
                 #[cfg(not(feature = "hardware"))]
@@ -1147,7 +1147,7 @@ impl WalletRoot {
                                             )
                                             .whitespace_normal(),
                                         )
-                                        .child(app_input(&trezor_app_passphrase_input)),
+                                        .child(app_masked_input(&trezor_app_passphrase_input, false)),
                                 )
                             }
                             #[cfg(not(feature = "hardware"))]

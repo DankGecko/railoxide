@@ -9,7 +9,7 @@ use gpui_component::{
     button::ButtonVariants,
     input::{InputEvent, InputState},
 };
-use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::vault::VaultError;
 use zeroize::Zeroizing;
@@ -308,7 +308,7 @@ fn password_field(label: &'static str, input: &Entity<InputState>, disabled: boo
         .flex_col()
         .gap_1()
         .child(app_muted_text(label))
-        .child(app_input(input).disabled(disabled))
+        .child(app_masked_input(input, disabled))
 }
 
 fn change_vault_password_error_message(error: &VaultError) -> Arc<str> {

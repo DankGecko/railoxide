@@ -17,7 +17,9 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use railgun_ui::{chain_name, short_address};
-use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
+use ui::controls::{
+    app_button, app_button_base, app_input, app_masked_input, app_muted_text, app_strong_text,
+};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     PublicAssetId, PublicBalanceEntry,
@@ -1127,8 +1129,10 @@ impl WalletRoot {
                                             .whitespace_normal(),
                                         )
                                         .child(
-                                            app_input(&self.trezor_app_passphrase_input)
-                                                .disabled(self.public_form.adding_account),
+                                            app_masked_input(
+                                                &self.trezor_app_passphrase_input,
+                                                self.public_form.adding_account,
+                                            ),
                                         ),
                                 )
                             }
@@ -1203,7 +1207,10 @@ impl WalletRoot {
                     ))
                     .child(app_muted_text(next_index))
                     .child(app_input(&self.public_form.add_label_input))
-                    .child(app_input(&self.public_form.add_password_input))
+                    .child(app_masked_input(
+                        &self.public_form.add_password_input,
+                        false,
+                    ))
                     .children(self.public_form.error.as_ref().map(|message| {
                         Alert::error("wallet-public-add-derived-error", message.to_string()).small()
                     }))
@@ -1239,8 +1246,14 @@ impl WalletRoot {
                         "Import an EVM private key as a vaulted Public account.",
                     ))
                     .child(app_input(&self.public_form.import_label_input))
-                    .child(app_input(&self.public_form.import_private_key_input))
-                    .child(app_input(&self.public_form.import_password_input))
+                    .child(app_masked_input(
+                        &self.public_form.import_private_key_input,
+                        false,
+                    ))
+                    .child(app_masked_input(
+                        &self.public_form.import_password_input,
+                        false,
+                    ))
                     .child(
                         Checkbox::new("wallet-public-import-global")
                             .label("Global account")

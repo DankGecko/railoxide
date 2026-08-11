@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui_component::{Sizable, WindowExt, alert::Alert, button::ButtonVariants, input::InputEvent};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::vault::{VaultError, WalletMetadataBundle, WalletSource};
 use zeroize::Zeroizing;
@@ -132,7 +132,7 @@ impl Render for KeyExportPasswordDialogContent {
             .flex_col()
             .gap_3()
             .child(app_muted_text(key_export_password_prompt_copy(self.kind)).whitespace_normal())
-            .child(app_input(&self.password_input))
+            .child(app_masked_input(&self.password_input, false))
             .when_some(self.error.as_ref(), |this, error| {
                 this.child(
                     app_muted_text(error.to_string())

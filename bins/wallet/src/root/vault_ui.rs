@@ -18,7 +18,8 @@ use gpui_component::{
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
-    app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
+    app_button, app_button_base, app_button_label, app_input, app_masked_input, app_muted_text,
+    app_strong_text,
 };
 #[cfg(feature = "hardware")]
 use ui::theme::APP_MONO_FONT_FAMILY;
@@ -219,8 +220,8 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        body.child(app_input(&self.new_password_input))
-            .child(app_input(&self.confirm_password_input))
+        body.child(app_masked_input(&self.new_password_input, false))
+            .child(app_masked_input(&self.confirm_password_input, false))
             .child(
                 app_button("create-wallet-vault", "Create vault")
                     .primary()
@@ -327,19 +328,22 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        body.child(app_input(&self.unlock_password_input).disabled(self.unlock_in_progress))
-            .child(
-                app_button("unlock-wallet-vault", "Unlock vault")
-                    .primary()
-                    .w_full()
-                    .loading(self.unlock_in_progress)
-                    .disabled(self.unlock_in_progress)
-                    .on_click(move |_event, window, cx| {
-                        submit_root.update(cx, |root, cx| {
-                            root.unlock_vault_from_input(window, cx);
-                        });
-                    }),
-            )
+        body.child(app_masked_input(
+            &self.unlock_password_input,
+            self.unlock_in_progress,
+        ))
+        .child(
+            app_button("unlock-wallet-vault", "Unlock vault")
+                .primary()
+                .w_full()
+                .loading(self.unlock_in_progress)
+                .disabled(self.unlock_in_progress)
+                .on_click(move |_event, window, cx| {
+                    submit_root.update(cx, |root, cx| {
+                        root.unlock_vault_from_input(window, cx);
+                    });
+                }),
+        )
     }
 
     fn render_wallet_setup(&self, root: Entity<Self>) -> gpui::AnyElement {
@@ -441,7 +445,7 @@ impl WalletRoot {
 
         body = body.child(app_input(&self.wallet_name_input));
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
-            body = body.child(app_input(&self.add_wallet_password_input));
+            body = body.child(app_masked_input(&self.add_wallet_password_input, false));
         }
 
         body.child(
@@ -515,7 +519,7 @@ impl WalletRoot {
         body.child(app_input(&self.wallet_name_input))
             .when(
                 matches!(self.vault_state, VaultState::ViewUnlocked),
-                |this| this.child(app_input(&self.add_wallet_password_input)),
+                |this| this.child(app_masked_input(&self.add_wallet_password_input, false)),
             )
             .child(app_input(&self.import_mnemonic_input))
             .child(
@@ -572,8 +576,10 @@ impl WalletRoot {
             matches!(self.vault_state, VaultState::ViewUnlocked),
             |this| {
                 this.child(
-                    app_input(&self.add_wallet_password_input)
-                        .disabled(self.hardware_wallet_creation_in_progress),
+                    app_masked_input(
+                        &self.add_wallet_password_input,
+                        self.hardware_wallet_creation_in_progress,
+                    ),
                 )
             },
         )
@@ -717,8 +723,10 @@ impl WalletRoot {
         content = content
             .when(requires_password, |this| {
                 this.child(
-                    app_input(&self.hardware_profile_password_input)
-                        .disabled(self.hardware_profile_unlock.in_progress),
+                    app_masked_input(
+                        &self.hardware_profile_password_input,
+                        self.hardware_profile_unlock.in_progress,
+                    ),
                 )
             })
             .when(device_kind == HardwareDeviceKind::Trezor, |this| {
@@ -804,8 +812,10 @@ impl WalletRoot {
                         )
                         .when(mode == TrezorPassphraseMode::EnterInApp, |this| {
                             this.child(
-                                app_input(&self.trezor_app_passphrase_input)
-                                    .disabled(self.hardware_profile_unlock.in_progress),
+                                app_masked_input(
+                                    &self.trezor_app_passphrase_input,
+                                    self.hardware_profile_unlock.in_progress,
+                                ),
                             )
                         }),
                 )
@@ -1234,8 +1244,10 @@ impl WalletRoot {
                                     "If the Trezor session expires, re-enter the app passphrase here before opening or creating accounts.",
                                 ).whitespace_normal())
                                 .child(
-                                    app_input(&self.trezor_app_passphrase_input)
-                                        .disabled(self.hardware_profile_unlock.in_progress),
+                                    app_masked_input(
+                                        &self.trezor_app_passphrase_input,
+                                        self.hardware_profile_unlock.in_progress,
+                                    ),
                                 ),
                         )
                     })
