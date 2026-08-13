@@ -1,11 +1,12 @@
 use super::{
     BroadcasterPreferenceEntry, DecodedWalletMetadata, EncryptedRecord, HardwareProfileMetadata,
     HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HmacKeyInit, HmacSha256, KEY_LEN,
-    Mac, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret,
-    PublicAddressBookEntry, RecordKind, SecretKey, VaultError, WalletChainMetadataBundle,
-    WalletConnectRelayIdentity, WalletConnectSessionRecord, WalletMetadataBundle,
-    WalletMetadataWire, WalletPrivateRecordKind, WalletSpendBundle, WalletViewBundle, Zeroizing,
-    decrypt_payload, decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
+    Mac, PrivateAddressBookEntry, ProtectedSoftwareSeedSession, PublicAccountMetadata,
+    PublicAccountSecret, PublicAddressBookEntry, RecordKind, SOFTWARE_CONTEXT_SEED_LEN, SecretKey,
+    SoftwareSeedSessionBinding, VaultError, WalletChainMetadataBundle, WalletConnectRelayIdentity,
+    WalletConnectSessionRecord, WalletMetadataBundle, WalletMetadataWire, WalletPrivateRecordKind,
+    WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload, decrypt_serialized,
+    derive_context_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -113,20 +114,31 @@ impl ViewUnlock {
         let missing_display_order = wire.display_order.is_none();
         let missing_lifecycle_fields =
             wire.source.is_none() || wire.status.is_none() || missing_display_order;
+        let source = wire.source.unwrap_or_default();
+        let missing_software_context = wire.software_context.is_none()
+            && !source.is_hardware_derived()
+            && wire.hardware_descriptor.is_none()
+            && wire.hardware_account.is_none();
+        let metadata = WalletMetadataBundle {
+            wallet_uuid: wire.wallet_uuid,
+            label: wire.label,
+            derivation_index: wire.derivation_index,
+            source,
+            status: wire.status.unwrap_or_default(),
+            display_order: wire.display_order.unwrap_or_default(),
+            hardware_descriptor: wire.hardware_descriptor,
+            hardware_account: wire.hardware_account,
+            pending_create_new_chain_ids: wire.pending_create_new_chain_ids,
+            software_context: wire.software_context,
+        };
+        if !missing_software_context {
+            metadata.validate()?;
+        }
         Ok(DecodedWalletMetadata {
-            metadata: WalletMetadataBundle {
-                wallet_uuid: wire.wallet_uuid,
-                label: wire.label,
-                derivation_index: wire.derivation_index,
-                source: wire.source.unwrap_or_default(),
-                status: wire.status.unwrap_or_default(),
-                display_order: wire.display_order.unwrap_or_default(),
-                hardware_descriptor: wire.hardware_descriptor,
-                hardware_account: wire.hardware_account,
-                pending_create_new_chain_ids: wire.pending_create_new_chain_ids,
-            },
+            metadata,
             missing_lifecycle_fields,
             missing_display_order,
+            missing_software_context,
         })
     }
 
@@ -394,6 +406,26 @@ impl SpendUnlock {
         record: &EncryptedRecord,
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         decrypt_payload(&self.spend_dek, kind, record_id, record)
+    }
+
+    pub fn seal_software_seed_session(
+        &self,
+        binding: SoftwareSeedSessionBinding,
+        seed: &[u8],
+    ) -> Result<ProtectedSoftwareSeedSession, VaultError> {
+        if seed.len() != SOFTWARE_CONTEXT_SEED_LEN {
+            return Err(VaultError::InvalidSoftwareSeedLength);
+        }
+        let encrypted_seed = encrypt_payload(
+            &self.spend_dek,
+            RecordKind::SoftwareContextSeed,
+            &binding.record_id(),
+            seed,
+        )?;
+        Ok(ProtectedSoftwareSeedSession::from_parts(
+            binding,
+            encrypted_seed,
+        ))
     }
 
     pub fn encrypt_spend_bundle(

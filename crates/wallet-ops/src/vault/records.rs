@@ -2,7 +2,7 @@ use super::{
     ADDITIONAL_WALLET_LABEL_PREFIX, Address, BROADCASTER_BANNED_PREFIX,
     BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, HARDWARE_PROFILE_PREFIX,
     HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareProfileMetadata,
-    HardwareWalletAccountIndexReservation, KEY_LEN, MnemonicBuilder, PRIMARY_WALLET_LABEL,
+    HardwareWalletAccountIndexReservation, KEY_LEN, KeyError, PRIMARY_WALLET_LABEL,
     PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX,
     PUBLIC_ADDRESS_BOOK_PREFIX, PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata,
     PublicAccountScope, PublicAccountSecret, PublicAccountSource, PublicAccountStatus,
@@ -11,11 +11,51 @@ use super::{
     WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
     WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
     WALLETCONNECT_SESSION_PREFIX, WalletCacheError, WalletConnectRelayIdentity,
-    WalletConnectSessionRecord, WalletMetadataBundle, WalletUtxo, Zeroizing,
+    WalletConnectSessionRecord, WalletKeys, WalletMetadataBundle, WalletUtxo, Zeroize, Zeroizing,
     bip39_mnemonic_from_entropy, generate_opaque_id,
 };
 
+use coins_bip32::prelude::{Parent, XPriv};
+
 use crate::parse_railgun_recipient;
+
+pub fn bip39_seed_from_mnemonic(
+    mnemonic: &str,
+    passphrase: &str,
+) -> Result<Zeroizing<[u8; 64]>, VaultError> {
+    let passphrase = Zeroizing::new(passphrase.to_owned());
+    bip39_seed_from_mnemonic_zeroizing(mnemonic, &passphrase)
+}
+
+pub(super) fn bip39_seed_from_mnemonic_zeroizing(
+    mnemonic: &str,
+    passphrase: &Zeroizing<String>,
+) -> Result<Zeroizing<[u8; 64]>, VaultError> {
+    let mnemonic =
+        bip39::Mnemonic::parse(mnemonic).map_err(|_| VaultError::Key(KeyError::InvalidMnemonic))?;
+    Ok(Zeroizing::new(mnemonic.to_seed(passphrase.as_str())))
+}
+
+pub(super) fn wallet_keys_from_seed(
+    seed: &[u8; 64],
+    derivation_index: u32,
+) -> Result<WalletKeys, VaultError> {
+    Ok(WalletKeys::from_seed(seed, derivation_index)?)
+}
+
+pub fn wallet_keys_from_mnemonic(
+    mnemonic: &str,
+    passphrase: &str,
+    derivation_index: u32,
+) -> Result<WalletKeys, VaultError> {
+    let seed = bip39_seed_from_mnemonic(mnemonic, passphrase)?;
+    wallet_keys_from_seed(&seed, derivation_index)
+}
+
+pub(super) fn zeroize_wallet_keys(wallet: &mut WalletKeys) {
+    wallet.spending_private_key.zeroize();
+    wallet.viewing.viewing_private_key.zeroize();
+}
 
 pub(super) fn wallet_view_record_key(wallet_id: &str) -> String {
     format!("{WALLET_VIEW_PREFIX}{wallet_id}")
@@ -128,6 +168,7 @@ pub(super) fn wallet_metadata_record_entry(
     view: &ViewUnlock,
     metadata: &WalletMetadataBundle,
 ) -> Result<(String, Vec<u8>), VaultError> {
+    metadata.validate()?;
     let key = wallet_metadata_record_key(&metadata.wallet_uuid);
     let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
     record.to_record_entry(key)
@@ -677,6 +718,31 @@ pub(super) fn initial_derived_public_account(
     })
 }
 
+pub(super) fn initial_derived_public_account_from_seed(
+    wallet_uuid: &str,
+    seed: &[u8; 64],
+    existing_accounts: &[PublicAccountMetadata],
+) -> Result<PublicAccountMetadata, VaultError> {
+    let address = derive_public_evm_address_from_seed(seed, 0)?;
+    let scope = PublicAccountScope::PrivateWallet {
+        wallet_uuid: wallet_uuid.to_owned(),
+    };
+    ensure_public_account_address_available(existing_accounts, address, &scope, wallet_uuid)?;
+    Ok(PublicAccountMetadata {
+        public_account_uuid: generate_opaque_id()?,
+        address,
+        label: Some(public_account_default_label(
+            next_public_account_label_number(existing_accounts, wallet_uuid),
+        )),
+        source: PublicAccountSource::Derived,
+        scope,
+        derivation_index: Some(0),
+        hardware_descriptor: None,
+        status: PublicAccountStatus::Active,
+        display_order: next_public_account_display_order(existing_accounts)?,
+    })
+}
+
 pub(super) fn next_public_account_label_number(
     metadata: &[PublicAccountMetadata],
     wallet_uuid: &str,
@@ -697,22 +763,63 @@ pub fn derive_public_evm_private_key_from_entropy(
     derivation_index: u32,
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
     let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(entropy)?);
-    derive_public_evm_private_key_from_mnemonic(&mnemonic, derivation_index)
+    derive_public_evm_private_key_from_mnemonic_with_passphrase(&mnemonic, "", derivation_index)
 }
 
 pub fn derive_public_evm_private_key_from_mnemonic(
     mnemonic: &str,
     derivation_index: u32,
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-    let signer = MnemonicBuilder::from_phrase(mnemonic)
-        .index(derivation_index)
-        .map_err(|_| VaultError::PublicEvmKeyDerivation)?
-        .build()
+    derive_public_evm_private_key_from_mnemonic_with_passphrase(mnemonic, "", derivation_index)
+}
+
+pub fn derive_public_evm_private_key_from_mnemonic_with_passphrase(
+    mnemonic: &str,
+    passphrase: &str,
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let seed = bip39_seed_from_mnemonic(mnemonic, passphrase)?;
+    derive_public_evm_private_key_from_seed(&seed, derivation_index)
+}
+
+pub(super) fn derive_public_evm_private_key_from_seed(
+    seed: &[u8; 64],
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let root = XPriv::root_from_seed(seed, None).map_err(|_| VaultError::PublicEvmKeyDerivation)?;
+    let child = root
+        .derive_child(coins_bip32::BIP32_HARDEN + 44)
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN + 60))
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN))
+        .and_then(|key| key.derive_child(0))
+        .and_then(|key| key.derive_child(derivation_index))
         .map_err(|_| VaultError::PublicEvmKeyDerivation)?;
-    let bytes = signer.to_bytes();
+    let signing_key: &coins_bip32::ecdsa::SigningKey = child.as_ref();
+    let bytes = signing_key.to_bytes();
     let mut private_key = [0u8; KEY_LEN];
     private_key.copy_from_slice(bytes.as_slice());
     Ok(Zeroizing::new(private_key))
+}
+
+pub(super) fn derive_public_evm_address_from_seed(
+    seed: &[u8; 64],
+    derivation_index: u32,
+) -> Result<Address, VaultError> {
+    let private_key = derive_public_evm_private_key_from_seed(seed, derivation_index)?;
+    public_evm_address_from_private_key(&private_key)
+}
+
+pub fn derive_public_evm_address_from_mnemonic_with_passphrase(
+    mnemonic: &str,
+    passphrase: &str,
+    derivation_index: u32,
+) -> Result<Address, VaultError> {
+    let private_key = derive_public_evm_private_key_from_mnemonic_with_passphrase(
+        mnemonic,
+        passphrase,
+        derivation_index,
+    )?;
+    public_evm_address_from_private_key(&private_key)
 }
 
 pub fn derive_public_evm_address_from_entropy(

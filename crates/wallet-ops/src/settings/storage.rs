@@ -1,7 +1,7 @@
 use super::{
-    DEFAULT_AUTO_LOCK_TIMEOUT_SECS, DbStore, WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION,
-    WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WalletSettings, WalletSettingsError,
-    WalletUiState, WalletUiStateError,
+    DEFAULT_AUTO_LOCK_TIMEOUT_SECS, DbStore, RememberedWalletKind, WALLET_SETTINGS_KEY,
+    WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WalletSettings,
+    WalletSettingsError, WalletUiState, WalletUiStateError,
 };
 
 /// Loads and migrates a supported settings record without requiring semantic validity.
@@ -41,8 +41,14 @@ pub fn load_wallet_ui_state(store: &DbStore) -> Result<WalletUiState, WalletUiSt
         return Ok(WalletUiState::default());
     };
 
-    match decode_wallet_ui_state(&payload) {
-        Ok(state) => Ok(state),
+    match decode_wallet_ui_state_with_migration(&payload) {
+        Ok((state, migrated)) => {
+            if migrated {
+                let payload = encode_wallet_ui_state(&state)?;
+                store.put_app_settings_record(WALLET_UI_STATE_KEY, &payload)?;
+            }
+            Ok(state)
+        }
         Err(
             error @ (WalletUiStateError::Decode(_) | WalletUiStateError::UnsupportedVersion { .. }),
         ) => {
@@ -104,11 +110,23 @@ pub fn encode_wallet_ui_state(state: &WalletUiState) -> Result<Vec<u8>, WalletUi
 }
 
 pub fn decode_wallet_ui_state(data: &[u8]) -> Result<WalletUiState, WalletUiStateError> {
-    let state: WalletUiState = rmp_serde::from_slice(data)?;
-    if state.version != WALLET_UI_STATE_VERSION {
-        return Err(WalletUiStateError::UnsupportedVersion {
-            version: state.version,
-        });
-    }
-    Ok(state)
+    decode_wallet_ui_state_with_migration(data).map(|(state, _migrated)| state)
+}
+
+fn decode_wallet_ui_state_with_migration(
+    data: &[u8],
+) -> Result<(WalletUiState, bool), WalletUiStateError> {
+    let mut state: WalletUiState = rmp_serde::from_slice(data)?;
+    let migrated = match state.version {
+        WALLET_UI_STATE_VERSION => false,
+        1 => {
+            state.version = WALLET_UI_STATE_VERSION;
+            state.last_wallet_kind = RememberedWalletKind::default();
+            true
+        }
+        version => {
+            return Err(WalletUiStateError::UnsupportedVersion { version });
+        }
+    };
+    Ok((state, migrated))
 }

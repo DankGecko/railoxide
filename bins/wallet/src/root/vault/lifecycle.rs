@@ -1,17 +1,92 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
+use super::super::chain_load::WalletSyncLifecycleCleanupWaitGroup;
 #[cfg(not(feature = "hardware"))]
 use super::hardware_device_wallet_select_label;
 use super::{
     Arc, BroadcasterActivityTab, ChainUtxoState, Context, DesktopViewSession, ParentElement,
-    SearchableVec, Styled, VaultError, VaultState, ViewUnlock, WalletMetadataBundle, WalletRoot,
-    WalletSetupMode, WalletTab, Window, WindowExt, Zeroizing, app_strong_text,
-    default_wallet_label_for_metadata, dialog_content_max_height, dialog_max_height,
-    hardware_device_kind_from_wallet_select_value, px, scrollable_dialog_content,
-    secondary_dialog_content_width, vault_error_kind, vault_error_message,
-    wallet_options_from_metadata, wallet_select_items_from_metadata,
-    wallet_select_value_for_selected_wallet,
+    PendingSoftwareProfileOpen, RememberedWalletKind, SearchableVec, Styled, VaultError,
+    VaultState, ViewUnlock, WalletMetadataBundle, WalletOption, WalletRoot, WalletSetupMode,
+    WalletTab, Window, WindowExt, Zeroizing, app_strong_text, default_wallet_label_for_metadata,
+    dialog_content_max_height, dialog_max_height, hardware_device_kind_from_wallet_select_value,
+    px, scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
+    vault_error_message, visible_wallet_metadata, wallet_options_from_metadata,
+    wallet_select_items_from_metadata, wallet_select_value_for_selected_wallet,
 };
+
+const PENDING_SOFTWARE_PROFILE_OPEN_TIMEOUT: Duration = Duration::from_mins(5);
+
+pub(super) const fn pending_software_profile_open_timeout_is_current(
+    captured_lifetime_generation: u64,
+    current_lifetime_generation: u64,
+    is_pending: bool,
+) -> bool {
+    // The timeout belongs to the pending lifetime, even while an operation owns its payload.
+    is_pending && captured_lifetime_generation == current_lifetime_generation
+}
+
+struct WalletContextInstallation {
+    session: Arc<DesktopViewSession>,
+    metadata: Vec<WalletMetadataBundle>,
+    created_wallet_init_policy: wallet_ops::CreatedWalletChainInitPolicy,
+    protected_seed_session: Option<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+    active_wallet_generation: u64,
+    selected_chain: u64,
+    #[cfg(feature = "hardware")]
+    active_hardware_profile: Option<HardwareProfileMetadata>,
+    cleanup: WalletSyncLifecycleCleanupWaitGroup,
+}
+
+pub(in crate::root) const fn wallet_replacement_finalize_is_admitted(
+    captured_wallet_generation: u64,
+    current_wallet_generation: u64,
+    captured_chain: u64,
+    current_chain: u64,
+    deleting_wallet: bool,
+    switching_wallet: bool,
+) -> bool {
+    !deleting_wallet
+        && captured_wallet_generation == current_wallet_generation
+        && captured_chain == current_chain
+        && switching_wallet
+}
+
+pub(super) fn pending_profile_result_is_current(
+    captured_operation_generation: u64,
+    current_operation_generation: u64,
+    captured_wallet_generation: u64,
+    current_wallet_generation: u64,
+    captured_base_profile_uuid: &str,
+    current_base_profile_uuid: Option<&str>,
+    selected_wallet_id: Option<&str>,
+    captured_chain: u64,
+    current_chain: u64,
+    is_pending: bool,
+) -> bool {
+    is_pending
+        && captured_operation_generation == current_operation_generation
+        && captured_wallet_generation == current_wallet_generation
+        && current_base_profile_uuid == Some(captured_base_profile_uuid)
+        && selected_wallet_id.is_none()
+        && captured_chain == current_chain
+}
+
+pub(super) fn clear_wallet_context_visibility<T>(
+    view_session: &mut Option<Arc<T>>,
+    selected_wallet_id: &mut Option<Arc<str>>,
+    revealed_passphrase_context_id: &mut Option<Arc<str>>,
+    wallet_metadata: &mut Vec<WalletMetadataBundle>,
+    wallet_options: &mut Vec<WalletOption>,
+    public_accounts: &mut Vec<wallet_ops::vault::PublicAccountMetadata>,
+) {
+    *view_session = None;
+    *selected_wallet_id = None;
+    *revealed_passphrase_context_id = None;
+    wallet_metadata.clear();
+    wallet_options.clear();
+    public_accounts.clear();
+}
 
 pub(in crate::root) const fn vault_lock_is_allowed(
     maintenance_idle: bool,
@@ -165,14 +240,15 @@ impl WalletRoot {
                     return;
                 }
                 match result {
-                    Ok(Ok(session)) => root.install_view_session(session, metadata, window, cx),
+                    Ok(Ok(session)) => root.install_view_session(session, &metadata, window, cx),
                     Ok(Err(error)) => {
                         root.handle_vault_error(&error, cx);
                         root.sync_wallet_select(window, cx);
                     }
                     Err(error) => {
+                        tracing::warn!(%error, "wallet view-session task failed");
                         root.set_vault_error(
-                            format!("Failed to switch wallet: {error}").as_str(),
+                            "Failed to open wallet. See logs for non-sensitive diagnostics.",
                             cx,
                         );
                         root.sync_wallet_select(window, cx);
@@ -217,14 +293,15 @@ impl WalletRoot {
                     return;
                 }
                 match result {
-                    Ok(Ok(session)) => root.install_view_session(session, metadata, window, cx),
+                    Ok(Ok(session)) => root.install_view_session(session, &metadata, window, cx),
                     Ok(Err(error)) => {
                         root.handle_vault_error(&error, cx);
                         root.sync_wallet_select(window, cx);
                     }
                     Err(error) => {
+                        tracing::warn!(%error, "wallet view-session task failed");
                         root.set_vault_error(
-                            format!("Failed to open wallet: {error}").as_str(),
+                            "Failed to open wallet. See logs for non-sensitive diagnostics.",
                             cx,
                         );
                         root.sync_wallet_select(window, cx);
@@ -259,8 +336,10 @@ impl WalletRoot {
                 return;
             }
         };
-        self.wallet_metadata.clone_from(&metadata);
-        self.wallet_options = wallet_options_from_metadata(metadata.clone());
+        let visible_metadata =
+            visible_wallet_metadata(&metadata, self.revealed_passphrase_context_id.as_deref());
+        self.wallet_metadata.clone_from(&visible_metadata);
+        self.wallet_options = wallet_options_from_metadata(visible_metadata);
 
         if self.selected_wallet_id.as_deref() != Some(wallet_id) {
             self.sync_wallet_select(window, cx);
@@ -277,7 +356,7 @@ impl WalletRoot {
             return;
         };
         match store.load_view_session(password, next_wallet_id.as_ref()) {
-            Ok(session) => self.install_view_session(session, metadata, window, cx),
+            Ok(session) => self.install_view_session(session, &metadata, window, cx),
             Err(error) => self.handle_vault_error(&error, cx),
         }
     }
@@ -285,7 +364,7 @@ impl WalletRoot {
     pub(super) fn install_view_session(
         &mut self,
         session: DesktopViewSession,
-        metadata: Vec<WalletMetadataBundle>,
+        metadata: &[WalletMetadataBundle],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -302,7 +381,7 @@ impl WalletRoot {
     pub(in crate::root) fn install_view_session_after_management(
         &mut self,
         session: DesktopViewSession,
-        metadata: Vec<WalletMetadataBundle>,
+        metadata: &[WalletMetadataBundle],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -316,13 +395,34 @@ impl WalletRoot {
         );
     }
 
+    pub(super) fn install_verified_software_context(
+        &mut self,
+        session: DesktopViewSession,
+        metadata: &[WalletMetadataBundle],
+        protected_seed_session: Option<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.begin_view_session_installation(
+            session,
+            metadata,
+            true,
+            wallet_ops::CreatedWalletChainInitPolicy::Resumed,
+            protected_seed_session,
+            window,
+            cx,
+        );
+    }
+
     #[cfg(feature = "hardware")]
-    fn active_hardware_profile_for_wallet(&self) -> Option<HardwareProfileMetadata> {
-        let selected_wallet_id = self.selected_wallet_id.as_deref()?;
-        let account = self
-            .wallet_metadata
+    fn active_hardware_profile_for_wallet(
+        &self,
+        wallet_id: &str,
+        metadata: &[WalletMetadataBundle],
+    ) -> Option<HardwareProfileMetadata> {
+        let account = metadata
             .iter()
-            .find(|wallet| wallet.wallet_uuid == selected_wallet_id)
+            .find(|wallet| wallet.wallet_uuid == wallet_id)
             .and_then(|wallet| wallet.hardware_account.as_ref())?;
 
         self.hardware_profile_unlock
@@ -341,9 +441,30 @@ impl WalletRoot {
     fn install_view_session_with_dialog_policy(
         &mut self,
         session: DesktopViewSession,
-        metadata: Vec<WalletMetadataBundle>,
+        metadata: &[WalletMetadataBundle],
         close_dialogs: bool,
         created_wallet_init_policy: wallet_ops::CreatedWalletChainInitPolicy,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.begin_view_session_installation(
+            session,
+            metadata,
+            close_dialogs,
+            created_wallet_init_policy,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn begin_view_session_installation(
+        &mut self,
+        session: DesktopViewSession,
+        metadata: &[WalletMetadataBundle],
+        close_dialogs: bool,
+        created_wallet_init_policy: wallet_ops::CreatedWalletChainInitPolicy,
+        protected_seed_session: Option<wallet_ops::vault::ProtectedSoftwareSeedSession>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -351,27 +472,179 @@ impl WalletRoot {
             self.sync_wallet_select(window, cx);
             return;
         }
+        #[cfg(feature = "hardware")]
+        let active_hardware_profile =
+            self.active_hardware_profile_for_wallet(session.wallet_id(), metadata);
+        self.clear_protected_software_seed_session(cx);
         self.supersede_wallet_sessions();
-        let vault_view_unlock = Arc::new(session.clone_vault_view_unlock());
-        let session = Arc::new(session);
-        let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
+        self.pending_software_profile_open = None;
+        self.pending_software_profile_base_profile_uuid = None;
+        self.invalidate_pending_profile_open_tokens();
         if close_dialogs {
             window.close_all_dialogs(cx);
         }
         self.advance_active_wallet_generation();
-        self.view_session = Some(session);
+        clear_wallet_context_visibility(
+            &mut self.view_session,
+            &mut self.selected_wallet_id,
+            &mut self.revealed_passphrase_context_id,
+            &mut self.wallet_metadata,
+            &mut self.wallet_options,
+            &mut self.public_accounts,
+        );
+        self.vault_view_unlock = None;
+        self.vault_state = VaultState::SwitchingWallet;
+        self.wallet_setup_mode = WalletSetupMode::Choose;
+        self.focus_vault_input_on_render = false;
+        self.setup_password = None;
+        self.generated_seed = None;
+        self.clear_key_export_dialog_state(window, cx);
+        #[cfg(feature = "hardware")]
+        {
+            self.active_hardware_profile = None;
+            self.hardware_profile_unlock = HardwareProfileUnlockState::default();
+            self.clear_hardware_profile_sensitive_inputs(window, cx);
+        }
+        self.hardware_wallet_creation_in_progress = false;
+        self.hardware_wallet_creation_generation =
+            self.hardware_wallet_creation_generation.wrapping_add(1);
+        self.hardware_wallet_creation_intent = None;
+        self.clear_hardware_wallet_restore_account_index(window, cx);
+        self.vault_error = None;
+        self.reset_wallet_scoped_state(cx);
+        self.private_address_book.clear();
+        self.public_address_book.clear();
+        self.sync_wallet_select(window, cx);
+        cx.notify();
+
+        let installation = WalletContextInstallation {
+            session: Arc::new(session),
+            metadata: metadata.to_vec(),
+            created_wallet_init_policy,
+            protected_seed_session,
+            active_wallet_generation: self.active_wallet_generation,
+            selected_chain: self.selected_chain,
+            #[cfg(feature = "hardware")]
+            active_hardware_profile,
+            cleanup: self.wallet_sync_cleanup_wait_group(),
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let cleanup_result = installation
+                .cleanup
+                .clone()
+                .shutdown_for_wallet_replacement()
+                .await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                let installation = installation;
+                if !wallet_replacement_finalize_is_admitted(
+                    installation.active_wallet_generation,
+                    root.active_wallet_generation,
+                    installation.selected_chain,
+                    root.selected_chain,
+                    root.manage_wallets.deleting_wallet_id.is_some(),
+                    root.view_session.is_none()
+                        && root.vault_view_unlock.is_none()
+                        && matches!(root.vault_state, VaultState::SwitchingWallet),
+                ) {
+                    return;
+                }
+                let report = match cleanup_result {
+                    Ok(report) => report,
+                    Err(error) => {
+                        tracing::warn!(%error, "wallet replacement sync cleanup failed");
+                        root.set_wallet_replacement_error(
+                            "Previous wallet sync cleanup could not be completed. Retry the wallet replacement before continuing.",
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                if report.failed_startup_tasks != 0 {
+                    root.set_wallet_replacement_error(
+                        "Previous wallet sync cleanup failed. Retry the wallet replacement.",
+                        cx,
+                    );
+                    return;
+                }
+                root.finish_view_session_installation(installation, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_view_session_installation(
+        &mut self,
+        installation: WalletContextInstallation,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let WalletContextInstallation {
+            session,
+            metadata,
+            created_wallet_init_policy,
+            protected_seed_session,
+            active_wallet_generation: _,
+            selected_chain: _,
+            #[cfg(feature = "hardware")]
+            active_hardware_profile,
+            cleanup: _,
+        } = installation;
+        let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
+        let vault_view_unlock = Arc::new(session.clone_vault_view_unlock());
+        self.invalidate_pending_profile_open_tokens();
+        let visible_metadata = visible_wallet_metadata(&metadata, Some(wallet_id.as_ref()));
+        self.revealed_passphrase_context_id = visible_metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == wallet_id.as_ref())
+            .and_then(|metadata| {
+                metadata
+                    .software_context
+                    .as_ref()
+                    .filter(|context| {
+                        context.kind == wallet_ops::vault::WalletSoftwareContextKind::Passphrase
+                    })
+                    .map(|_| Arc::clone(&wallet_id))
+            });
+        self.view_session = Some(Arc::clone(&session));
         self.install_vault_view_unlock(vault_view_unlock);
-        self.wallet_metadata = metadata;
+        self.wallet_metadata = visible_metadata;
         self.wallet_options = wallet_options_from_metadata(self.wallet_metadata.clone());
         self.selected_wallet_id = Some(Arc::clone(&wallet_id));
-        self.ui_state.last_wallet_id = Some(wallet_id.as_ref().to_owned());
+        let selected_metadata = self
+            .wallet_metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == wallet_id.as_ref());
+        if selected_metadata.is_some_and(|metadata| metadata.source.is_hardware_derived())
+            || session.hardware_profile_session().is_some()
+        {
+            self.ui_state.last_wallet_id = Some(wallet_id.as_ref().to_owned());
+            self.ui_state.last_wallet_kind = RememberedWalletKind::HardwareWallet;
+        } else {
+            self.ui_state.last_wallet_id = Some(
+                selected_metadata
+                    .and_then(|metadata| metadata.software_context.as_ref())
+                    .map_or_else(
+                        || wallet_id.as_ref().to_owned(),
+                        |context| context.base_profile_uuid.clone(),
+                    ),
+            );
+            self.ui_state.last_wallet_kind = RememberedWalletKind::SoftwareProfile;
+        }
         self.save_ui_state();
         #[cfg(feature = "hardware")]
         {
-            self.active_hardware_profile = self.active_hardware_profile_for_wallet();
+            self.active_hardware_profile = if selected_metadata
+                .is_some_and(|metadata| metadata.source.is_hardware_derived())
+                || session.hardware_profile_session().is_some()
+            {
+                active_hardware_profile
+            } else {
+                None
+            };
         }
         self.sync_wallet_select(window, cx);
         self.reset_wallet_scoped_state(cx);
+        self.protected_software_seed_session = protected_seed_session.map(Arc::new);
         self.reload_address_books(cx);
         self.reload_broadcaster_preferences(cx);
         self.reload_public_accounts(window, cx);
@@ -401,7 +674,9 @@ impl WalletRoot {
             Some(created_wallet_init_policy.sync_start_policy()),
             cx,
         );
-        self.initialize_created_wallet_chain_metadata(created_wallet_init_policy);
+        if created_wallet_init_policy != wallet_ops::CreatedWalletChainInitPolicy::Resumed {
+            self.initialize_created_wallet_chain_metadata(created_wallet_init_policy);
+        }
         cx.notify();
     }
 
@@ -428,7 +703,7 @@ impl WalletRoot {
     pub(super) fn enter_view_unlocked(
         &mut self,
         session: DesktopViewSession,
-        metadata: Vec<WalletMetadataBundle>,
+        metadata: &[WalletMetadataBundle],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -438,7 +713,7 @@ impl WalletRoot {
     pub(super) fn enter_new_wallet_view_unlocked(
         &mut self,
         session: DesktopViewSession,
-        metadata: Vec<WalletMetadataBundle>,
+        metadata: &[WalletMetadataBundle],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -491,13 +766,15 @@ impl WalletRoot {
 
     pub(in crate::root) fn enter_password_metadata_unlocked(
         &mut self,
-        metadata: Vec<WalletMetadataBundle>,
+        metadata: &[WalletMetadataBundle],
         vault_view_unlock: Arc<ViewUnlock>,
         setup_password: Option<Zeroizing<String>>,
+        pending_software_profile_open: Option<PendingSoftwareProfileOpen>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let active = wallet_options_from_metadata(metadata.clone());
+        self.clear_protected_software_seed_session(cx);
+        let active = wallet_options_from_metadata(metadata.to_owned());
         if active.is_empty() {
             if let Some(password) = setup_password {
                 self.set_default_wallet_name_from_password(password.as_str(), window, cx);
@@ -512,12 +789,19 @@ impl WalletRoot {
             return;
         }
 
+        if let Some(pending) = pending_software_profile_open {
+            self.enter_pending_software_profile_open(pending, window, cx);
+            return;
+        }
+
         window.close_all_dialogs(cx);
         self.advance_active_wallet_generation();
+        self.pending_software_profile_base_profile_uuid = None;
         self.view_session = None;
         self.install_vault_view_unlock(vault_view_unlock);
-        self.wallet_metadata = metadata;
-        self.wallet_options = active;
+        self.revealed_passphrase_context_id = None;
+        self.wallet_metadata = visible_wallet_metadata(metadata, None);
+        self.wallet_options = wallet_options_from_metadata(self.wallet_metadata.clone());
         self.selected_wallet_id = None;
         self.sync_wallet_select(window, cx);
         self.shutdown_wallet_session_store();
@@ -543,6 +827,151 @@ impl WalletRoot {
         cx.notify();
     }
 
+    pub(super) fn enter_pending_software_profile_open(
+        &mut self,
+        mut pending: PendingSoftwareProfileOpen,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        self.pending_software_profile_open_lifetime_generation = self
+            .pending_software_profile_open_lifetime_generation
+            .wrapping_add(1);
+        self.pending_software_profile_open_operation_generation = self
+            .pending_software_profile_open_operation_generation
+            .wrapping_add(1);
+        pending.set_operation_generation(self.pending_software_profile_open_operation_generation);
+        self.pending_software_profile_base_profile_uuid =
+            Some(Arc::clone(&pending.base_profile_uuid));
+        self.pending_software_profile_open = Some(pending);
+        self.shutdown_wallet_session_store();
+        self.advance_active_wallet_generation();
+        self.clear_protected_software_seed_session(cx);
+        clear_wallet_context_visibility(
+            &mut self.view_session,
+            &mut self.selected_wallet_id,
+            &mut self.revealed_passphrase_context_id,
+            &mut self.wallet_metadata,
+            &mut self.wallet_options,
+            &mut self.public_accounts,
+        );
+        self.vault_view_unlock = None;
+        self.private_address_book.clear();
+        self.public_address_book.clear();
+        self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
+        self.broadcaster_preference_error = None;
+        self.reset_wallet_scoped_state(cx);
+        self.sync_wallet_select(window, cx);
+        self.setup_password = None;
+        self.generated_seed = None;
+        self.vault_error = None;
+        self.vault_state = VaultState::PendingSoftwareProfileOpen;
+        self.wallet_setup_mode = WalletSetupMode::Choose;
+        cx.notify();
+        self.schedule_pending_software_profile_open_timeout(window, cx);
+        let passphrase_open_ui = self.passphrase_open_ui.clone();
+        cx.defer_in(window, move |_root, window, cx| {
+            passphrase_open_ui.update(cx, |ui, cx| ui.focus_passphrase(window, cx));
+        });
+    }
+
+    fn schedule_pending_software_profile_open_timeout(
+        &self,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) {
+        let captured_lifetime_generation = self.pending_software_profile_open_lifetime_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(PENDING_SOFTWARE_PROFILE_OPEN_TIMEOUT)
+                .await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                if pending_software_profile_open_timeout_is_current(
+                    captured_lifetime_generation,
+                    root.pending_software_profile_open_lifetime_generation,
+                    matches!(root.vault_state, VaultState::PendingSoftwareProfileOpen),
+                ) {
+                    root.abandon_pending_software_profile_open(window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::root) fn pending_software_profile_open_stage(
+        &self,
+    ) -> Option<super::PendingSoftwareProfileOpenStage> {
+        self.pending_software_profile_open
+            .as_ref()
+            .map(PendingSoftwareProfileOpen::stage)
+    }
+
+    pub(in crate::root) fn pending_software_profile_open_base_label(&self) -> Option<&str> {
+        self.pending_software_profile_open
+            .as_ref()
+            .map(|pending| pending.base_metadata.label.as_str())
+    }
+
+    pub(super) fn pending_software_profile_open_is_current(
+        &self,
+        operation_generation: u64,
+        active_wallet_generation: u64,
+        selected_chain: u64,
+        base_profile_uuid: &str,
+    ) -> bool {
+        pending_profile_result_is_current(
+            operation_generation,
+            self.pending_software_profile_open_operation_generation,
+            active_wallet_generation,
+            self.active_wallet_generation,
+            base_profile_uuid,
+            self.pending_software_profile_base_profile_uuid.as_deref(),
+            self.selected_wallet_id.as_deref(),
+            selected_chain,
+            self.selected_chain,
+            matches!(self.vault_state, VaultState::PendingSoftwareProfileOpen),
+        )
+    }
+
+    pub(super) fn abandon_pending_software_profile_open(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.pending_software_profile_open = None;
+        self.pending_software_profile_base_profile_uuid = None;
+        self.invalidate_pending_profile_open_tokens();
+        self.shutdown_wallet_session_store();
+        self.clear_protected_software_seed_session(cx);
+        clear_wallet_context_visibility(
+            &mut self.view_session,
+            &mut self.selected_wallet_id,
+            &mut self.revealed_passphrase_context_id,
+            &mut self.wallet_metadata,
+            &mut self.wallet_options,
+            &mut self.public_accounts,
+        );
+        self.vault_view_unlock = None;
+        self.private_address_book.clear();
+        self.public_address_book.clear();
+        self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
+        self.broadcaster_preference_error = None;
+        self.reset_wallet_scoped_state(cx);
+        self.sync_wallet_select(window, cx);
+        self.vault_state = VaultState::UnlockVault;
+        self.focus_vault_input_on_render = true;
+        cx.notify();
+    }
+
+    pub(in crate::root) const fn invalidate_pending_profile_open_tokens(&mut self) {
+        self.pending_software_profile_open_operation_generation = self
+            .pending_software_profile_open_operation_generation
+            .wrapping_add(1);
+        self.pending_software_profile_open_lifetime_generation = self
+            .pending_software_profile_open_lifetime_generation
+            .wrapping_add(1);
+    }
+
     pub(in crate::root) fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if !vault_lock_is_allowed(
             self.maintenance_controller.read(cx).is_idle(),
@@ -554,10 +983,19 @@ impl WalletRoot {
         self.clear_private_broadcaster_progress_state();
         self.stop_waku();
         window.close_all_dialogs(cx);
-        self.clear_spend_authorization(cx);
+        self.clear_protected_software_seed_session(cx);
         self.view_session = None;
-        self.wallet_metadata.clear();
-        self.wallet_options.clear();
+        self.pending_software_profile_open = None;
+        self.pending_software_profile_base_profile_uuid = None;
+        self.invalidate_pending_profile_open_tokens();
+        clear_wallet_context_visibility(
+            &mut self.view_session,
+            &mut self.selected_wallet_id,
+            &mut self.revealed_passphrase_context_id,
+            &mut self.wallet_metadata,
+            &mut self.wallet_options,
+            &mut self.public_accounts,
+        );
         self.private_address_book.clear();
         self.public_address_book.clear();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
@@ -573,7 +1011,6 @@ impl WalletRoot {
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.active_broadcaster_tab = BroadcasterActivityTab::default();
         self.address_book_save_error = None;
-        self.selected_wallet_id = None;
         self.advance_active_wallet_generation();
         self.sync_wallet_select(window, cx);
         self.send_forms.clear();
@@ -629,5 +1066,142 @@ impl WalletRoot {
     ) {
         self.vault_error = Some(message.into());
         cx.notify();
+    }
+
+    fn set_wallet_replacement_error(&mut self, message: &'static str, cx: &mut Context<'_, Self>) {
+        self.vault_error = None;
+        self.vault_state = VaultState::Error(Arc::from(message));
+        self.focus_vault_input_on_render = false;
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        clear_wallet_context_visibility, pending_profile_result_is_current,
+        pending_software_profile_open_timeout_is_current, wallet_replacement_finalize_is_admitted,
+    };
+    use crate::root::WalletOption;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use wallet_ops::vault::{
+        PublicAccountMetadata, PublicAccountScope, PublicAccountSource, PublicAccountStatus,
+        WalletMetadataBundle, WalletSoftwareContext,
+    };
+
+    #[test]
+    fn pending_profile_timeout_ignores_stale_lifetime_or_state() {
+        assert!(pending_software_profile_open_timeout_is_current(7, 7, true));
+        assert!(!pending_software_profile_open_timeout_is_current(
+            7, 8, true
+        ));
+        assert!(!pending_software_profile_open_timeout_is_current(
+            7, 7, false
+        ));
+    }
+
+    #[test]
+    fn wallet_replacement_finalize_requires_current_switching_admission() {
+        assert!(wallet_replacement_finalize_is_admitted(
+            7, 7, 1, 1, false, true
+        ));
+        assert!(!wallet_replacement_finalize_is_admitted(
+            6, 7, 1, 1, false, true
+        ));
+        assert!(!wallet_replacement_finalize_is_admitted(
+            7, 7, 2, 1, false, true
+        ));
+        assert!(!wallet_replacement_finalize_is_admitted(
+            7, 7, 1, 1, true, true
+        ));
+        assert!(!wallet_replacement_finalize_is_admitted(
+            7, 7, 1, 1, false, false
+        ));
+    }
+
+    #[test]
+    fn pending_profile_result_rejects_every_replacement_boundary() {
+        let current = |operation, wallet, profile, selected, chain, pending| {
+            pending_profile_result_is_current(
+                operation,
+                7,
+                wallet,
+                11,
+                "base-profile",
+                profile,
+                selected,
+                chain,
+                1,
+                pending,
+            )
+        };
+
+        assert!(current(7, 11, Some("base-profile"), None, 1, true));
+        assert!(!current(6, 11, Some("base-profile"), None, 1, true));
+        assert!(!current(7, 10, Some("base-profile"), None, 1, true));
+        assert!(!current(7, 11, Some("other-profile"), None, 1, true));
+        assert!(!current(
+            7,
+            11,
+            Some("base-profile"),
+            Some("selected"),
+            1,
+            true
+        ));
+        assert!(!current(7, 11, Some("base-profile"), None, 2, true));
+        assert!(!current(7, 11, Some("base-profile"), None, 1, false));
+    }
+
+    #[test]
+    fn pending_context_cleanup_clears_visible_state() {
+        let mut view_session = Some(Arc::new(()));
+        let mut selected_wallet_id = Some(Arc::from("child"));
+        let mut revealed = Some(Arc::from("child"));
+        let mut metadata = vec![WalletMetadataBundle {
+            wallet_uuid: "child".to_owned(),
+            label: "Child".to_owned(),
+            derivation_index: 0,
+            source: wallet_ops::vault::WalletSource::Imported,
+            status: wallet_ops::vault::WalletStatus::Active,
+            display_order: 0,
+            hardware_descriptor: None,
+            hardware_account: None,
+            pending_create_new_chain_ids: BTreeSet::default(),
+            software_context: Some(WalletSoftwareContext::passphrase("base")),
+        }];
+        let mut options = vec![WalletOption {
+            wallet_id: Arc::from("child"),
+            source: wallet_ops::vault::WalletSource::Imported,
+        }];
+        let mut accounts = vec![PublicAccountMetadata {
+            public_account_uuid: "child-account".to_owned(),
+            address: alloy::primitives::Address::ZERO,
+            label: None,
+            source: PublicAccountSource::Derived,
+            scope: PublicAccountScope::PrivateWallet {
+                wallet_uuid: "child".to_owned(),
+            },
+            derivation_index: Some(0),
+            hardware_descriptor: None,
+            status: PublicAccountStatus::Active,
+            display_order: 0,
+        }];
+
+        clear_wallet_context_visibility(
+            &mut view_session,
+            &mut selected_wallet_id,
+            &mut revealed,
+            &mut metadata,
+            &mut options,
+            &mut accounts,
+        );
+
+        assert!(view_session.is_none());
+        assert!(selected_wallet_id.is_none());
+        assert!(revealed.is_none());
+        assert!(metadata.is_empty());
+        assert!(options.is_empty());
+        assert!(accounts.is_empty());
     }
 }

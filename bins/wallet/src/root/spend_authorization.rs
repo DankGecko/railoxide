@@ -32,6 +32,7 @@ use wallet_ops::hardware::{
 use wallet_ops::vault::{
     DesktopVaultStore, DesktopViewSession, HardwareProfileSession, VaultError,
 };
+use wallet_ops::vault::{SoftwareSeedSessionBinding, WalletSoftwareContextKind};
 use wallet_ops::{
     BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization, SponsoredAuthorizationLimit,
 };
@@ -48,7 +49,7 @@ use super::{
 };
 
 const SPEND_AUTHORIZATION_DIALOG_WIDTH: gpui::Pixels = px(560.0);
-const SPEND_AUTHORIZATION_SESSION_WARNING: &str = "This will allow on-chain spending from this vault without re-entering the password until you lock the vault or close the app. Only use this on a trusted device.";
+const SPEND_AUTHORIZATION_SESSION_WARNING: &str = "Spending remains authorized for the selected lifetime without re-entering the password. Only use this on a trusted device.";
 const SUMMARY_RECIPIENT_PREFIX_CHARS: usize = 8;
 const SUMMARY_RECIPIENT_SUFFIX_CHARS: usize = 8;
 const SUMMARY_RECIPIENT_SHORTEN_THRESHOLD_CHARS: usize = 28;
@@ -78,37 +79,76 @@ impl SpendAuthorizationLifetime {
             Self::FifteenMinutes => Some(Duration::from_mins(15)),
         }
     }
+
+    pub(super) const fn requires_reusable_authorization_warning(self) -> bool {
+        !matches!(self, Self::Once)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SpendAuthorizationScope {
+    base_profile_uuid: Arc<str>,
+    wallet_uuid: Arc<str>,
+    protected_seed_binding: Option<SoftwareSeedSessionBinding>,
+}
+
+impl SpendAuthorizationScope {
+    fn new(
+        base_profile_uuid: impl Into<Arc<str>>,
+        wallet_uuid: impl Into<Arc<str>>,
+        protected_seed_binding: Option<SoftwareSeedSessionBinding>,
+    ) -> Self {
+        Self {
+            base_profile_uuid: base_profile_uuid.into(),
+            wallet_uuid: wallet_uuid.into(),
+            protected_seed_binding,
+        }
+    }
 }
 
 pub(super) struct SpendAuthorizationCache {
     password: Zeroizing<String>,
+    scope: SpendAuthorizationScope,
     expires_at: Option<Instant>,
+}
+
+fn clear_protected_software_seed_session_state(
+    protected_software_seed_session: &mut Option<
+        Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+    >,
+    spend_authorization_cache: &mut Option<SpendAuthorizationCache>,
+) -> bool {
+    let cleared = protected_software_seed_session.take().is_some();
+    spend_authorization_cache.take().is_some() || cleared
 }
 
 impl SpendAuthorizationCache {
     fn new(
         password: Zeroizing<String>,
         lifetime: SpendAuthorizationLifetime,
+        scope: SpendAuthorizationScope,
         now: Instant,
     ) -> Option<Self> {
         match lifetime {
             SpendAuthorizationLifetime::Once => None,
             SpendAuthorizationLifetime::UntilVaultLock => Some(Self {
                 password,
+                scope,
                 expires_at: None,
             }),
             SpendAuthorizationLifetime::FiveMinutes
             | SpendAuthorizationLifetime::FifteenMinutes => {
                 lifetime.duration().map(|duration| Self {
                     password,
+                    scope,
                     expires_at: Some(now + duration),
                 })
             }
         }
     }
 
-    fn is_valid_at(&self, now: Instant) -> bool {
-        self.expires_at.is_none_or(|expires_at| now < expires_at)
+    fn is_valid_at(&self, scope: &SpendAuthorizationScope, now: Instant) -> bool {
+        self.scope == *scope && self.expires_at.is_none_or(|expires_at| now < expires_at)
     }
 }
 
@@ -611,7 +651,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                 self.lifetime,
             ))
             .when(
-                self.lifetime == SpendAuthorizationLifetime::UntilVaultLock,
+                self.lifetime.requires_reusable_authorization_warning(),
                 |this| {
                     this.child(
                         Alert::warning(
@@ -1002,12 +1042,12 @@ impl WalletRoot {
         if spend_authorization_can_use_cached_password(&summary)
             && let Some(password) = self.valid_spend_authorization_password(cx)
         {
-            self.continue_authorized_spend(
-                intent,
-                DesktopPrivateSpendAuthorization::VaultPassword(password),
-                window,
-                cx,
-            );
+            match self.desktop_spend_authorization(password) {
+                Ok(authorization) => {
+                    self.continue_authorized_spend(intent, authorization, window, cx);
+                }
+                Err(message) => self.set_vault_error(message, cx),
+            }
             return;
         }
 
@@ -1268,10 +1308,11 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> Option<Zeroizing<String>> {
         let now = Instant::now();
+        let scope = self.current_spend_authorization_scope();
         if self
             .spend_authorization_cache
             .as_ref()
-            .is_some_and(|authorization| authorization.is_valid_at(now))
+            .is_some_and(|authorization| authorization.is_valid_at(&scope, now))
         {
             return self
                 .spend_authorization_cache
@@ -1292,22 +1333,92 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let authorization = match self.desktop_spend_authorization(password.clone()) {
+            Ok(authorization) => authorization,
+            Err(message) => {
+                self.set_vault_error(message, cx);
+                return;
+            }
+        };
         self.spend_authorization_lifetime = lifetime;
-        self.spend_authorization_cache =
-            SpendAuthorizationCache::new(password.clone(), lifetime, Instant::now());
-        window.close_dialog(cx);
-        self.continue_authorized_spend(
-            intent,
-            DesktopPrivateSpendAuthorization::VaultPassword(password),
-            window,
-            cx,
+        self.spend_authorization_cache = SpendAuthorizationCache::new(
+            password,
+            lifetime,
+            self.current_spend_authorization_scope(),
+            Instant::now(),
         );
+        window.close_dialog(cx);
+        self.continue_authorized_spend(intent, authorization, window, cx);
     }
 
     pub(super) fn clear_spend_authorization(&mut self, cx: &mut Context<'_, Self>) {
         if self.spend_authorization_cache.take().is_some() {
             cx.notify();
         }
+    }
+
+    pub(super) fn clear_protected_software_seed_session(&mut self, cx: &mut Context<'_, Self>) {
+        if clear_protected_software_seed_session_state(
+            &mut self.protected_software_seed_session,
+            &mut self.spend_authorization_cache,
+        ) {
+            cx.notify();
+        }
+    }
+
+    fn current_spend_authorization_scope(&self) -> SpendAuthorizationScope {
+        let wallet_uuid = self.selected_wallet_id.as_deref().unwrap_or("");
+        let base_profile_uuid = self
+            .wallet_metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == wallet_uuid)
+            .and_then(|metadata| metadata.software_context.as_ref())
+            .map_or(wallet_uuid, |context| context.base_profile_uuid.as_str());
+        SpendAuthorizationScope::new(
+            base_profile_uuid,
+            wallet_uuid,
+            self.protected_software_seed_session
+                .as_ref()
+                .map(|session| session.binding().clone()),
+        )
+    }
+
+    fn desktop_spend_authorization(
+        &self,
+        password: Zeroizing<String>,
+    ) -> Result<DesktopPrivateSpendAuthorization, Arc<str>> {
+        let wallet_uuid = self
+            .selected_wallet_id
+            .as_deref()
+            .ok_or_else(|| Arc::from("Select a wallet before authorizing a spend"))?;
+        let metadata = self
+            .wallet_metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == wallet_uuid)
+            .ok_or_else(|| Arc::from("Selected wallet metadata is unavailable"))?;
+        let Some(context) = metadata.software_context.as_ref() else {
+            return Ok(DesktopPrivateSpendAuthorization::VaultPassword(password));
+        };
+        if context.kind != WalletSoftwareContextKind::Passphrase {
+            return Ok(DesktopPrivateSpendAuthorization::VaultPassword(password));
+        }
+        let session = self
+            .protected_software_seed_session
+            .as_ref()
+            .ok_or_else(|| {
+                Arc::from("Open the selected passphrase wallet again before spending")
+            })?;
+        if session.binding().base_profile_uuid() != context.base_profile_uuid
+            || session.binding().context_wallet_uuid() != wallet_uuid
+        {
+            return Err(Arc::from(
+                "The selected passphrase wallet session is stale; open it again before spending",
+            ));
+        }
+        Ok(DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed {
+            password,
+            session: Arc::clone(session),
+        })
     }
 
     fn continue_authorized_spend(
@@ -1399,33 +1510,30 @@ impl WalletRoot {
                 );
             }
             SpendAuthorizationIntent::PublicSend(draft) => {
-                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
-                else {
+                let Ok((password, session)) = authorization.public_signing_parts() else {
                     self.set_vault_error(
                         "Public account spend authorization requires the vault password",
                         cx,
                     );
                     return;
                 };
-                self.submit_public_send_authorized(*draft, password, window, cx);
+                self.submit_public_send_authorized(*draft, password, session, window, cx);
             }
             SpendAuthorizationIntent::PublicShield(draft) => {
-                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
-                else {
+                let Ok((password, session)) = authorization.public_signing_parts() else {
                     self.set_vault_error(
                         "Public account spend authorization requires the vault password",
                         cx,
                     );
                     return;
                 };
-                self.submit_public_shield_authorized(*draft, password, window, cx);
+                self.submit_public_shield_authorized(*draft, password, session, window, cx);
             }
             SpendAuthorizationIntent::WalletConnectRequest {
                 request_key,
                 review_token,
             } => {
-                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
-                else {
+                let Ok((password, session)) = authorization.public_signing_parts() else {
                     self.set_vault_error(
                         "WalletConnect Public account authorization requires the vault password",
                         cx,
@@ -1436,6 +1544,7 @@ impl WalletRoot {
                     &request_key,
                     review_token,
                     password,
+                    session,
                     window,
                     cx,
                 );
@@ -1593,10 +1702,79 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
     elapsed: Duration,
 ) -> bool {
     let now = Instant::now();
-    let Some(cache) =
-        SpendAuthorizationCache::new(Zeroizing::new("password".to_string()), lifetime, now)
-    else {
+    let scope = SpendAuthorizationScope::new("base", "wallet", None);
+    let Some(cache) = SpendAuthorizationCache::new(
+        Zeroizing::new("password".to_string()),
+        lifetime,
+        scope.clone(),
+        now,
+    ) else {
         return false;
     };
-    cache.is_valid_at(now + elapsed)
+    cache.is_valid_at(&scope, now + elapsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remembered_authorization_is_bound_to_exact_wallet_scope() {
+        let now = Instant::now();
+        let first_scope = SpendAuthorizationScope::new("base-a", "wallet-a", None);
+        let second_scope = SpendAuthorizationScope::new("base-a", "wallet-b", None);
+        let session_scope = SpendAuthorizationScope::new(
+            "base-a",
+            "wallet-a",
+            Some(SoftwareSeedSessionBinding::new(
+                "base-a",
+                "wallet-a",
+                wallet_ops::vault::VaultSessionId::from_bytes([7; 16]),
+            )),
+        );
+        let cache = SpendAuthorizationCache::new(
+            Zeroizing::new("password".to_owned()),
+            SpendAuthorizationLifetime::UntilVaultLock,
+            first_scope.clone(),
+            now,
+        )
+        .expect("remembered cache");
+
+        assert!(cache.is_valid_at(&first_scope, now));
+        assert!(!cache.is_valid_at(&second_scope, now));
+        assert!(!cache.is_valid_at(&session_scope, now));
+    }
+
+    #[test]
+    fn context_cleanup_drops_protected_seed_and_remembered_spend_authorization() {
+        let created = wallet_ops::vault::create_with_params(
+            "test-vault-password",
+            wallet_ops::vault::KdfParams::default(),
+        )
+        .expect("create test vault");
+        let binding = SoftwareSeedSessionBinding::new(
+            "base-profile",
+            "child-context",
+            wallet_ops::vault::VaultSessionId::from_bytes([8; 16]),
+        );
+        let protected = created
+            .spend
+            .seal_software_seed_session(binding.clone(), &[7; 64])
+            .expect("seal protected seed");
+        let scope = SpendAuthorizationScope::new("base-profile", "child-context", Some(binding));
+        let mut protected = Some(Arc::new(protected));
+        let mut remembered = SpendAuthorizationCache::new(
+            Zeroizing::new("test-vault-password".to_owned()),
+            SpendAuthorizationLifetime::UntilVaultLock,
+            scope,
+            Instant::now(),
+        );
+
+        assert!(clear_protected_software_seed_session_state(
+            &mut protected,
+            &mut remembered,
+        ));
+        assert!(protected.is_none());
+        assert!(remembered.is_none());
+    }
 }

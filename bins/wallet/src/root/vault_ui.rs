@@ -7,7 +7,6 @@ use gpui::{
 };
 use gpui_component::alert::Alert;
 use gpui_component::progress::Progress as UiProgress;
-#[cfg(feature = "hardware")]
 use gpui_component::spinner::Spinner;
 use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants, tooltip::Tooltip};
 use gpui_component::{Icon, Sizable};
@@ -32,12 +31,12 @@ use wallet_ops::vault::TrezorPassphraseMode;
 use super::actions::{CycleTrezorPassphraseMode, TREZOR_PASSPHRASE_MODE_KEY_CONTEXT};
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
-use super::vault::hardware_device_label;
 #[cfg(feature = "hardware")]
 use super::vault::{
     HardwareProfileApprovalPrompt, HardwareProfilePickerView, HardwareProfileStep,
     HardwareProfileStepState, HardwareProfileStepStatus,
 };
+use super::vault::{PendingSoftwareProfileOpenStage, hardware_device_label};
 use super::{
     Activity, VaultState, WalletRoot, WalletSetupMode, labeled_field, rgb_with_alpha,
     scrollable_dialog_content,
@@ -85,10 +84,11 @@ impl WalletRoot {
             .into_any_element()
     }
 
-    const fn vault_dialog_title(&self) -> &'static str {
+    fn vault_dialog_title(&self) -> &'static str {
         match &self.vault_state {
             VaultState::CreateVault => "Create wallet vault",
             VaultState::UnlockVault => "Unlock wallet",
+            VaultState::SwitchingWallet => "Opening wallet",
             VaultState::SetupWallet => match self.wallet_setup_mode {
                 WalletSetupMode::Choose => "Add your first wallet",
                 WalletSetupMode::GeneratedReview => "Save recovery phrase",
@@ -96,6 +96,9 @@ impl WalletRoot {
                 WalletSetupMode::Hardware(HardwareDeviceKind::Ledger) => "Ledger-derived wallet",
                 WalletSetupMode::Hardware(HardwareDeviceKind::Trezor) => "Trezor-derived wallet",
             },
+            VaultState::PendingSoftwareProfileOpen => {
+                pending_software_profile_open_title(self.pending_software_profile_open_stage())
+            }
             VaultState::ViewUnlocked => "Wallet",
             VaultState::Error(_) => "Wallet vault unavailable",
         }
@@ -105,7 +108,11 @@ impl WalletRoot {
         match &self.vault_state {
             VaultState::CreateVault => self.render_create_vault(root).into_any_element(),
             VaultState::UnlockVault => self.render_unlock_vault(root).into_any_element(),
+            VaultState::SwitchingWallet => Self::render_switching_wallet().into_any_element(),
             VaultState::SetupWallet => self.render_wallet_setup(root).into_any_element(),
+            VaultState::PendingSoftwareProfileOpen => {
+                self.passphrase_open_ui.clone().into_any_element()
+            }
             VaultState::ViewUnlocked => div().into_any_element(),
             VaultState::Error(message) => self.render_vault_fatal(message).into_any_element(),
         }
@@ -129,6 +136,17 @@ impl WalletRoot {
             )
             .child(self.render_vault_dialog_content(root))
             .into_any_element()
+    }
+
+    fn render_switching_wallet() -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(Spinner::new().small())
+            .child(app_muted_text(
+                "Waiting for the previous wallet session to close...",
+            ))
     }
 
     fn render_pre_unlock_settings_gear(root: Entity<Self>) -> gpui::Div {
@@ -1347,17 +1365,32 @@ impl WalletRoot {
 }
 
 pub(super) const fn should_show_pre_unlock_settings_action(vault_state: &VaultState) -> bool {
-    !matches!(vault_state, VaultState::ViewUnlocked)
+    matches!(
+        vault_state,
+        VaultState::CreateVault
+            | VaultState::UnlockVault
+            | VaultState::SetupWallet
+            | VaultState::Error(_)
+    )
 }
 
-fn vault_dialog_body(subtitle: impl Into<SharedString>) -> gpui::Div {
+const fn pending_software_profile_open_title(
+    stage: Option<PendingSoftwareProfileOpenStage>,
+) -> &'static str {
+    match stage {
+        None | Some(PendingSoftwareProfileOpenStage::Choosing) => "Open wallet",
+        Some(PendingSoftwareProfileOpenStage::UnknownDecision) => "Passphrase wallet not found",
+        Some(PendingSoftwareProfileOpenStage::CreationHandoff) => "Add passphrase wallet",
+    }
+}
+
+pub(in crate::root) fn vault_dialog_body(subtitle: impl Into<SharedString>) -> gpui::Div {
     let subtitle = subtitle.into();
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(app_muted_text(subtitle).line_height(px(18.0)))
+    div().w_full().flex().flex_col().gap_3().child(
+        app_muted_text(subtitle)
+            .whitespace_normal()
+            .line_height(px(18.0)),
+    )
 }
 
 pub(in crate::root) const fn hardware_create_button_id(

@@ -407,19 +407,25 @@ impl WalletRoot {
         let password = if let Some(password) = vault_password {
             password
         } else {
-            let DesktopPrivateSpendAuthorization::VaultPassword(password) = &spend_authorization
-            else {
-                tracing::warn!(
-                    "blocked Shield refund self-broadcast requested without gas-payer password"
-                );
-                self.set_vault_error(
+            let password = match &spend_authorization {
+                DesktopPrivateSpendAuthorization::VaultPassword(password)
+                | DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed { password, .. } => {
+                    password
+                }
+                DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
+                    tracing::warn!(
+                        "blocked Shield refund self-broadcast requested without gas-payer password"
+                    );
+                    self.set_vault_error(
                     "Blocked Shield refund self-broadcast requires the vault password for the public gas payer.",
                     cx,
                 );
-                return;
+                    return;
+                }
             };
             password.clone()
         };
+        let protected_seed_session = spend_authorization.protected_seed_session();
         let Some(session) = self.selected_chain_session() else {
             tracing::warn!("blocked Shield refund requested without selected chain session");
             return;
@@ -473,6 +479,7 @@ impl WalletRoot {
             vault_store,
             spend_authorization,
             vault_password: password,
+            protected_software_seed_session: protected_seed_session,
             trezor_pin_matrix_provider,
             utxo_id,
             requested_public_account_uuid: Some(public_account_uuid),

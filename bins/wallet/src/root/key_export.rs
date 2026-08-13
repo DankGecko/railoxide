@@ -8,7 +8,9 @@ use gpui_component::{Sizable, WindowExt, alert::Alert, button::ButtonVariants, i
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_masked_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
-use wallet_ops::vault::{VaultError, WalletMetadataBundle, WalletSource};
+use wallet_ops::vault::{
+    VaultError, WalletMetadataBundle, WalletSoftwareContextKind, WalletSource,
+};
 use zeroize::Zeroizing;
 
 use super::{
@@ -26,6 +28,8 @@ pub(super) struct KeyExportState {
     wallet_id: Option<Arc<str>>,
     wallet_label: Option<Arc<str>>,
     wallet_source: Option<WalletSource>,
+    wallet_context_kind: Option<WalletSoftwareContextKind>,
+    base_profile_uuid: Option<Arc<str>>,
     mnemonic: Option<Zeroizing<String>>,
     shareable_viewing_key: Option<Zeroizing<String>>,
 }
@@ -36,6 +40,11 @@ impl KeyExportState {
         self.wallet_id = Some(Arc::from(wallet.wallet_uuid.clone()));
         self.wallet_label = Some(Arc::from(wallet.label.clone()));
         self.wallet_source = Some(wallet.source);
+        self.wallet_context_kind = wallet.software_context.as_ref().map(|context| context.kind);
+        self.base_profile_uuid = wallet
+            .software_context
+            .as_ref()
+            .map(|context| Arc::from(context.base_profile_uuid.clone()));
     }
 
     fn clear(&mut self) {
@@ -43,6 +52,8 @@ impl KeyExportState {
         self.wallet_id = None;
         self.wallet_label = None;
         self.wallet_source = None;
+        self.wallet_context_kind = None;
+        self.base_profile_uuid = None;
     }
 
     fn clear_values(&mut self) {
@@ -276,7 +287,7 @@ impl WalletRoot {
             return Err(Arc::from("Wallet vault storage is unavailable."));
         };
 
-        match store.export_wallet_mnemonic(password, wallet_id.as_ref()) {
+        match store.export_wallet_mnemonic_for_context(password, wallet_id.as_ref()) {
             Ok(mnemonic) => {
                 self.key_export.mnemonic = Some(mnemonic);
                 cx.notify();
@@ -315,7 +326,9 @@ impl WalletRoot {
                     wallet_id.as_ref(),
                     self.view_session.as_deref(),
                 ),
-            _ => store.export_wallet_shareable_viewing_key(password, wallet_id.as_ref()),
+            _ => {
+                store.export_wallet_shareable_viewing_key_for_context(password, wallet_id.as_ref())
+            }
         };
 
         match result {
@@ -356,6 +369,15 @@ impl WalletRoot {
             .flex_col()
             .gap_4()
             .child(Alert::warning("wallet-key-export-warning", key_export_warning_copy()).small())
+            .children(
+                key_export_context_warning(
+                    self.key_export.wallet_context_kind,
+                    self.key_export.base_profile_uuid.as_deref(),
+                )
+                .map(|warning| {
+                    Alert::warning("wallet-key-export-context-warning", warning).small()
+                }),
+            )
             .child(app_muted_text(format!("Selected wallet: {wallet_label}")).whitespace_normal())
             .child(self.render_mnemonic_export_row(root, source))
             .child(self.render_shareable_viewing_key_export_row(root, source))
@@ -501,6 +523,41 @@ fn render_key_export_value_field(
 
 pub(in crate::root) const fn key_export_mnemonic_available(source: WalletSource) -> bool {
     !source.is_hardware_derived()
+}
+
+pub(in crate::root) const fn key_export_context_warning(
+    context_kind: Option<WalletSoftwareContextKind>,
+    base_profile_uuid: Option<&str>,
+) -> Option<&'static str> {
+    match key_export_context_warning_predicates(context_kind, base_profile_uuid) {
+        Some(_) => Some(
+            "This mnemonic alone cannot restore this wallet. The exact mnemonic passphrase is also required and is not retained by the app.",
+        ),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) struct KeyExportContextWarningPredicates {
+    pub(in crate::root) mnemonic_alone_is_insufficient: bool,
+    pub(in crate::root) passphrase_is_external: bool,
+    pub(in crate::root) passphrase_is_not_retained: bool,
+}
+
+pub(in crate::root) const fn key_export_context_warning_predicates(
+    context_kind: Option<WalletSoftwareContextKind>,
+    base_profile_uuid: Option<&str>,
+) -> Option<KeyExportContextWarningPredicates> {
+    match context_kind {
+        Some(WalletSoftwareContextKind::Passphrase) if base_profile_uuid.is_some() => {
+            Some(KeyExportContextWarningPredicates {
+                mnemonic_alone_is_insufficient: true,
+                passphrase_is_external: true,
+                passphrase_is_not_retained: true,
+            })
+        }
+        _ => None,
+    }
 }
 
 pub(in crate::root) const fn key_export_copy_available(revealed: bool) -> bool {

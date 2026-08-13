@@ -22,6 +22,7 @@ const BROADCASTER_ICON_PATH: &str = "railgun/icons/robot.svg";
 const LOGS_ICON_PATH: &str = "railgun/icons/logs.svg";
 const DICES_ICON_PATH: &str = "railgun/icons/dices.svg";
 const SQUARE_ICON_PATH: &str = "railgun/icons/square.svg";
+const SQUARE_ASTERISK_ICON_PATH: &str = "railgun/icons/square-asterisk.svg";
 const PENCIL_ICON_PATH: &str = "railgun/icons/pencil.svg";
 const QR_CODE_ICON_PATH: &str = "railgun/icons/qr-code.svg";
 const TRASH_2_ICON_PATH: &str = "railgun/icons/trash-2.svg";
@@ -33,6 +34,9 @@ pub(crate) const LIST_ICON_PATH: &str = "railgun/icons/list.svg";
 pub(crate) const GROUP_ICON_PATH: &str = "railgun/icons/group.svg";
 pub(crate) const CHEVRONS_DOWN_ICON_PATH: &str = "railgun/icons/chevrons-down.svg";
 const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
+const WRENCH_ICON_PATH: &str = "railgun/icons/wrench.svg";
+const FILE_PEN_LINE_ICON_PATH: &str = "railgun/icons/file-pen-line.svg";
+const FOLDER_COG_ICON_PATH: &str = "railgun/icons/folder-cog.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
 const TOR_STATUS_ICON_PATH: &str = "railgun/icons/tor-status.svg";
@@ -58,6 +62,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     LOGS_ICON_PATH,
     DICES_ICON_PATH,
     SQUARE_ICON_PATH,
+    SQUARE_ASTERISK_ICON_PATH,
     PENCIL_ICON_PATH,
     QR_CODE_ICON_PATH,
     TRASH_2_ICON_PATH,
@@ -69,6 +74,9 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     GROUP_ICON_PATH,
     CHEVRONS_DOWN_ICON_PATH,
     KEY_ROUND_ICON_PATH,
+    WRENCH_ICON_PATH,
+    FILE_PEN_LINE_ICON_PATH,
+    FOLDER_COG_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
     TOR_STATUS_ICON_PATH,
@@ -95,6 +103,7 @@ const BROADCASTER_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/
 const LOGS_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/logs.svg");
 const DICES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/dices.svg");
 const SQUARE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square.svg");
+const SQUARE_ASTERISK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square-asterisk.svg");
 const PENCIL_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pencil.svg");
 const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/qr-code.svg");
 const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
@@ -106,6 +115,9 @@ const LIST_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/list.svg");
 const GROUP_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/group.svg");
 const CHEVRONS_DOWN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/chevrons-down.svg");
 const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.svg");
+const WRENCH_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/wrench.svg");
+const FILE_PEN_LINE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/file-pen-line.svg");
+const FOLDER_COG_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/folder-cog.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
 const TOR_STATUS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tor-status.svg");
@@ -284,12 +296,17 @@ pub(crate) enum RailgunActionIcon {
     Shield,
     Dices,
     Square,
+    SquareAsterisk,
     Pencil,
     QrCode,
     Trash2,
     Clock,
     BookUser,
     Save,
+    KeyRound,
+    Wrench,
+    FilePenLine,
+    FolderCog,
 }
 
 impl IconNamed for RailgunActionIcon {
@@ -300,12 +317,17 @@ impl IconNamed for RailgunActionIcon {
             Self::Shield => SHIELD_ICON_PATH,
             Self::Dices => DICES_ICON_PATH,
             Self::Square => SQUARE_ICON_PATH,
+            Self::SquareAsterisk => SQUARE_ASTERISK_ICON_PATH,
             Self::Pencil => PENCIL_ICON_PATH,
             Self::QrCode => QR_CODE_ICON_PATH,
             Self::Trash2 => TRASH_2_ICON_PATH,
             Self::Clock => CLOCK_ICON_PATH,
             Self::BookUser => BOOK_USER_ICON_PATH,
             Self::Save => SAVE_ICON_PATH,
+            Self::KeyRound => KEY_ROUND_ICON_PATH,
+            Self::Wrench => WRENCH_ICON_PATH,
+            Self::FilePenLine => FILE_PEN_LINE_ICON_PATH,
+            Self::FolderCog => FOLDER_COG_ICON_PATH,
         }
         .into()
     }
@@ -399,6 +421,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         LOGS_ICON_PATH => Some(LOGS_ICON_BYTES),
         DICES_ICON_PATH => Some(DICES_ICON_BYTES),
         SQUARE_ICON_PATH => Some(SQUARE_ICON_BYTES),
+        SQUARE_ASTERISK_ICON_PATH => Some(SQUARE_ASTERISK_ICON_BYTES),
         PENCIL_ICON_PATH => Some(PENCIL_ICON_BYTES),
         QR_CODE_ICON_PATH => Some(QR_CODE_ICON_BYTES),
         TRASH_2_ICON_PATH => Some(TRASH_2_ICON_BYTES),
@@ -410,6 +433,9 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         GROUP_ICON_PATH => Some(GROUP_ICON_BYTES),
         CHEVRONS_DOWN_ICON_PATH => Some(CHEVRONS_DOWN_ICON_BYTES),
         KEY_ROUND_ICON_PATH => Some(KEY_ROUND_ICON_BYTES),
+        WRENCH_ICON_PATH => Some(WRENCH_ICON_BYTES),
+        FILE_PEN_LINE_ICON_PATH => Some(FILE_PEN_LINE_ICON_BYTES),
+        FOLDER_COG_ICON_PATH => Some(FOLDER_COG_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
         TOR_STATUS_ICON_PATH => Some(TOR_STATUS_ICON_BYTES),
@@ -461,6 +487,30 @@ mod tests {
             assets
                 .load("railgun/icons/save.svg")
                 .expect("load save icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/square-asterisk.svg")
+                .expect("load square asterisk icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/wrench.svg")
+                .expect("load wrench icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/file-pen-line.svg")
+                .expect("load file pen line icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/folder-cog.svg")
+                .expect("load folder cog icon")
                 .is_some()
         );
         assert!(

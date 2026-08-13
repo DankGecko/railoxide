@@ -3,6 +3,19 @@ use super::{
     WalletSetupMode, Window, Zeroizing,
 };
 
+pub(in crate::root) const fn should_focus_vault_input(
+    vault_state: &VaultState,
+    wallet_setup_mode: WalletSetupMode,
+) -> bool {
+    matches!(
+        vault_state,
+        VaultState::CreateVault | VaultState::UnlockVault
+    ) || matches!(
+        (vault_state, wallet_setup_mode),
+        (VaultState::SetupWallet, WalletSetupMode::Import)
+    )
+}
+
 impl WalletRoot {
     pub(in crate::root) fn set_wallet_name_input(
         &self,
@@ -84,7 +97,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &Context<'_, Self>,
     ) {
-        if !self.focus_vault_input_on_render {
+        if !self.focus_vault_input_on_render
+            || !should_focus_vault_input(&self.vault_state, self.wallet_setup_mode)
+        {
+            self.focus_vault_input_on_render = false;
             return;
         }
 
@@ -104,7 +120,11 @@ impl WalletRoot {
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window),
-            VaultState::SetupWallet | VaultState::ViewUnlocked | VaultState::Error(_) => {}
+            VaultState::SetupWallet
+            | VaultState::SwitchingWallet
+            | VaultState::PendingSoftwareProfileOpen
+            | VaultState::ViewUnlocked
+            | VaultState::Error(_) => {}
         }
         self.focus_vault_input_on_render = false;
     }

@@ -24,9 +24,11 @@ use crate::hardware_typed_data::HardwareEip712Model;
 use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings};
 use crate::signer::SoftwareEvmSigner;
 use crate::vault::{
-    DesktopVaultStore, DesktopViewSession, HardwareProfileBinding, HardwareProfileSession,
-    KdfParams, PublicAccountMetadata, PublicAccountScope, PublicAccountSource, PublicAccountStatus,
-    TrezorPassphraseMode, VaultError, WalletSource,
+    CreateSoftwareContextResult, DesktopVaultStore, DesktopViewSession, HardwareProfileBinding,
+    HardwareProfileSession, KdfParams, PublicAccountMetadata, PublicAccountScope,
+    PublicAccountSource, PublicAccountStatus, SoftwareContextChainInput, SoftwareContextSyncIntent,
+    SoftwareSeedSessionBinding, TrezorPassphraseMode, VaultError, VaultSessionId, WalletSource,
+    bip39_seed_from_mnemonic,
 };
 use crate::{GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback};
 
@@ -204,6 +206,7 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
             vault_password: Zeroizing::new("wrong password".to_owned()),
+            protected_software_seed_session: None,
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: account.public_account_uuid.clone(),
@@ -219,6 +222,7 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                protected_software_seed_session: None,
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid,
@@ -280,6 +284,7 @@ fn walletconnect_typed_data_signs_for_software_public_account() {
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                protected_software_seed_session: None,
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid,
@@ -345,6 +350,7 @@ fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_p
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                protected_software_seed_session: None,
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid,
@@ -1540,6 +1546,7 @@ fn public_actions_reject_zero_amount_before_signing() {
             view_session: Arc::clone(&view_session),
             vault_store: Arc::clone(&store),
             vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
+            protected_software_seed_session: None,
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: "unused".to_string(),
@@ -1567,6 +1574,7 @@ fn public_actions_reject_zero_amount_before_signing() {
             view_session,
             vault_store: store,
             vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
+            protected_software_seed_session: None,
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: "unused".to_string(),
@@ -1616,6 +1624,7 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
         &derived.public_account_uuid,
         None,
         None,
+        None,
     )
     .expect("derived signer");
     assert_eq!(derived_signer.address(), derived.address);
@@ -1624,6 +1633,7 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
         &view_session,
         None,
         &derived.public_account_uuid,
+        None,
         None,
         None,
     ) else {
@@ -1731,6 +1741,7 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
         &hardware_public.public_account_uuid,
         None,
         None,
+        None,
     )
     .expect("hardware signer with profile session");
     assert_eq!(hardware_signer.address(), hardware_public.address);
@@ -1752,11 +1763,129 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
         &imported.public_account_uuid,
         None,
         None,
+        None,
     )
     .expect("imported signer");
     assert_eq!(imported_signer.address(), imported.address);
 
     drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
+    let (root_dir, db, store, base_view_session) = public_action_request_parts();
+    let mut grant = store
+        .create_spend_grant(TEST_PASSWORD)
+        .expect("context creation grant");
+    let CreateSoftwareContextResult::Created {
+        public_account,
+        protected_seed_session,
+        ..
+    } = store
+        .create_software_context(
+            &base_view_session.clone_vault_view_unlock(),
+            &mut grant,
+            base_view_session.wallet_id(),
+            "walletconnect-passphrase",
+            0,
+            "WalletConnect passphrase",
+            Zeroizing::new("TREZOR".to_owned()),
+            Zeroizing::new("TREZOR".to_owned()),
+            SoftwareContextSyncIntent::RecoverExisting,
+            &[SoftwareContextChainInput {
+                chain_type: 0,
+                chain_id: 1,
+                contract: "0xcontract".to_owned(),
+                deployment_block: 0,
+                current_safe_head: None,
+            }],
+            VaultSessionId::from_bytes([31; 16]),
+        )
+        .expect("create passphrase context")
+    else {
+        panic!("expected created context");
+    };
+    let view_session = Arc::new(
+        store
+            .load_view_session(TEST_PASSWORD, "walletconnect-passphrase")
+            .expect("passphrase view session"),
+    );
+    let protected_seed_session = Arc::new(protected_seed_session);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+
+    let missing = runtime.block_on(walletconnect_sign_personal_message(
+        WalletConnectPersonalSignRequest {
+            view_session: Arc::clone(&view_session),
+            vault_store: Arc::clone(&store),
+            vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+            protected_software_seed_session: None,
+            trezor_app_passphrase: None,
+            trezor_pin_matrix_provider: None,
+            public_account_uuid: public_account.public_account_uuid.clone(),
+            message: b"passphrase session".to_vec(),
+            event_tx: None,
+        },
+    ));
+    assert!(missing.is_err());
+
+    let wrong_session = {
+        let seed = bip39_seed_from_mnemonic(TEST_MNEMONIC, "TREZOR").expect("context seed");
+        let wrong_grant = store
+            .create_spend_grant(TEST_PASSWORD)
+            .expect("wrong-session grant");
+        Arc::new(
+            wrong_grant
+                .spend_unlock()
+                .expect("wrong-session spend unlock")
+                .seal_software_seed_session(
+                    SoftwareSeedSessionBinding::new(
+                        base_view_session.wallet_id(),
+                        "wrong-context",
+                        VaultSessionId::from_bytes([32; 16]),
+                    ),
+                    seed.as_ref(),
+                )
+                .expect("wrong protected session"),
+        )
+    };
+    let wrong = runtime.block_on(walletconnect_sign_personal_message(
+        WalletConnectPersonalSignRequest {
+            view_session: Arc::clone(&view_session),
+            vault_store: Arc::clone(&store),
+            vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+            protected_software_seed_session: Some(wrong_session),
+            trezor_app_passphrase: None,
+            trezor_pin_matrix_provider: None,
+            public_account_uuid: public_account.public_account_uuid.clone(),
+            message: b"passphrase session".to_vec(),
+            event_tx: None,
+        },
+    ));
+    assert!(wrong.is_err());
+
+    let signature = runtime
+        .block_on(walletconnect_sign_personal_message(
+            WalletConnectPersonalSignRequest {
+                view_session,
+                vault_store: store,
+                vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                protected_software_seed_session: Some(protected_seed_session),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: public_account.public_account_uuid,
+                message: b"passphrase session".to_vec(),
+                event_tx: None,
+            },
+        ))
+        .expect("passphrase WalletConnect signature");
+    assert!(signature.starts_with("0x"));
+
+    drop(base_view_session);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }

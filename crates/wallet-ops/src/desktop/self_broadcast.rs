@@ -40,6 +40,7 @@ pub(super) async fn submit_self_broadcast_plan(
     view_session: &vault::DesktopViewSession,
     vault_store: &vault::DesktopVaultStore,
     vault_password: Option<&str>,
+    protected_seed_session: Option<&vault::ProtectedSoftwareSeedSession>,
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     public_account_uuid: String,
     session: Arc<WalletSession>,
@@ -61,6 +62,7 @@ pub(super) async fn submit_self_broadcast_plan(
         view_session,
         vault_password,
         &public_account_uuid,
+        protected_seed_session,
         None,
         trezor_pin_matrix_provider,
     )?;
@@ -1491,6 +1493,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
         &request.view_session,
         vault_password.as_ref().map(|password| password.as_str()),
         &request.public_account_uuid,
+        request.protected_software_seed_session.as_deref(),
         None,
         request.trezor_pin_matrix_provider,
     )?;

@@ -3,7 +3,9 @@ use super::{Arc, HardwareDeviceKind, WalletSource};
 pub(in crate::root) enum VaultState {
     CreateVault,
     UnlockVault,
+    SwitchingWallet,
     SetupWallet,
+    PendingSoftwareProfileOpen,
     ViewUnlocked,
     Error(Arc<str>),
 }

@@ -1,7 +1,8 @@
 use super::*;
 use crate::root::key_export::{
-    KeyExportSecretKind, WALLET_EXPORT_MENU_LABEL, key_export_copy_available,
-    key_export_error_message, key_export_mnemonic_available, key_export_password_dialog_title,
+    KeyExportSecretKind, WALLET_EXPORT_MENU_LABEL, key_export_context_warning,
+    key_export_context_warning_predicates, key_export_copy_available, key_export_error_message,
+    key_export_mnemonic_available, key_export_password_dialog_title,
     key_export_password_submit_button_id, key_export_reveal_button_id,
 };
 
@@ -22,6 +23,40 @@ fn key_export_availability_matches_wallet_source() {
 fn key_export_copy_is_only_available_after_reveal() {
     assert!(!key_export_copy_available(false));
     assert!(key_export_copy_available(true));
+}
+
+#[test]
+fn key_export_warning_is_context_specific() {
+    let predicates = key_export_context_warning_predicates(
+        Some(wallet_ops::vault::WalletSoftwareContextKind::Passphrase),
+        Some("base-profile"),
+    )
+    .expect("passphrase context warning predicates");
+    assert!(predicates.mnemonic_alone_is_insufficient);
+    assert!(predicates.passphrase_is_external);
+    assert!(predicates.passphrase_is_not_retained);
+    let warning = key_export_context_warning(
+        Some(wallet_ops::vault::WalletSoftwareContextKind::Passphrase),
+        Some("base-profile"),
+    )
+    .expect("passphrase context warning");
+    assert!(warning.contains("mnemonic alone cannot restore"));
+    assert!(warning.contains("passphrase"));
+    assert!(warning.contains("not retained"));
+    assert!(
+        key_export_context_warning_predicates(
+            Some(wallet_ops::vault::WalletSoftwareContextKind::Passphrase),
+            None,
+        )
+        .is_none()
+    );
+    assert!(
+        key_export_context_warning(
+            Some(wallet_ops::vault::WalletSoftwareContextKind::Standard),
+            Some("base-profile"),
+        )
+        .is_none()
+    );
 }
 
 #[test]

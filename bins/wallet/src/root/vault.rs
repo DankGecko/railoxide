@@ -26,6 +26,7 @@ use wallet_ops::hardware::{
     },
 };
 use wallet_ops::hardware::{HardwareDeviceKind, HardwareWalletSyncIntent};
+use wallet_ops::settings::RememberedWalletKind;
 #[cfg(feature = "hardware")]
 use wallet_ops::vault::{
     DesktopVaultStore, HardwareProfileBindingKind, HardwareProfileSession, HardwareWalletProfile,
@@ -33,7 +34,8 @@ use wallet_ops::vault::{
 };
 use wallet_ops::vault::{
     DesktopViewSession, HardwareProfileMetadata, HardwareRailgunAccountMetadata,
-    PRIMARY_WALLET_LABEL, VaultError, ViewUnlock, WalletMetadataBundle, WalletSource,
+    PRIMARY_WALLET_LABEL, SpendUnlock, VaultError, VaultSessionId, ViewUnlock,
+    WalletMetadataBundle, WalletSoftwareContextKind, WalletSource,
     default_wallet_label_for_metadata, generate_opaque_id, generate_seed_material,
     sort_wallet_metadata,
 };
@@ -52,6 +54,8 @@ mod errors;
 mod hardware;
 mod inputs;
 mod lifecycle;
+mod passphrase_ui;
+mod pending;
 #[cfg(test)]
 pub(in crate::root) use lifecycle::vault_lock_is_allowed;
 mod selection;
@@ -94,17 +98,24 @@ pub(in crate::root) use hardware::{
     trezor_session_stale_error_message,
 };
 pub(in crate::root) use hardware::{default_hardware_wallet_setup_intent, hardware_device_label};
+#[cfg(test)]
+pub(in crate::root) use inputs::should_focus_vault_input;
+#[cfg(test)]
+pub(in crate::root) use lifecycle::wallet_replacement_finalize_is_admitted;
+pub(in crate::root) use passphrase_ui::PassphraseOpenUi;
+pub(in crate::root) use pending::{PendingSoftwareProfileOpen, PendingSoftwareProfileOpenStage};
 #[cfg(feature = "hardware")]
 pub(in crate::root::vault) use selection::hardware_device_kind_from_source;
 #[allow(unused_imports)]
 pub(in crate::root) use selection::{
     HardwareWalletDisplayInfo, hardware_device_kind_from_wallet_select_value,
-    hardware_device_wallet_select_label, hardware_wallet_display_info, remembered_wallet_option,
+    hardware_device_wallet_select_label, hardware_wallet_display_info,
+    passphrase_open_action_is_eligible, remembered_wallet_id_for_restore, visible_wallet_metadata,
     wallet_options_from_metadata, wallet_select_items_from_metadata,
     wallet_select_value_for_selected_wallet,
 };
 #[cfg(test)]
-pub(in crate::root) use setup::load_preferred_password_unlockable_wallet_session;
+pub(in crate::root) use setup::{SoftwareProfileRestoreAction, software_profile_restore_action};
 pub(in crate::root) use types::{VaultState, WalletOption, WalletSetupMode};
 
 #[allow(dead_code)]

@@ -12,7 +12,8 @@ use crate::TxReceiptOutput;
 use crate::hardware::HardwareTypedDataSigningMode;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
-    DesktopVaultStore, DesktopViewSession, HardwareProfileSession, PublicAccountMetadata,
+    DesktopVaultStore, DesktopViewSession, HardwareProfileSession, ProtectedSoftwareSeedSession,
+    PublicAccountMetadata,
 };
 
 pub type PublicActionGasFeeQuote = crate::SelfBroadcastGasFeeQuote;
@@ -226,6 +227,7 @@ pub struct PublicSendRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub protected_software_seed_session: Option<Arc<ProtectedSoftwareSeedSession>>,
     pub trezor_app_passphrase: Option<Zeroizing<String>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
@@ -272,6 +274,7 @@ pub struct PublicShieldRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub protected_software_seed_session: Option<Arc<ProtectedSoftwareSeedSession>>,
     pub trezor_app_passphrase: Option<Zeroizing<String>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
@@ -289,6 +292,7 @@ pub struct WalletConnectPersonalSignRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub protected_software_seed_session: Option<Arc<ProtectedSoftwareSeedSession>>,
     pub trezor_app_passphrase: Option<Zeroizing<String>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
@@ -300,6 +304,7 @@ pub struct WalletConnectTypedDataSignRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub protected_software_seed_session: Option<Arc<ProtectedSoftwareSeedSession>>,
     pub trezor_app_passphrase: Option<Zeroizing<String>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
@@ -380,6 +385,7 @@ pub struct WalletConnectSendTransactionRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub protected_software_seed_session: Option<Arc<ProtectedSoftwareSeedSession>>,
     pub trezor_app_passphrase: Option<Zeroizing<String>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,

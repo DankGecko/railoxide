@@ -285,7 +285,7 @@ async fn new_wallet_chain_baseline(
 ) -> Result<DesktopWalletChainStart> {
     match init_policy {
         CreatedWalletChainInitPolicy::InitialCreate => {
-            let head = fetch_new_wallet_chain_head(defaults, effective_chain, http).await?;
+            let head = fetch_effective_chain_head(defaults, effective_chain, http).await?;
             Ok(new_wallet_chain_start_from_head(
                 effective_chain.deployment_block,
                 effective_chain.finality_depth,
@@ -298,7 +298,7 @@ async fn new_wallet_chain_baseline(
     }
 }
 
-async fn fetch_new_wallet_chain_head(
+async fn fetch_effective_chain_head(
     defaults: &ChainConfigDefaults,
     effective_chain: &settings::EffectiveChainConfig,
     http: &HttpContext,
@@ -306,30 +306,26 @@ async fn fetch_new_wallet_chain_head(
     let chain_cfg = chain_config(defaults, None, Some(effective_chain), http, None)?;
     let providers = chain_cfg.rpcs.available_providers();
     if providers.is_empty() {
-        return Err(eyre!("no RPC providers configured"));
+        return Err(eyre!(
+            "no RPC providers configured for chain {}",
+            effective_chain.chain_id
+        ));
     }
 
-    let mut last_error = None;
     for provider in providers {
-        match provider.provider.get_block_number().await {
-            Ok(head) => return Ok(head),
-            Err(error) => {
-                let message = error.to_string();
-                tracing::warn!(
-                    chain_id = effective_chain.chain_id,
-                    rpc = provider.url.as_str(),
-                    error = %message,
-                    "failed to fetch new wallet chain metadata baseline head"
-                );
-                chain_cfg.rpcs.mark_bad_provider(&provider);
-                last_error = Some(message);
-            }
+        if let Ok(head) = provider.provider.get_block_number().await {
+            return Ok(head);
         }
+        tracing::warn!(
+            chain_id = effective_chain.chain_id,
+            "failed to fetch effective chain head"
+        );
+        chain_cfg.rpcs.mark_bad_provider(&provider);
     }
 
     Err(eyre!(
-        "all RPC providers failed{}",
-        last_error.map_or_else(String::new, |error| format!("; last error: {error}"))
+        "all RPC providers failed for chain {}",
+        effective_chain.chain_id
     ))
 }
 
@@ -574,6 +570,17 @@ async fn finish_waited_wallet_startup(
 
 pub(crate) fn chain_defaults_for_chain(chain_id: u64) -> Result<ChainConfigDefaults> {
     ChainConfigDefaults::for_chain(chain_id).ok_or_else(|| eyre!("unsupported chain id {chain_id}"))
+}
+
+pub async fn fetch_current_safe_head(
+    effective_chain: &settings::EffectiveChainConfig,
+    http: &HttpContext,
+) -> Result<u64> {
+    let defaults = chain_defaults_for_chain(effective_chain.chain_id)?;
+    let head = fetch_effective_chain_head(&defaults, effective_chain, http).await?;
+    Ok(head
+        .saturating_sub(effective_chain.finality_depth)
+        .max(effective_chain.deployment_block))
 }
 
 pub(crate) fn chain_config(

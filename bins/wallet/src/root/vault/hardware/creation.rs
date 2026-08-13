@@ -114,9 +114,9 @@ impl WalletRoot {
                 match result {
                     Ok(Ok((session, metadata))) => {
                         if sync_intent == HardwareWalletSyncIntent::CreateNew {
-                            root.enter_new_wallet_view_unlocked(session, metadata, window, cx);
+                            root.enter_new_wallet_view_unlocked(session, &metadata, window, cx);
                         } else {
-                            root.enter_view_unlocked(session, metadata, window, cx);
+                            root.enter_view_unlocked(session, &metadata, window, cx);
                         }
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {

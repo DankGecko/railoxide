@@ -77,6 +77,10 @@ impl From<&vault::WalletMetadataBundle> for DesktopWalletSyncStartPolicy {
 
 pub enum DesktopPrivateSpendAuthorization {
     VaultPassword(Zeroizing<String>),
+    ProtectedSoftwareSeed {
+        password: Zeroizing<String>,
+        session: Arc<vault::ProtectedSoftwareSeedSession>,
+    },
     PreauthorizedSigner(vault::SoftwareRailgunSpendSigner),
 }
 
@@ -105,7 +109,7 @@ impl DesktopPrivateSpendAuthorization {
     pub(crate) fn signer<'a>(
         &'a self,
         vault_store: &vault::DesktopVaultStore,
-        wallet_id: &str,
+        view_session: &vault::DesktopViewSession,
         operation: &'static str,
     ) -> Result<DesktopPrivateSpendSigner<'a>> {
         match self {
@@ -114,7 +118,20 @@ impl DesktopPrivateSpendAuthorization {
                     .create_spend_grant(password.as_str())
                     .wrap_err_with(|| format!("authorize {operation} spend"))?;
                 let signer = vault_store
-                    .railgun_spend_signer(&mut grant, wallet_id)
+                    .railgun_spend_signer_for_session(&mut grant, view_session, None)
+                    .wrap_err_with(|| format!("load {operation} spend signer"))?;
+                Ok(DesktopPrivateSpendSigner::Owned(Box::new(signer)))
+            }
+            Self::ProtectedSoftwareSeed { password, session } => {
+                let mut grant = vault_store
+                    .create_spend_grant(password.as_str())
+                    .wrap_err_with(|| format!("authorize {operation} spend"))?;
+                let signer = vault_store
+                    .railgun_spend_signer_for_session(
+                        &mut grant,
+                        view_session,
+                        Some(session.as_ref()),
+                    )
                     .wrap_err_with(|| format!("load {operation} spend signer"))?;
                 Ok(DesktopPrivateSpendSigner::Owned(Box::new(signer)))
             }
@@ -125,7 +142,7 @@ impl DesktopPrivateSpendAuthorization {
     pub(crate) fn into_signer(
         self,
         vault_store: &vault::DesktopVaultStore,
-        wallet_id: &str,
+        view_session: &vault::DesktopViewSession,
         operation: &'static str,
     ) -> Result<vault::SoftwareRailgunSpendSigner> {
         match self {
@@ -134,10 +151,45 @@ impl DesktopPrivateSpendAuthorization {
                     .create_spend_grant(password.as_str())
                     .wrap_err_with(|| format!("authorize {operation} spend"))?;
                 vault_store
-                    .railgun_spend_signer(&mut grant, wallet_id)
+                    .railgun_spend_signer_for_session(&mut grant, view_session, None)
+                    .wrap_err_with(|| format!("load {operation} spend signer"))
+            }
+            Self::ProtectedSoftwareSeed { password, session } => {
+                let mut grant = vault_store
+                    .create_spend_grant(password.as_str())
+                    .wrap_err_with(|| format!("authorize {operation} spend"))?;
+                vault_store
+                    .railgun_spend_signer_for_session(
+                        &mut grant,
+                        view_session,
+                        Some(session.as_ref()),
+                    )
                     .wrap_err_with(|| format!("load {operation} spend signer"))
             }
             Self::PreauthorizedSigner(signer) => Ok(signer),
+        }
+    }
+
+    pub fn public_signing_parts(
+        self,
+    ) -> Result<(
+        Zeroizing<String>,
+        Option<Arc<vault::ProtectedSoftwareSeedSession>>,
+    )> {
+        match self {
+            Self::VaultPassword(password) => Ok((password, None)),
+            Self::ProtectedSoftwareSeed { password, session } => Ok((password, Some(session))),
+            Self::PreauthorizedSigner(_) => Err(eyre!(
+                "preauthorized Railgun signer cannot authorize a Public action"
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn protected_seed_session(&self) -> Option<Arc<vault::ProtectedSoftwareSeedSession>> {
+        match self {
+            Self::ProtectedSoftwareSeed { session, .. } => Some(Arc::clone(session)),
+            Self::VaultPassword(_) | Self::PreauthorizedSigner(_) => None,
         }
     }
 }
@@ -376,6 +428,7 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Option<Zeroizing<String>>,
+    pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub token: Address,
@@ -400,6 +453,7 @@ pub struct DesktopSendSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Option<Zeroizing<String>>,
+    pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub token: Address,
@@ -459,6 +513,7 @@ pub struct DesktopPreparedSponsoredSelfBroadcastRequest {
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub vault_password: Option<Zeroizing<String>>,
+    pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub prepared: PreparedSponsoredCall,
@@ -475,6 +530,7 @@ pub struct DesktopSponsoredSendSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Option<Zeroizing<String>>,
+    pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub token: Address,
@@ -497,6 +553,7 @@ pub struct DesktopSponsoredUnshieldSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Option<Zeroizing<String>>,
+    pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub token: Address,
@@ -569,6 +626,7 @@ pub struct BlockedShieldRescueSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Zeroizing<String>,
+    pub protected_software_seed_session: Option<Arc<vault::ProtectedSoftwareSeedSession>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub utxo_id: BlockedShieldRescueUtxoId,
     pub requested_public_account_uuid: Option<String>,

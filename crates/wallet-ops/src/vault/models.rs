@@ -1,9 +1,9 @@
 use std::{collections::BTreeSet, fmt};
 
 use super::{
-    Address, BTreeMap, Deserialize, HardwareDerivationDescriptor, HardwareDeviceKind,
-    HardwarePublicAccountDescriptor, KEY_LEN, Serialize, U256, VaultError, ViewingKeyData,
-    WalletKeys, Zeroize,
+    Address, BTreeMap, Deserialize, EncryptedRecord, HardwareDerivationDescriptor,
+    HardwareDeviceKind, HardwarePublicAccountDescriptor, KEY_LEN, RecordKind, Serialize,
+    SpendGrant, U256, VaultError, ViewingKeyData, WalletKeys, Zeroize, Zeroizing, fill,
 };
 use serde::{Deserializer, Serializer, de};
 use sha2::Digest;
@@ -92,6 +92,217 @@ impl WalletSource {
     }
 }
 
+pub const SOFTWARE_CONTEXT_VERSION: u32 = 1;
+pub const SOFTWARE_CONTEXT_SEED_LEN: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VaultSessionId([u8; 16]);
+
+impl VaultSessionId {
+    pub fn random() -> Result<Self, VaultError> {
+        let mut id = [0u8; 16];
+        fill(&mut id).map_err(|_| VaultError::Random)?;
+        Ok(Self(id))
+    }
+
+    #[must_use]
+    pub const fn from_bytes(id: [u8; 16]) -> Self {
+        Self(id)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> String {
+        alloy::hex::encode(self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftwareSeedSessionBinding {
+    base_profile_uuid: String,
+    context_wallet_uuid: String,
+    vault_session_id: VaultSessionId,
+}
+
+impl SoftwareSeedSessionBinding {
+    #[must_use]
+    pub fn new(
+        base_profile_uuid: impl Into<String>,
+        context_wallet_uuid: impl Into<String>,
+        vault_session_id: VaultSessionId,
+    ) -> Self {
+        Self {
+            base_profile_uuid: base_profile_uuid.into(),
+            context_wallet_uuid: context_wallet_uuid.into(),
+            vault_session_id,
+        }
+    }
+
+    #[must_use]
+    pub fn base_profile_uuid(&self) -> &str {
+        &self.base_profile_uuid
+    }
+
+    #[must_use]
+    pub fn context_wallet_uuid(&self) -> &str {
+        &self.context_wallet_uuid
+    }
+
+    #[must_use]
+    pub const fn vault_session_id(&self) -> VaultSessionId {
+        self.vault_session_id
+    }
+
+    #[must_use]
+    pub fn record_id(&self) -> String {
+        let vault_session_id = self.vault_session_id.as_str();
+        format!(
+            "software-context-seed:v1:base:{}:{}:context:{}:{}:vault-session:{}:{}",
+            self.base_profile_uuid.len(),
+            self.base_profile_uuid,
+            self.context_wallet_uuid.len(),
+            self.context_wallet_uuid,
+            vault_session_id.len(),
+            vault_session_id,
+        )
+    }
+}
+
+pub struct ProtectedSoftwareSeedSession {
+    encrypted_seed: EncryptedRecord,
+    binding: SoftwareSeedSessionBinding,
+}
+
+impl ProtectedSoftwareSeedSession {
+    pub(super) const fn from_parts(
+        binding: SoftwareSeedSessionBinding,
+        encrypted_seed: EncryptedRecord,
+    ) -> Self {
+        Self {
+            encrypted_seed,
+            binding,
+        }
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &SoftwareSeedSessionBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn encrypted_record(&self) -> &EncryptedRecord {
+        &self.encrypted_seed
+    }
+
+    pub fn open(
+        &self,
+        grant: &mut SpendGrant,
+        expected_binding: &SoftwareSeedSessionBinding,
+    ) -> Result<Zeroizing<[u8; SOFTWARE_CONTEXT_SEED_LEN]>, VaultError> {
+        if &self.binding != expected_binding {
+            return Err(VaultError::SoftwareSeedSessionBindingMismatch);
+        }
+        let spend = grant.take_spend_unlock()?;
+        let plaintext = spend.decrypt_record(
+            RecordKind::SoftwareContextSeed,
+            &self.binding.record_id(),
+            &self.encrypted_seed,
+        )?;
+        if plaintext.len() != SOFTWARE_CONTEXT_SEED_LEN {
+            return Err(VaultError::InvalidSoftwareSeedLength);
+        }
+        let mut seed = [0u8; SOFTWARE_CONTEXT_SEED_LEN];
+        seed.copy_from_slice(&plaintext);
+        Ok(Zeroizing::new(seed))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalletSoftwareContextKind {
+    Standard,
+    Passphrase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalletSoftwareContext {
+    pub version: u32,
+    pub base_profile_uuid: String,
+    pub kind: WalletSoftwareContextKind,
+    #[serde(default)]
+    pub auto_open_standard_context: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftwareContextSyncIntent {
+    CreateNew,
+    RecoverExisting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftwareContextChainInput {
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub contract: String,
+    pub deployment_block: u64,
+    pub current_safe_head: Option<u64>,
+}
+
+pub enum CreateSoftwareContextResult {
+    ExistingContext {
+        metadata: WalletMetadataBundle,
+        protected_seed_session: ProtectedSoftwareSeedSession,
+    },
+    Created {
+        metadata: WalletMetadataBundle,
+        public_account: PublicAccountMetadata,
+        chain_metadata: Vec<WalletChainMetadataBundle>,
+        protected_seed_session: ProtectedSoftwareSeedSession,
+    },
+}
+
+impl WalletSoftwareContext {
+    #[must_use]
+    pub fn standard(base_profile_uuid: impl Into<String>) -> Self {
+        Self {
+            version: SOFTWARE_CONTEXT_VERSION,
+            base_profile_uuid: base_profile_uuid.into(),
+            kind: WalletSoftwareContextKind::Standard,
+            auto_open_standard_context: false,
+        }
+    }
+
+    #[must_use]
+    pub fn passphrase(base_profile_uuid: impl Into<String>) -> Self {
+        Self {
+            version: SOFTWARE_CONTEXT_VERSION,
+            base_profile_uuid: base_profile_uuid.into(),
+            kind: WalletSoftwareContextKind::Passphrase,
+            auto_open_standard_context: false,
+        }
+    }
+
+    pub(super) fn validate_for_wallet(&self, wallet_uuid: &str) -> Result<(), VaultError> {
+        if self.version != SOFTWARE_CONTEXT_VERSION || self.base_profile_uuid.is_empty() {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        if matches!(self.kind, WalletSoftwareContextKind::Standard)
+            && self.base_profile_uuid != wallet_uuid
+        {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        if matches!(self.kind, WalletSoftwareContextKind::Passphrase)
+            && (self.base_profile_uuid == wallet_uuid || self.auto_open_standard_context)
+        {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletSpendSource {
     Software,
@@ -115,6 +326,8 @@ pub struct WalletMetadataBundle {
     pub hardware_account: Option<HardwareRailgunAccountMetadata>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pending_create_new_chain_ids: BTreeSet<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_context: Option<WalletSoftwareContext>,
 }
 
 impl WalletMetadataBundle {
@@ -124,6 +337,23 @@ impl WalletMetadataBundle {
             .as_ref()
             .map(|account| &account.descriptor)
             .or(self.hardware_descriptor.as_ref())
+    }
+
+    pub(super) fn validate(&self) -> Result<(), VaultError> {
+        if self.source.is_hardware_derived()
+            || self.hardware_descriptor.is_some()
+            || self.hardware_account.is_some()
+        {
+            if self.software_context.is_some() {
+                return Err(VaultError::InvalidWalletMetadata);
+            }
+            return Ok(());
+        }
+
+        let Some(context) = self.software_context.as_ref() else {
+            return Err(VaultError::InvalidWalletMetadata);
+        };
+        context.validate_for_wallet(&self.wallet_uuid)
     }
 }
 
@@ -820,12 +1050,15 @@ pub(super) struct WalletMetadataWire {
     pub(super) hardware_account: Option<HardwareRailgunAccountMetadata>,
     #[serde(default)]
     pub(super) pending_create_new_chain_ids: BTreeSet<u64>,
+    #[serde(default)]
+    pub(super) software_context: Option<WalletSoftwareContext>,
 }
 
 pub(super) struct DecodedWalletMetadata {
     pub(super) metadata: WalletMetadataBundle,
     pub(super) missing_lifecycle_fields: bool,
     pub(super) missing_display_order: bool,
+    pub(super) missing_software_context: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -174,6 +174,7 @@ impl WalletRoot {
                 request_key,
                 request.review_token,
                 Zeroizing::new(String::new()),
+                None,
                 window,
                 cx,
             );
@@ -193,6 +194,9 @@ impl WalletRoot {
         request_key: &str,
         review_token: u64,
         vault_password: Zeroizing<String>,
+        protected_software_seed_session: Option<
+            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+        >,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -318,6 +322,7 @@ impl WalletRoot {
                 vault_store,
                 view_session,
                 vault_password,
+                protected_software_seed_session,
                 trezor_app_passphrase,
                 trezor_pin_matrix_provider,
                 effective_chain,

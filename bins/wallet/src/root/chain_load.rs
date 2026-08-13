@@ -87,6 +87,18 @@ pub(super) fn chain_load_start_is_allowed(
     }
 }
 
+pub(super) const fn wallet_sync_start_is_admitted(
+    pending_software_profile_open: bool,
+    has_view_session: bool,
+    has_selected_wallet: bool,
+    maintenance_allows_start: bool,
+) -> bool {
+    !pending_software_profile_open
+        && has_view_session
+        && has_selected_wallet
+        && maintenance_allows_start
+}
+
 pub(super) const fn wallet_sync_maintenance_allows_start(
     public_sync_cache_resetting: bool,
     merkle_forest_cache_resetting: bool,
@@ -526,6 +538,12 @@ impl WalletSyncLifecycleCleanupWaitGroup {
     }
 
     pub(super) async fn shutdown_for_root_replacement(
+        self,
+    ) -> Result<WalletSyncLifecycleCleanupReport, String> {
+        self.wait().await
+    }
+
+    pub(super) async fn shutdown_for_wallet_replacement(
         self,
     ) -> Result<WalletSyncLifecycleCleanupReport, String> {
         self.wait().await
@@ -1364,6 +1382,7 @@ impl WalletRoot {
     }
 
     pub(super) fn reset_wallet_scoped_state(&mut self, cx: &mut Context<'_, Self>) {
+        self.clear_protected_software_seed_session(cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
@@ -1459,6 +1478,10 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> WalletSyncLifecycleCleanupWaitGroup {
         self.advance_active_wallet_generation();
+        self.pending_software_profile_open = None;
+        self.pending_software_profile_base_profile_uuid = None;
+        self.invalidate_pending_profile_open_tokens();
+        self.revealed_passphrase_context_id = None;
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.start_wallet_sync_cleanup(cleanup);
         self.reset_wallet_scoped_state(cx);
@@ -1471,6 +1494,10 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> (WalletSyncLifecycleCleanupWaitGroup, HttpContext) {
         self.advance_active_wallet_generation();
+        self.pending_software_profile_open = None;
+        self.pending_software_profile_base_profile_uuid = None;
+        self.invalidate_pending_profile_open_tokens();
+        self.revealed_passphrase_context_id = None;
         let cleanup = self.wallet_sync_lifecycle.invalidate();
         self.wallet_sync_lifecycle_shutdown_started = true;
         let outgoing_http = self.http.clone();
@@ -1703,23 +1730,27 @@ impl WalletRoot {
             tracing::debug!(chain_id, "skipping wallet sync during wallet deletion");
             return;
         }
-        let Some(view_session) = self.view_session.clone() else {
-            tracing::debug!(
-                chain_id,
-                "skipping wallet sync without active wallet session"
-            );
-            return;
-        };
-        if !wallet_sync_maintenance_allows_start(
-            self.public_sync_cache_resetting,
-            self.merkle_forest_cache_resetting,
+        if !wallet_sync_start_is_admitted(
+            matches!(
+                self.vault_state,
+                super::VaultState::PendingSoftwareProfileOpen
+            ),
+            self.view_session.is_some(),
+            self.selected_wallet_id.is_some(),
+            wallet_sync_maintenance_allows_start(
+                self.public_sync_cache_resetting,
+                self.merkle_forest_cache_resetting,
+            ),
         ) {
             tracing::debug!(
                 chain_id,
-                "skipping wallet sync during destructive cache reset"
+                "skipping wallet sync without an admitted wallet context"
             );
             return;
         }
+        let Some(view_session) = self.view_session.clone() else {
+            return;
+        };
         if matches!(
             self.chain_states.get(&chain_id),
             Some(

@@ -8,7 +8,7 @@ use super::{
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 4;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
-pub const WALLET_UI_STATE_VERSION: u32 = 1;
+pub const WALLET_UI_STATE_VERSION: u32 = 2;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x4fa849f01e8983c4393eee6e7482f60d4f9702e2d7917101a0edeb001369d5c5";
 pub const LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
@@ -103,12 +103,21 @@ pub struct PrivacySettings {
     pub mimic_railway_shields_by_default: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RememberedWalletKind {
+    #[default]
+    Unknown,
+    SoftwareProfile,
+    HardwareWallet,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WalletUiState {
     pub version: u32,
     pub last_wallet_id: Option<String>,
     pub last_chain_id: Option<u64>,
+    pub last_wallet_kind: RememberedWalletKind,
 }
 
 impl Default for WalletUiState {
@@ -117,6 +126,7 @@ impl Default for WalletUiState {
             version: WALLET_UI_STATE_VERSION,
             last_wallet_id: None,
             last_chain_id: None,
+            last_wallet_kind: RememberedWalletKind::Unknown,
         }
     }
 }

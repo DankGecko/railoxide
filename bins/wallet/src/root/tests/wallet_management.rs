@@ -1,9 +1,14 @@
 use super::*;
 use crate::root::manage_wallets::{
-    restart_selected_wallet_sync_after_deletion, wallet_management_delete_requires_device,
+    WalletManagementDeleteKind, restart_selected_wallet_sync_after_deletion,
+    wallet_management_delete_kind, wallet_management_delete_requires_device,
+    wallet_management_delete_uses_dialog, wallet_management_deletion_affects_selected_wallet,
     wallet_management_preserves_hidden_delete_session, wallet_management_switch_requires_device,
 };
-use crate::root::vault::vault_lock_is_allowed;
+use crate::root::vault::{
+    SoftwareProfileRestoreAction, remembered_wallet_id_for_restore,
+    software_profile_restore_action, vault_lock_is_allowed,
+};
 
 #[test]
 fn active_dialog_blocks_background_focus_changes() {
@@ -60,6 +65,20 @@ fn hardware_delete_requires_matching_open_session() {
 }
 
 #[test]
+fn software_wallet_deletion_uses_the_shared_dialog() {
+    assert!(wallet_management_delete_uses_dialog(
+        WalletSource::Generated
+    ));
+    assert!(wallet_management_delete_uses_dialog(WalletSource::Imported));
+    assert!(!wallet_management_delete_uses_dialog(
+        WalletSource::LedgerDerived
+    ));
+    assert!(!wallet_management_delete_uses_dialog(
+        WalletSource::TrezorDerived
+    ));
+}
+
+#[test]
 fn hidden_hardware_delete_session_survives_management_refresh() {
     assert!(wallet_management_preserves_hidden_delete_session(
         Some("hardware-wallet"),
@@ -75,6 +94,110 @@ fn hidden_hardware_delete_session_survives_management_refresh() {
         None,
         Some("hardware-wallet"),
         Some("hardware-wallet"),
+    ));
+}
+
+#[test]
+fn standard_delete_is_profile_scoped() {
+    let mut base = wallet_metadata(
+        "base-profile",
+        "Standard",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        0,
+    );
+    base.software_context = Some(wallet_ops::vault::WalletSoftwareContext::standard(
+        "base-profile",
+    ));
+    let mut child = wallet_metadata(
+        "concealed-child",
+        "Concealed child",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        1,
+    );
+    child.software_context = Some(wallet_ops::vault::WalletSoftwareContext::passphrase(
+        "base-profile",
+    ));
+    let metadata = vec![base.clone(), child];
+
+    assert_eq!(
+        wallet_management_delete_kind(&base, &metadata),
+        WalletManagementDeleteKind::SoftwareProfile
+    );
+}
+
+#[test]
+fn whole_profile_deletion_of_selected_child_requires_profile_cleanup() {
+    let mut base = wallet_metadata(
+        "base-profile",
+        "Base",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        0,
+    );
+    base.software_context = Some(wallet_ops::vault::WalletSoftwareContext::standard(
+        "base-profile",
+    ));
+    let mut child = wallet_metadata(
+        "profile-child",
+        "Child",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        1,
+    );
+    child.software_context = Some(wallet_ops::vault::WalletSoftwareContext::passphrase(
+        "base-profile",
+    ));
+    let mut unrelated_child = wallet_metadata(
+        "unrelated-child",
+        "Unrelated child",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        2,
+    );
+    unrelated_child.software_context = Some(wallet_ops::vault::WalletSoftwareContext::passphrase(
+        "other-profile",
+    ));
+    let ordinary = wallet_metadata(
+        "ordinary-wallet",
+        "Ordinary",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        3,
+    );
+    let metadata = vec![base.clone(), child, unrelated_child, ordinary.clone()];
+
+    assert!(wallet_management_deletion_affects_selected_wallet(
+        &base,
+        WalletManagementDeleteKind::SoftwareProfile,
+        Some("base-profile"),
+        &metadata,
+    ));
+    assert!(wallet_management_deletion_affects_selected_wallet(
+        &base,
+        WalletManagementDeleteKind::SoftwareProfile,
+        Some("profile-child"),
+        &metadata,
+    ));
+    assert!(!wallet_management_deletion_affects_selected_wallet(
+        &base,
+        WalletManagementDeleteKind::SoftwareProfile,
+        Some("unrelated-child"),
+        &metadata,
+    ));
+
+    assert!(wallet_management_deletion_affects_selected_wallet(
+        &ordinary,
+        WalletManagementDeleteKind::Wallet,
+        Some("ordinary-wallet"),
+        &metadata,
+    ));
+    assert!(!wallet_management_deletion_affects_selected_wallet(
+        &ordinary,
+        WalletManagementDeleteKind::Wallet,
+        Some("profile-child"),
+        &metadata,
     ));
 }
 
@@ -119,10 +242,6 @@ fn completed_hardware_delete_target_open_preserves_intent_on_dialog_close() {
         Some("hardware-wallet")
     );
 }
-
-const RESTORE_TEST_PASSWORD: &str = "restore test password";
-const RESTORE_TEST_MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
 fn hardware_wallet_metadata(
     wallet_uuid: &str,
@@ -202,48 +321,6 @@ fn hardware_account_picker_row(
     }
 }
 
-fn restore_test_wallet_options(
-    name: &str,
-) -> (PathBuf, DesktopVaultStore, ViewUnlock, Vec<WalletOption>) {
-    let root = temp_wallet_db_root(name);
-    let store = DesktopVaultStore::open(root.clone()).expect("open wallet store");
-    store
-        .create_vault_with_params(
-            RESTORE_TEST_PASSWORD,
-            wallet_ops::vault::KdfParams::new(1024, 1, 1),
-        )
-        .expect("create vault");
-    for (wallet_id, label) in [("wallet-a", "Alpha"), ("wallet-b", "Beta")] {
-        let metadata = store
-            .new_wallet_metadata(
-                RESTORE_TEST_PASSWORD,
-                wallet_id,
-                0,
-                WalletSource::Imported,
-                label,
-            )
-            .expect("wallet metadata");
-        store
-            .import_wallet_mnemonic_with_metadata(
-                RESTORE_TEST_PASSWORD,
-                wallet_id,
-                0,
-                "english",
-                RESTORE_TEST_MNEMONIC,
-                &metadata,
-            )
-            .expect("import wallet");
-    }
-    let view = store
-        .unlock_view(RESTORE_TEST_PASSWORD)
-        .expect("unlock view");
-    let metadata = store
-        .list_wallet_metadata_with_view_unlock(&view, true)
-        .expect("list metadata");
-    let options = wallet_options_from_metadata(metadata);
-    (root, store, view, options)
-}
-
 #[test]
 fn wallet_options_hide_inactive_and_sort_active_metadata() {
     let options = wallet_options_from_metadata(vec![
@@ -277,88 +354,64 @@ fn wallet_options_hide_inactive_and_sort_active_metadata() {
 }
 
 #[test]
-fn remembered_wallet_option_resolves_only_active_wallet_options() {
-    let options = wallet_options_from_metadata(vec![
-        wallet_metadata(
-            "wallet-hidden",
-            "Hidden",
-            WalletSource::Imported,
-            WalletStatus::Inactive,
-            0,
-        ),
-        wallet_metadata(
-            "wallet-b",
-            "Beta",
-            WalletSource::Imported,
-            WalletStatus::Active,
-            1,
-        ),
-    ]);
+fn remembered_software_state_resolves_to_the_standard_context() {
+    let standard = wallet_metadata(
+        "base-profile",
+        "Standard",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        0,
+    );
+    let mut child = wallet_metadata(
+        "passphrase-child",
+        "Passphrase",
+        WalletSource::Imported,
+        WalletStatus::Active,
+        1,
+    );
+    child.software_context = Some(wallet_ops::vault::WalletSoftwareContext::passphrase(
+        "base-profile",
+    ));
+    let metadata = vec![standard, child];
 
     assert_eq!(
-        remembered_wallet_option(&options, Some("wallet-b"))
-            .expect("remembered active wallet")
-            .wallet_id
-            .as_ref(),
-        "wallet-b"
+        remembered_wallet_id_for_restore(
+            &metadata,
+            Some("base-profile"),
+            wallet_ops::settings::RememberedWalletKind::SoftwareProfile,
+        )
+        .expect("standard profile")
+        .as_ref(),
+        "base-profile"
     );
-    assert!(remembered_wallet_option(&options, Some("wallet-hidden")).is_none());
-    assert!(remembered_wallet_option(&options, None).is_none());
-}
-
-#[test]
-fn remembered_software_wallet_restore_prefers_remembered_wallet() {
-    let (root, store, view, options) = restore_test_wallet_options("remembered-restore");
-
-    let session = load_preferred_password_unlockable_wallet_session(
-        &store,
-        &view,
-        &options,
-        Some("wallet-b"),
-    )
-    .expect("load preferred wallet")
-    .expect("session");
-
-    assert_eq!(session.wallet_id(), "wallet-b");
-
-    drop(session);
-    drop(store);
-    fs::remove_dir_all(root).expect("remove temp wallet db");
-}
-
-#[test]
-fn missing_remembered_wallet_falls_back_to_first_loadable_wallet() {
-    let (root, store, view, options) = restore_test_wallet_options("remembered-missing");
-
-    let session = load_preferred_password_unlockable_wallet_session(
-        &store,
-        &view,
-        &options,
-        Some("missing-wallet"),
-    )
-    .expect("load fallback wallet")
-    .expect("session");
-
-    assert_eq!(session.wallet_id(), "wallet-a");
-
-    drop(session);
-    drop(store);
-    fs::remove_dir_all(root).expect("remove temp wallet db");
-}
-
-#[test]
-fn no_remembered_wallet_falls_back_to_first_loadable_wallet() {
-    let (root, store, view, options) = restore_test_wallet_options("remembered-none");
-
-    let session = load_preferred_password_unlockable_wallet_session(&store, &view, &options, None)
-        .expect("load fallback wallet")
-        .expect("session");
-
-    assert_eq!(session.wallet_id(), "wallet-a");
-
-    drop(session);
-    drop(store);
-    fs::remove_dir_all(root).expect("remove temp wallet db");
+    assert_eq!(
+        remembered_wallet_id_for_restore(
+            &metadata,
+            Some("passphrase-child"),
+            wallet_ops::settings::RememberedWalletKind::SoftwareProfile,
+        )
+        .expect("child software state")
+        .as_ref(),
+        "base-profile"
+    );
+    assert_eq!(
+        remembered_wallet_id_for_restore(
+            &metadata,
+            Some("passphrase-child"),
+            wallet_ops::settings::RememberedWalletKind::Unknown,
+        )
+        .expect("legacy child state")
+        .as_ref(),
+        "base-profile"
+    );
+    assert_eq!(
+        software_profile_restore_action(true),
+        SoftwareProfileRestoreAction::Standard
+    );
+    assert_eq!(
+        software_profile_restore_action(false),
+        SoftwareProfileRestoreAction::Pending
+    );
 }
 
 #[cfg(feature = "hardware")]

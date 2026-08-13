@@ -249,7 +249,21 @@ fn locked_vault_screen_exposes_pre_unlock_settings_action() {
         &VaultState::SetupWallet
     ));
     assert!(!should_show_pre_unlock_settings_action(
+        &VaultState::SwitchingWallet
+    ));
+    assert!(!should_show_pre_unlock_settings_action(
+        &VaultState::PendingSoftwareProfileOpen
+    ));
+    assert!(!should_show_pre_unlock_settings_action(
         &VaultState::ViewUnlocked
+    ));
+}
+
+#[test]
+fn switching_wallet_does_not_request_vault_input_focus() {
+    assert!(!should_focus_vault_input(
+        &VaultState::SwitchingWallet,
+        WalletSetupMode::Choose,
     ));
 }
 

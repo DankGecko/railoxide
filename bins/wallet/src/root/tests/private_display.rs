@@ -323,6 +323,14 @@ fn remembered_spend_authorization_expires_by_lifetime() {
 }
 
 #[test]
+fn reusable_spend_authorization_warning_matches_lifetime() {
+    assert!(!SpendAuthorizationLifetime::Once.requires_reusable_authorization_warning());
+    assert!(SpendAuthorizationLifetime::FiveMinutes.requires_reusable_authorization_warning());
+    assert!(SpendAuthorizationLifetime::FifteenMinutes.requires_reusable_authorization_warning());
+    assert!(SpendAuthorizationLifetime::UntilVaultLock.requires_reusable_authorization_warning());
+}
+
+#[test]
 fn hardware_spend_authorization_copy_uses_concise_device_language() {
     let copy = crate::root::spend_authorization::hardware_spend_authorization_instruction("Ledger");
     let detail = crate::root::spend_authorization::hardware_spend_authorization_detail();

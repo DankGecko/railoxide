@@ -1,11 +1,14 @@
 use super::{
-    DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, SoftwareRailgunSpendSigner,
-    SpendGrant, StoredWalletRecord, VaultError, VaultRecordEntries, ViewUnlock, WALLET_VIEW_PREFIX,
-    WalletKeys, WalletMetadataBundle, WalletSpendBundle, WalletViewBundle, Zeroizing,
-    bip39_entropy_from_mnemonic, initial_derived_public_account,
-    public_account_metadata_record_entry, unlock_spend, unlock_view,
-    wallet_chain_index_complete_record_entry, wallet_metadata_record_key, wallet_spend_record_key,
-    wallet_view_record_key,
+    DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, ProtectedSoftwareSeedSession,
+    PublicAccountScope, PublicAccountSource, SoftwareRailgunSpendSigner,
+    SoftwareSeedSessionBinding, SpendGrant, StoredWalletRecord, VaultError, VaultRecordEntries,
+    ViewUnlock, WALLET_VIEW_PREFIX, WalletKeys, WalletMetadataBundle, WalletSoftwareContextKind,
+    WalletSpendBundle, WalletViewBundle, Zeroizing, bip39_entropy_from_mnemonic,
+    bip39_mnemonic_from_entropy, derive_public_evm_address_from_seed,
+    initial_derived_public_account, public_account_metadata_record_entry, unlock_spend,
+    unlock_view, wallet_chain_index_complete_record_entry, wallet_keys_from_mnemonic,
+    wallet_keys_from_seed, wallet_metadata_record_key, wallet_spend_record_key,
+    wallet_view_record_key, zeroize_wallet_keys,
 };
 
 impl DesktopVaultStore {
@@ -241,8 +244,73 @@ impl DesktopVaultStore {
         wallet_id: &str,
     ) -> Result<SoftwareRailgunSpendSigner, VaultError> {
         let bundle = self.load_spend_bundle(grant, wallet_id)?;
-        let wallet =
-            WalletKeys::from_bip39_entropy(&bundle.bip39_entropy, bundle.derivation_index)?;
+        let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(&bundle.bip39_entropy)?);
+        let wallet = wallet_keys_from_mnemonic(&mnemonic, "", bundle.derivation_index)?;
+        Ok(SoftwareRailgunSpendSigner { wallet })
+    }
+
+    pub fn railgun_spend_signer_for_session(
+        &self,
+        grant: &mut SpendGrant,
+        view_session: &DesktopViewSession,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+    ) -> Result<SoftwareRailgunSpendSigner, VaultError> {
+        let wallet_id = view_session.wallet_id();
+        let metadata = self.load_wallet_metadata_with_view(&view_session.view, wallet_id)?;
+        let Some(context) = metadata.software_context.as_ref() else {
+            return Err(VaultError::InvalidWalletMetadata);
+        };
+        let wallet = match context.kind {
+            WalletSoftwareContextKind::Standard => {
+                let bundle = self.load_spend_bundle(grant, wallet_id)?;
+                let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(&bundle.bip39_entropy)?);
+                wallet_keys_from_mnemonic(&mnemonic, "", bundle.derivation_index)?
+            }
+            WalletSoftwareContextKind::Passphrase => {
+                let session =
+                    protected_seed_session.ok_or(VaultError::SoftwareSeedSessionRequired)?;
+                let binding = SoftwareSeedSessionBinding::new(
+                    &context.base_profile_uuid,
+                    wallet_id,
+                    session.binding().vault_session_id(),
+                );
+                let seed = session.open(grant, &binding)?;
+                let wallet = wallet_keys_from_seed(&seed, view_session.derivation_index())?;
+                let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+                let identity_accounts = accounts
+                    .iter()
+                    .filter(|account| {
+                        account.source == PublicAccountSource::Derived
+                            && account.derivation_index == Some(0)
+                            && matches!(
+                                &account.scope,
+                                PublicAccountScope::PrivateWallet { wallet_uuid }
+                                    if wallet_uuid == view_session.wallet_id()
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                if identity_accounts.len() != 1
+                    || identity_accounts[0].address
+                        != derive_public_evm_address_from_seed(&seed, 0)?
+                {
+                    let mut wallet = wallet;
+                    zeroize_wallet_keys(&mut wallet);
+                    return Err(VaultError::InvalidSoftwareContextIdentity);
+                }
+                wallet
+            }
+        };
+        let view_record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
+        let persisted_view = view_session
+            .view
+            .decrypt_view_bundle(wallet_id, &view_record)?;
+        if persisted_view.derivation_index != view_session.derivation_index()
+            || !wallet_identity_matches_view_bundle(&wallet, &persisted_view)
+        {
+            let mut wallet = wallet;
+            zeroize_wallet_keys(&mut wallet);
+            return Err(VaultError::InvalidSoftwareContextIdentity);
+        }
         Ok(SoftwareRailgunSpendSigner { wallet })
     }
 
@@ -255,11 +323,19 @@ impl DesktopVaultStore {
         entropy: &[u8],
         metadata: Option<&WalletMetadataBundle>,
     ) -> Result<(StoredWalletRecord, VaultRecordEntries), VaultError> {
+        if metadata
+            .and_then(|metadata| metadata.software_context.as_ref())
+            .is_some_and(|context| context.kind == WalletSoftwareContextKind::Passphrase)
+        {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
         let vault_metadata = self.metadata()?;
         let view = unlock_view(&vault_metadata, password)?;
         let spend = unlock_spend(&vault_metadata, password)?;
-        let wallet = WalletKeys::from_bip39_entropy(entropy, derivation_index)?;
+        let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(entropy)?);
+        let mut wallet = wallet_keys_from_mnemonic(&mnemonic, "", derivation_index)?;
         let view_bundle = WalletViewBundle::from_wallet_keys(derivation_index, &wallet);
+        zeroize_wallet_keys(&mut wallet);
         let spend_bundle = WalletSpendBundle {
             derivation_index,
             bip39_language,
@@ -305,4 +381,11 @@ impl DesktopVaultStore {
             records,
         ))
     }
+}
+
+fn wallet_identity_matches_view_bundle(wallet: &WalletKeys, bundle: &WalletViewBundle) -> bool {
+    wallet.spending_public_key.map(|value| value.to_be_bytes()) == bundle.spending_public_key
+        && wallet.viewing.viewing_public_key == bundle.viewing_public_key
+        && wallet.viewing.nullifying_key.to_be_bytes() == bundle.nullifying_key
+        && wallet.viewing.master_public_key.to_be_bytes() == bundle.master_public_key
 }

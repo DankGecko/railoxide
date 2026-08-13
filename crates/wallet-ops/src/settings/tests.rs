@@ -13,9 +13,9 @@ use super::{
     OFFICIAL_INDEXED_ARTIFACT_GATEWAYS, OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME,
     OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY, OFFICIAL_POI_ARTIFACT_GATEWAYS,
     OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
-    PoiArtifactManifestSourceSetting, PoiReadSourceSetting, WALLET_SETTINGS_KEY,
-    WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WakuDirectPeerSetting,
-    WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
+    PoiArtifactManifestSourceSetting, PoiReadSourceSetting, RememberedWalletKind,
+    WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION,
+    WakuDirectPeerSetting, WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
     build_effective_chain_configs, build_effective_token_registry, decode_wallet_settings,
     decode_wallet_ui_state, encode_wallet_settings, load_wallet_settings, load_wallet_ui_state,
     save_wallet_settings, save_wallet_ui_state, should_show_chain_deployment_metadata_settings,
@@ -773,6 +773,7 @@ fn ui_state_roundtrip_through_local_db() {
         version: 0,
         last_wallet_id: Some("wallet-123".to_owned()),
         last_chain_id: Some(137),
+        last_wallet_kind: RememberedWalletKind::SoftwareProfile,
     };
 
     save_wallet_ui_state(&store, &state).expect("save UI state");
@@ -784,7 +785,70 @@ fn ui_state_roundtrip_through_local_db() {
             version: WALLET_UI_STATE_VERSION,
             last_wallet_id: Some("wallet-123".to_owned()),
             last_chain_id: Some(137),
+            last_wallet_kind: RememberedWalletKind::SoftwareProfile,
         }
+    );
+
+    save_wallet_ui_state(
+        &store,
+        &WalletUiState {
+            version: WALLET_UI_STATE_VERSION,
+            last_wallet_id: Some("hardware-123".to_owned()),
+            last_chain_id: Some(137),
+            last_wallet_kind: RememberedWalletKind::HardwareWallet,
+        },
+    )
+    .expect("save hardware UI state");
+    assert_eq!(
+        load_wallet_ui_state(&store).expect("load hardware UI state"),
+        WalletUiState {
+            version: WALLET_UI_STATE_VERSION,
+            last_wallet_id: Some("hardware-123".to_owned()),
+            last_chain_id: Some(137),
+            last_wallet_kind: RememberedWalletKind::HardwareWallet,
+        }
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn released_v1_ui_state_migrates_to_unknown_kind_and_persists_v2() {
+    #[derive(Serialize)]
+    struct ReleasedV1WalletUiState {
+        version: u32,
+        last_wallet_id: Option<String>,
+        last_chain_id: Option<u64>,
+    }
+
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let payload = rmp_serde::to_vec_named(&ReleasedV1WalletUiState {
+        version: 1,
+        last_wallet_id: Some("legacy-wallet".to_owned()),
+        last_chain_id: Some(56),
+    })
+    .expect("encode released v1 UI state");
+    store
+        .put_app_settings_record(WALLET_UI_STATE_KEY, &payload)
+        .expect("store released v1 UI state");
+
+    let loaded = load_wallet_ui_state(&store).expect("migrate UI state");
+    assert_eq!(loaded.version, WALLET_UI_STATE_VERSION);
+    assert_eq!(loaded.last_wallet_id.as_deref(), Some("legacy-wallet"));
+    assert_eq!(loaded.last_chain_id, Some(56));
+    assert_eq!(loaded.last_wallet_kind, RememberedWalletKind::Unknown);
+    let persisted = store
+        .get_app_settings_record(WALLET_UI_STATE_KEY)
+        .expect("load migrated UI state")
+        .expect("migrated UI state");
+    assert_eq!(
+        decode_wallet_ui_state(&persisted).expect("decode migrated UI state"),
+        loaded
     );
 
     drop(store);
@@ -802,6 +866,7 @@ fn unsupported_future_ui_state_version_falls_back_to_empty() {
         version: WALLET_UI_STATE_VERSION + 1,
         last_wallet_id: Some("wallet-123".to_owned()),
         last_chain_id: Some(137),
+        last_wallet_kind: RememberedWalletKind::Unknown,
     };
     let data = rmp_serde::to_vec_named(&state).expect("encode future UI state");
     store

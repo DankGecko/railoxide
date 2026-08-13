@@ -1,12 +1,14 @@
 mod address_book;
 mod broadcaster_preferences;
 mod core_crypto;
+mod derivation_compatibility;
 mod encrypted_cache;
 mod first_run;
 mod hardware;
 mod helpers;
 mod key_export;
 mod public_accounts;
+mod software_context;
 mod wallet_metadata;
 mod wallet_storage;
 mod walletconnect_sessions;

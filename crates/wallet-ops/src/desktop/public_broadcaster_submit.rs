@@ -184,7 +184,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
 
     let signer = request.spend_authorization.into_signer(
         request.vault_store.as_ref(),
-        request.view_session.wallet_id(),
+        request.view_session.as_ref(),
         "public broadcaster unshield",
     )?;
 
@@ -600,7 +600,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
 
     let signer = request.spend_authorization.into_signer(
         request.vault_store.as_ref(),
-        request.view_session.wallet_id(),
+        request.view_session.as_ref(),
         "public broadcaster send",
     )?;
 

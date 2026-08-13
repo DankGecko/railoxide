@@ -52,4 +52,5 @@ pub use self_broadcast::{
     sponsored_self_broadcast_head_poll_interval,
 };
 pub use sessions::*;
+pub use sync_helpers::fetch_current_safe_head;
 pub(crate) use sync_helpers::*;

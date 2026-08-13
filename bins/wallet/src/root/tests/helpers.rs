@@ -256,5 +256,7 @@ pub(super) fn wallet_metadata(
         hardware_descriptor: None,
         hardware_account: None,
         pending_create_new_chain_ids: BTreeSet::new(),
+        software_context: (!source.is_hardware_derived())
+            .then(|| wallet_ops::vault::WalletSoftwareContext::standard(wallet_uuid)),
     }
 }

@@ -60,7 +60,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
 
     let signer = request.spend_authorization.into_signer(
         request.vault_store,
-        request.view_session.wallet_id(),
+        request.view_session,
         "unshield",
     )?;
 
@@ -409,7 +409,7 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
 
     let signer = request.spend_authorization.signer(
         request.vault_store.as_ref(),
-        request.view_session.wallet_id(),
+        request.view_session.as_ref(),
         "blocked Shield refund",
     )?;
     let tx_builder = TransactionBuilder {
@@ -579,7 +579,7 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
 
     let signer = request.spend_authorization.into_signer(
         request.vault_store,
-        request.view_session.wallet_id(),
+        request.view_session,
         "send",
     )?;
 
@@ -1656,11 +1656,8 @@ async fn prepare_desktop_sponsored_calldata(
         .ok_or_else(|| eyre!("chain handle not found for chain {chain_id}"))?;
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
-    let signer = spend_authorization.into_signer(
-        vault_store,
-        view_session.wallet_id(),
-        "sponsored private action",
-    )?;
+    let signer =
+        spend_authorization.into_signer(vault_store, view_session, "sponsored private action")?;
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id,
@@ -1957,6 +1954,7 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
             session: request.session,
             vault_store: request.vault_store,
             vault_password: request.vault_password,
+            protected_software_seed_session: request.protected_software_seed_session,
             trezor_pin_matrix_provider: request.trezor_pin_matrix_provider,
             public_account_uuid: request.public_account_uuid,
             prepared: prepared.clone(),
@@ -2006,6 +2004,7 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
             session: request.session,
             vault_store: request.vault_store,
             vault_password: request.vault_password,
+            protected_software_seed_session: request.protected_software_seed_session,
             trezor_pin_matrix_provider: request.trezor_pin_matrix_provider,
             public_account_uuid: request.public_account_uuid,
             prepared: prepared.clone(),
@@ -2541,6 +2540,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
             .vault_password
             .as_ref()
             .map(|password| password.as_str()),
+        request.protected_software_seed_session.as_deref(),
         request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),
@@ -2589,6 +2589,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
         Some(request.vault_password.as_str()),
+        request.protected_software_seed_session.as_deref(),
         request.trezor_pin_matrix_provider,
         prepared.public_account_uuid,
         Arc::clone(&request.session),
@@ -2657,6 +2658,7 @@ pub async fn submit_desktop_send_self_broadcast(
             .vault_password
             .as_ref()
             .map(|password| password.as_str()),
+        request.protected_software_seed_session.as_deref(),
         request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),

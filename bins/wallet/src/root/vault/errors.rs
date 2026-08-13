@@ -20,7 +20,22 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         VaultError::VaultNotFound => "vault_not_found",
         VaultError::UnlockFailed => "unlock_failed",
         VaultError::InvalidSpendGrant => "invalid_spend_grant",
+        VaultError::SoftwareSeedSessionBindingMismatch => "software_seed_session_binding_mismatch",
+        VaultError::SoftwareSeedSessionRequired => "software_seed_session_required",
+        VaultError::InvalidSoftwareSeedLength => "invalid_software_seed_length",
+        VaultError::DuplicateSoftwareContextIdentity => "duplicate_software_context_identity",
+        VaultError::InvalidSoftwareContextIdentity => "invalid_software_context_identity",
+        VaultError::PassphraseConfirmationMismatch => "passphrase_confirmation_mismatch",
+        VaultError::EmptySoftwareContextPassphrase => "empty_software_context_passphrase",
+        VaultError::SoftwareContextSafeHeadUnavailable => "software_context_safe_head_unavailable",
+        VaultError::SoftwareContextSafeHeadOverflow => "software_context_safe_head_overflow",
+        VaultError::DuplicateWalletUuid => "duplicate_wallet_uuid",
+        VaultError::StandardWalletHasPassphraseChildren => {
+            "standard_wallet_has_passphrase_children"
+        }
+        VaultError::DuplicateSoftwareContextChainInput => "duplicate_software_context_chain_input",
         VaultError::WalletNotFound => "wallet_not_found",
+        VaultError::InvalidWalletMetadata => "invalid_wallet_metadata",
         VaultError::InvalidWalletLabel => "invalid_wallet_label",
         VaultError::DuplicateWalletLabel => "duplicate_wallet_label",
         VaultError::InvalidWalletOrder => "invalid_wallet_order",
@@ -88,6 +103,41 @@ pub(in crate::root) fn vault_error_message(error: &VaultError) -> Arc<str> {
         }
         VaultError::WalletMnemonicUnavailable => {
             "Mnemonic seed export is unavailable for hardware-derived wallets.".into()
+        }
+        VaultError::SoftwareSeedSessionBindingMismatch => {
+            "The protected wallet session is no longer valid. Re-authorize the operation.".into()
+        }
+        VaultError::SoftwareSeedSessionRequired => {
+            "Open the protected wallet session before continuing.".into()
+        }
+        VaultError::InvalidSoftwareSeedLength => {
+            "The protected wallet session data is invalid. Re-authorize the operation.".into()
+        }
+        VaultError::DuplicateSoftwareContextIdentity => {
+            "Multiple matching wallet contexts were found. Choose a single context and try again."
+                .into()
+        }
+        VaultError::InvalidSoftwareContextIdentity => {
+            "The wallet context identity could not be verified. Try again.".into()
+        }
+        VaultError::PassphraseConfirmationMismatch => {
+            "Passphrase entries do not match. Re-enter them and try again.".into()
+        }
+        VaultError::EmptySoftwareContextPassphrase => {
+            "Enter a passphrase before continuing.".into()
+        }
+        VaultError::SoftwareContextSafeHeadUnavailable => {
+            "A current safe head is required before creating this wallet context.".into()
+        }
+        VaultError::SoftwareContextSafeHeadOverflow => {
+            "The wallet context scan start block is out of range.".into()
+        }
+        VaultError::DuplicateWalletUuid => {
+            "That wallet identifier is already in use. Choose a different context.".into()
+        }
+        VaultError::StandardWalletHasPassphraseChildren => "This standard wallet has passphrase wallets. Use the confirmed profile deletion action to remove the whole profile.".into(),
+        VaultError::DuplicateSoftwareContextChainInput => {
+            "Duplicate chain input was provided. Review the selected chains.".into()
         }
         VaultError::UnsupportedHardwareCustodyBackend(_) => {
             "This hardware wallet custody backend is not supported by this app version.".into()

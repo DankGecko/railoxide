@@ -1,6 +1,11 @@
 # Icon Sources
 
 - `square.svg`: Lucide `square`, ISC License, https://lucide.dev/icons/square
+- `square-asterisk.svg`: Lucide `square-asterisk`, ISC License, https://lucide.dev/icons/square-asterisk
+- `key-round.svg`: Lucide `key-round`, ISC License, https://lucide.dev/icons/key-round
+- `wrench.svg`: Lucide `wrench`, ISC License, https://lucide.dev/icons/wrench
+- `file-pen-line.svg`: Lucide `file-pen-line`, ISC License, https://lucide.dev/icons/file-pen-line
+- `folder-cog.svg`: Lucide `folder-cog`, ISC License, https://lucide.dev/icons/folder-cog
 - `clock.svg`: Lucide `clock`, ISC License, https://lucide.dev/icons/clock
 - `book-user.svg`: Lucide `book-user`, ISC License, https://lucide.dev/icons/book-user
 - `save.svg`: Lucide `save`, ISC License, https://lucide.dev/icons/save

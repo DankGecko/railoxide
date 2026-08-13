@@ -127,6 +127,7 @@ pub(super) fn hardware_wallet_metadata(
         hardware_descriptor: Some(descriptor),
         hardware_account: None,
         pending_create_new_chain_ids: BTreeSet::new(),
+        software_context: None,
     }
 }
 

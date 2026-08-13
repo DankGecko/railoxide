@@ -40,6 +40,7 @@ pub async fn submit_public_send_with_progress(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
+        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )?;
@@ -163,6 +164,7 @@ pub async fn submit_public_shield_with_progress(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
+        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )?;

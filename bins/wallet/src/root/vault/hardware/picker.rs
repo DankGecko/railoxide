@@ -1,3 +1,5 @@
+#[cfg(feature = "hardware")]
+use super::super::visible_wallet_metadata;
 #[cfg(not(feature = "hardware"))]
 use super::WalletRoot;
 #[cfg(feature = "hardware")]
@@ -381,7 +383,8 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.wallet_metadata = metadata.to_vec();
+        self.wallet_metadata =
+            visible_wallet_metadata(metadata, self.revealed_passphrase_context_id.as_deref());
         self.wallet_options = wallet_options_from_metadata(self.wallet_metadata.clone());
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
@@ -522,7 +525,7 @@ impl WalletRoot {
                     Ok(Ok((session, metadata))) => {
                         root.manage_wallets
                             .mark_hardware_delete_target_opened(session.wallet_id());
-                        root.install_view_session(session, metadata, window, cx);
+                        root.install_view_session(session, &metadata, window, cx);
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {
                         root.handle_hardware_profile_vault_error(&error);
@@ -761,9 +764,9 @@ impl WalletRoot {
                 match result {
                     Ok(Ok((session, metadata))) => {
                         if sync_intent == HardwareWalletSyncIntent::CreateNew {
-                            root.enter_new_wallet_view_unlocked(session, metadata, window, cx);
+                            root.enter_new_wallet_view_unlocked(session, &metadata, window, cx);
                         } else {
-                            root.install_view_session(session, metadata, window, cx);
+                            root.install_view_session(session, &metadata, window, cx);
                         }
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {

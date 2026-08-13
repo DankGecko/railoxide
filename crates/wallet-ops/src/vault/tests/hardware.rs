@@ -636,6 +636,8 @@ fn unsupported_hardware_custody_backend_fails_closed() {
     let mut metadata = store
         .load_wallet_metadata(TEST_PASSWORD, "unsupported-wallet")
         .expect("load metadata");
+    metadata.source = WalletSource::from_hardware_device_kind(descriptor.device_kind);
+    metadata.software_context = None;
     metadata.hardware_account = Some(HardwareRailgunAccountMetadata {
         profile_id: profile.profile_id,
         account_index: descriptor.account_index,
@@ -681,6 +683,8 @@ fn first_view_session_skips_unsupported_hardware_accounts() {
     let mut metadata = store
         .load_wallet_metadata(TEST_PASSWORD, "aaa-unsupported")
         .expect("load metadata");
+    metadata.source = WalletSource::from_hardware_device_kind(descriptor.device_kind);
+    metadata.software_context = None;
     metadata.hardware_account = Some(HardwareRailgunAccountMetadata {
         profile_id: profile.profile_id,
         account_index: descriptor.account_index,

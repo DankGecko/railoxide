@@ -13,16 +13,20 @@ use gpui_component::{
 };
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme;
+use wallet_ops::settings::RememberedWalletKind;
 use wallet_ops::vault::{
     DesktopVaultStore, DesktopViewSession, VaultError, ViewUnlock, WalletMetadataBundle,
-    WalletSource, WalletStatus, sort_wallet_metadata,
+    WalletSoftwareContextKind, WalletSource, WalletStatus, sort_wallet_metadata,
 };
 
 use crate::assets::RailgunActionIcon;
 
-use super::vault::{WalletOption, vault_error_kind, wallet_options_from_metadata};
+use super::vault::{
+    WalletOption, vault_error_kind, visible_wallet_metadata, wallet_options_from_metadata,
+};
 use super::{
-    APP_TEXT_SIZE, WalletRoot, chain_load::WalletSyncLifecycleCleanupWaitGroup,
+    APP_TEXT_SIZE, ConfirmationDialogProps, WalletRoot,
+    chain_load::WalletSyncLifecycleCleanupWaitGroup, confirmation_dialog,
     dialog_content_max_height, dialog_max_height, scrollable_dialog_content,
     secondary_dialog_content_width,
 };
@@ -103,6 +107,12 @@ pub(super) enum WalletManagementSelection {
     KeepSelected,
     SwitchTo(Arc<str>),
     NoActiveWallet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WalletManagementDeleteKind {
+    Wallet,
+    SoftwareProfile,
 }
 
 #[derive(Clone)]
@@ -214,6 +224,57 @@ pub(super) fn wallet_management_delete_requires_device(
     open_session_wallet_id: Option<&str>,
 ) -> bool {
     source.is_hardware_derived() && open_session_wallet_id != Some(wallet_id)
+}
+
+pub(super) const fn wallet_management_delete_uses_dialog(source: WalletSource) -> bool {
+    !source.is_hardware_derived()
+}
+
+pub(super) fn wallet_management_delete_kind(
+    target: &WalletMetadataBundle,
+    metadata: &[WalletMetadataBundle],
+) -> WalletManagementDeleteKind {
+    let Some(context) = target.software_context.as_ref() else {
+        return WalletManagementDeleteKind::Wallet;
+    };
+    if target.source.is_hardware_derived()
+        || context.kind != WalletSoftwareContextKind::Standard
+        || context.base_profile_uuid != target.wallet_uuid
+    {
+        return WalletManagementDeleteKind::Wallet;
+    }
+    if metadata.iter().any(|metadata| {
+        metadata.software_context.as_ref().is_some_and(|context| {
+            context.kind == WalletSoftwareContextKind::Passphrase
+                && context.base_profile_uuid == target.wallet_uuid
+        })
+    }) {
+        WalletManagementDeleteKind::SoftwareProfile
+    } else {
+        WalletManagementDeleteKind::Wallet
+    }
+}
+
+pub(super) fn wallet_management_deletion_affects_selected_wallet(
+    target: &WalletMetadataBundle,
+    delete_kind: WalletManagementDeleteKind,
+    selected_wallet_id: Option<&str>,
+    metadata: &[WalletMetadataBundle],
+) -> bool {
+    let Some(selected_wallet_id) = selected_wallet_id else {
+        return false;
+    };
+    if selected_wallet_id == target.wallet_uuid {
+        return true;
+    }
+    delete_kind == WalletManagementDeleteKind::SoftwareProfile
+        && metadata.iter().any(|metadata| {
+            metadata.wallet_uuid == selected_wallet_id
+                && metadata.software_context.as_ref().is_some_and(|context| {
+                    context.kind == WalletSoftwareContextKind::Passphrase
+                        && context.base_profile_uuid == target.wallet_uuid
+                })
+        })
 }
 
 pub(super) fn wallet_management_preserves_hidden_delete_session(
@@ -334,6 +395,7 @@ impl WalletRoot {
     fn delete_wallet_from_dialog(
         &mut self,
         wallet_id: Arc<str>,
+        software_delete_confirmed: bool,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -351,6 +413,7 @@ impl WalletRoot {
             .wallet_metadata
             .iter()
             .find(|metadata| metadata.wallet_uuid == wallet_id.as_ref())
+            .cloned()
         else {
             self.handle_wallet_management_error(&VaultError::WalletNotFound, cx);
             return;
@@ -370,7 +433,65 @@ impl WalletRoot {
             );
             return;
         }
-        if self.manage_wallets.pending_delete_wallet_id.as_deref() != Some(wallet_id.as_ref()) {
+        if wallet_management_delete_uses_dialog(target.source) && !software_delete_confirmed {
+            self.manage_wallets.pending_delete_wallet_id = None;
+            self.manage_wallets.error = None;
+            cx.notify();
+            let root = cx.entity();
+            let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+            let dialog_max_height = dialog_max_height(window);
+            let content_max_height = dialog_content_max_height(window);
+            window.open_dialog(cx, move |dialog, _window, _cx| {
+                let confirm_root = root.clone();
+                let confirm_wallet_id = Arc::clone(&wallet_id);
+                confirmation_dialog(
+                    dialog,
+                    ConfirmationDialogProps::danger(
+                        "Delete wallet?",
+                        software_wallet_delete_confirmation_copy(),
+                        None,
+                        "Delete wallet",
+                    ),
+                    dialog_width,
+                    dialog_max_height,
+                    content_max_height,
+                )
+                .on_ok(move |_event, window, cx| {
+                    let confirm_wallet_id = Arc::clone(&confirm_wallet_id);
+                    confirm_root.update(cx, |root, cx| {
+                        root.delete_wallet_from_dialog(confirm_wallet_id, true, window, cx);
+                    });
+                    true
+                })
+            });
+            return;
+        }
+        let (delete_kind, full_metadata) = if target.source.is_hardware_derived() {
+            (WalletManagementDeleteKind::Wallet, None)
+        } else {
+            let (store, view) = match self.wallet_management_context() {
+                Ok(context) => context,
+                Err(message) => {
+                    self.set_wallet_management_error(message, cx);
+                    return;
+                }
+            };
+            let metadata = match store.list_wallet_metadata_with_view_unlock(view.as_ref(), true) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.handle_wallet_management_error(&error, cx);
+                    return;
+                }
+            };
+            (
+                wallet_management_delete_kind(&target, &metadata),
+                Some(metadata),
+            )
+        };
+        if !wallet_management_delete_uses_dialog(target.source)
+            && delete_kind == WalletManagementDeleteKind::Wallet
+            && self.manage_wallets.pending_delete_wallet_id.as_deref() != Some(wallet_id.as_ref())
+        {
             self.manage_wallets.pending_delete_wallet_id = Some(wallet_id);
             self.manage_wallets.error = None;
             cx.notify();
@@ -388,8 +509,12 @@ impl WalletRoot {
                 return;
             }
         };
-        let deleting_selected_wallet =
-            self.selected_wallet_id.as_deref() == Some(wallet_id.as_ref());
+        let deleting_selected_wallet = wallet_management_deletion_affects_selected_wallet(
+            &target,
+            delete_kind,
+            self.selected_wallet_id.as_deref(),
+            full_metadata.as_deref().unwrap_or(&[]),
+        );
         self.manage_wallets.deleting_wallet_id = Some(Arc::clone(&wallet_id));
         self.manage_wallets.error = None;
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
@@ -404,6 +529,7 @@ impl WalletRoot {
             store,
             view,
             deleting_selected_wallet,
+            delete_kind == WalletManagementDeleteKind::SoftwareProfile,
             cleanup,
             window,
             cx,
@@ -417,6 +543,7 @@ impl WalletRoot {
         store: Arc<DesktopVaultStore>,
         view: Arc<ViewUnlock>,
         deleting_selected_wallet: bool,
+        whole_profile: bool,
         cleanup: WalletSyncLifecycleCleanupWaitGroup,
         window: &Window,
         cx: &mut Context<'_, Self>,
@@ -428,11 +555,21 @@ impl WalletRoot {
                 .await
                 .map_err(WalletDeletionTaskError::SyncShutdown)?;
             tokio::task::spawn_blocking(move || {
-                match target_session.as_deref() {
-                    Some(session) => store.delete_wallet_for_session(session, &wallet_id_string),
-                    None => store.delete_wallet_with_view_unlock(view.as_ref(), &wallet_id_string),
+                if whole_profile {
+                    store
+                        .delete_software_profile_with_view_unlock(view.as_ref(), &wallet_id_string)
+                        .map(|_| ())
+                } else {
+                    match target_session.as_deref() {
+                        Some(session) => {
+                            store.delete_wallet_for_session(session, &wallet_id_string)
+                        }
+                        None => {
+                            store.delete_wallet_with_view_unlock(view.as_ref(), &wallet_id_string)
+                        }
+                    }
+                    .map(|_| ())
                 }
-                .map(|_| ())
             })
             .await
             .map_err(|error| WalletDeletionTaskError::Join(error.to_string()))?
@@ -458,6 +595,7 @@ impl WalletRoot {
                             root.view_session = None;
                             root.selected_wallet_id = None;
                             root.ui_state.last_wallet_id = None;
+                            root.ui_state.last_wallet_kind = RememberedWalletKind::default();
                             root.save_ui_state();
                             #[cfg(feature = "hardware")]
                             {
@@ -658,7 +796,7 @@ impl WalletRoot {
             }
         };
         match store.list_wallet_metadata_with_view_unlock(view.as_ref(), true) {
-            Ok(metadata) => self.apply_wallet_management_metadata(metadata, window, cx),
+            Ok(metadata) => self.apply_wallet_management_metadata(&metadata, window, cx),
             Err(error) => {
                 self.handle_vault_error(&error, cx);
                 false
@@ -668,12 +806,14 @@ impl WalletRoot {
 
     fn apply_wallet_management_metadata(
         &mut self,
-        metadata: Vec<WalletMetadataBundle>,
+        metadata: &[WalletMetadataBundle],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
-        self.wallet_metadata.clone_from(&metadata);
-        self.wallet_options = wallet_options_from_metadata(metadata.clone());
+        let visible_metadata =
+            visible_wallet_metadata(metadata, self.revealed_passphrase_context_id.as_deref());
+        self.wallet_metadata.clone_from(&visible_metadata);
+        self.wallet_options = wallet_options_from_metadata(visible_metadata.clone());
         self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         let preserve_hidden_delete_session = wallet_management_preserves_hidden_delete_session(
             self.manage_wallets.hardware_delete_wallet_id.as_deref(),
@@ -709,7 +849,14 @@ impl WalletRoot {
                     }
                 };
                 if next_requires_device {
-                    self.enter_password_metadata_unlocked(metadata, view, None, window, cx);
+                    self.enter_password_metadata_unlocked(
+                        &visible_metadata,
+                        view,
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
                     return true;
                 }
                 match store
@@ -859,8 +1006,9 @@ impl WalletRoot {
         let is_current = self.selected_wallet_id.as_deref() == Some(wallet.wallet_uuid.as_str());
         let is_editing =
             self.manage_wallets.editing_wallet_id.as_deref() == Some(wallet.wallet_uuid.as_str());
-        let confirming_delete = self.manage_wallets.pending_delete_wallet_id.as_deref()
-            == Some(wallet.wallet_uuid.as_str());
+        let confirming_delete = wallet.source.is_hardware_derived()
+            && self.manage_wallets.pending_delete_wallet_id.as_deref()
+                == Some(wallet.wallet_uuid.as_str());
         let drag = WalletManagementDrag {
             wallet_id: Arc::clone(&wallet_id),
             label: Arc::clone(&label),
@@ -1078,7 +1226,7 @@ impl WalletRoot {
             .on_click(move |_event, window, cx| {
                 let wallet_id = Arc::clone(&delete_wallet_id);
                 delete_root.update(cx, |root, cx| {
-                    root.delete_wallet_from_dialog(wallet_id, window, cx);
+                    root.delete_wallet_from_dialog(wallet_id, false, window, cx);
                 });
             }),
         );
@@ -1187,6 +1335,9 @@ fn wallet_management_error_message(error: &VaultError) -> Arc<str> {
             "At least one active wallet is required. Show another wallet before hiding or deleting this one.",
         ),
         VaultError::WalletNotFound => Arc::from("Wallet not found. Refresh and try again."),
+        VaultError::StandardWalletHasPassphraseChildren => Arc::from(
+            "This standard wallet has passphrase wallets. Use the confirmed profile deletion action to remove the whole profile.",
+        ),
         VaultError::HardwareWalletViewRequiresDevice => {
             Arc::from("Unlock and select the matching hardware wallet before deleting it.")
         }
@@ -1195,4 +1346,8 @@ fn wallet_management_error_message(error: &VaultError) -> Arc<str> {
         ),
         _ => Arc::from(format!("Wallet management failed: {error}")),
     }
+}
+
+pub(super) const fn software_wallet_delete_confirmation_copy() -> &'static str {
+    "This will permanently delete this wallet and its Public accounts and local private sync data. Any passphrase wallets associated with this wallet will also be deleted."
 }

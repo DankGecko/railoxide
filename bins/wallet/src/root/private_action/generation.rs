@@ -438,6 +438,9 @@ impl WalletRoot {
                     DesktopPrivateSpendAuthorization::VaultPassword(password) => {
                         Some(password.clone())
                     }
+                    DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed {
+                        password, ..
+                    } => Some(password.clone()),
                     DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
                         self.set_send_form_error(
                             key,
@@ -451,6 +454,7 @@ impl WalletRoot {
         } else {
             None
         };
+        let protected_seed_session = spend_authorization.protected_seed_session();
 
         self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
         let generation_id = self.send_generation_seq;
@@ -650,6 +654,7 @@ impl WalletRoot {
                         vault_store,
                         spend_authorization,
                         vault_password: self_broadcast_vault_password,
+                        protected_software_seed_session: protected_seed_session,
                         trezor_pin_matrix_provider,
                         public_account_uuid,
                         token,
@@ -679,6 +684,7 @@ impl WalletRoot {
                         vault_store,
                         spend_authorization,
                         vault_password: self_broadcast_vault_password,
+                        protected_software_seed_session: protected_seed_session,
                         trezor_pin_matrix_provider,
                         public_account_uuid,
                         token,
@@ -1288,6 +1294,9 @@ impl WalletRoot {
                     DesktopPrivateSpendAuthorization::VaultPassword(password) => {
                         Some(password.clone())
                     }
+                    DesktopPrivateSpendAuthorization::ProtectedSoftwareSeed {
+                        password, ..
+                    } => Some(password.clone()),
                     DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
                         self.set_unshield_form_error(
                             key,
@@ -1301,6 +1310,7 @@ impl WalletRoot {
         } else {
             None
         };
+        let protected_seed_session = spend_authorization.protected_seed_session();
 
         self.unshield_generation_seq = self.unshield_generation_seq.wrapping_add(1);
         let generation_id = self.unshield_generation_seq;
@@ -1516,6 +1526,7 @@ impl WalletRoot {
                         vault_store,
                         spend_authorization,
                         vault_password: self_broadcast_vault_password,
+                        protected_software_seed_session: protected_seed_session,
                         trezor_pin_matrix_provider,
                         public_account_uuid,
                         token,
@@ -1548,6 +1559,7 @@ impl WalletRoot {
                         vault_store,
                         spend_authorization,
                         vault_password: self_broadcast_vault_password,
+                        protected_software_seed_session: protected_seed_session,
                         trezor_pin_matrix_provider,
                         public_account_uuid,
                         token,

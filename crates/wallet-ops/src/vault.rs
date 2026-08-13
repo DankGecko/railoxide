@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use alloy::primitives::{Address, U256};
 use alloy::signers::k256::ecdsa::SigningKey;
-use alloy::signers::local::{MnemonicBuilder, PrivateKeySigner};
+use alloy::signers::local::PrivateKeySigner;
 use argon2::{Algorithm, Argon2, Params, Version};
 use broadcaster_core::crypto::railgun::{RailgunError, ViewingKeyData};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -49,6 +49,7 @@ pub use core::*;
 pub use crypto::*;
 pub use models::*;
 pub use records::*;
+pub use store::SoftwareContextMatch;
 pub use unlock::*;
 
 #[cfg(test)]

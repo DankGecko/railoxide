@@ -28,6 +28,7 @@ pub async fn walletconnect_sign_personal_message(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
+        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )?;
@@ -69,6 +70,7 @@ pub async fn walletconnect_sign_typed_data_v4(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
+        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )?;
@@ -139,6 +141,7 @@ pub async fn walletconnect_probe_hardware_typed_data_signing_mode(
         &request.view_session,
         None,
         &request.public_account_uuid,
+        None,
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )?;
@@ -168,6 +171,7 @@ pub async fn submit_walletconnect_send_transaction(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
+        request.protected_software_seed_session.as_deref(),
         request.trezor_app_passphrase,
         request.trezor_pin_matrix_provider,
     )?;

@@ -11,9 +11,10 @@ pub(super) fn wallet_metadata_update_guard() -> std::sync::MutexGuard<'static, (
 use super::{
     BTreeSet, DesktopVaultStore, DesktopViewSession, EncryptedRecord, HardwareDerivationDescriptor,
     HardwareRailgunAccountMetadata, HardwareWalletSyncIntent, LoadedWalletMetadata,
-    PublicAccountScope, VaultError, ViewUnlock, WALLET_CHAIN_INDEX_COMPLETE_VERSION,
-    WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WalletCacheKey, WalletMetadataBundle,
-    WalletPrivateNamespaceId, WalletSource, WalletSpendSource, WalletStatus,
+    PublicAccountScope, StoredWalletContextRecord, VaultError, ViewUnlock,
+    WALLET_CHAIN_INDEX_COMPLETE_VERSION, WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX,
+    WalletCacheKey, WalletMetadataBundle, WalletPrivateNamespaceId, WalletSoftwareContext,
+    WalletSoftwareContextKind, WalletSource, WalletSpendSource, WalletStatus, WalletViewBundle,
     assign_missing_display_orders, default_wallet_label_for_metadata, generate_opaque_id,
     hardware_wallet_account_index_record_entry, next_wallet_display_order,
     public_account_metadata_record_key, public_account_secret_record_key, sort_wallet_metadata,
@@ -23,6 +24,121 @@ use super::{
 };
 
 impl DesktopVaultStore {
+    pub fn new_passphrase_context_metadata(
+        &self,
+        password: &str,
+        base_profile_uuid: &str,
+        wallet_uuid: &str,
+        derivation_index: u32,
+        label: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let view = self.unlock_view(password)?;
+        self.new_passphrase_context_metadata_with_view_unlock(
+            &view,
+            base_profile_uuid,
+            wallet_uuid,
+            derivation_index,
+            label,
+        )
+    }
+
+    pub fn new_passphrase_context_metadata_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        base_profile_uuid: &str,
+        wallet_uuid: &str,
+        derivation_index: u32,
+        label: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let existing = self.list_wallet_metadata_with_view(view)?;
+        let base = standard_base_profile(&existing, base_profile_uuid)?;
+        if existing
+            .iter()
+            .any(|metadata| metadata.wallet_uuid == wallet_uuid)
+        {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        let label = validate_wallet_label(label, &existing, None)?;
+        let display_order = next_wallet_display_order(&existing)?;
+        let metadata = WalletMetadataBundle {
+            wallet_uuid: wallet_uuid.to_owned(),
+            label,
+            derivation_index,
+            source: base.source,
+            status: WalletStatus::Active,
+            display_order,
+            hardware_descriptor: None,
+            hardware_account: None,
+            pending_create_new_chain_ids: BTreeSet::new(),
+            software_context: Some(WalletSoftwareContext::passphrase(base_profile_uuid)),
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    pub fn store_passphrase_context_with_view_bundle(
+        &self,
+        password: &str,
+        base_profile_uuid: &str,
+        wallet_uuid: &str,
+        view_bundle: &WalletViewBundle,
+        metadata: &WalletMetadataBundle,
+    ) -> Result<StoredWalletContextRecord, VaultError> {
+        let view = self.unlock_view(password)?;
+        self.store_passphrase_context_with_view_bundle_with_view_unlock(
+            &view,
+            base_profile_uuid,
+            wallet_uuid,
+            view_bundle,
+            metadata,
+        )
+    }
+
+    pub fn store_passphrase_context_with_view_bundle_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        base_profile_uuid: &str,
+        wallet_uuid: &str,
+        view_bundle: &WalletViewBundle,
+        metadata: &WalletMetadataBundle,
+    ) -> Result<StoredWalletContextRecord, VaultError> {
+        let existing = self.list_wallet_metadata_with_view(view)?;
+        standard_base_profile(&existing, base_profile_uuid)?;
+        if existing
+            .iter()
+            .any(|existing| existing.wallet_uuid == wallet_uuid)
+        {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        let Some(context) = metadata.software_context.as_ref() else {
+            return Err(VaultError::InvalidWalletMetadata);
+        };
+        if metadata.wallet_uuid != wallet_uuid
+            || metadata.derivation_index != view_bundle.derivation_index
+            || metadata.source.is_hardware_derived()
+            || context.kind != WalletSoftwareContextKind::Passphrase
+            || context.base_profile_uuid != base_profile_uuid
+        {
+            return Err(VaultError::InvalidWalletMetadata);
+        }
+        metadata.validate()?;
+
+        let view_record = view.encrypt_view_bundle(wallet_uuid, view_bundle)?;
+        let metadata_record = view.encrypt_wallet_metadata(wallet_uuid, metadata)?;
+        let view_record_key = wallet_view_record_key(wallet_uuid);
+        let metadata_record_key = wallet_metadata_record_key(wallet_uuid);
+        self.db.put_desktop_wallet_vault_records(&[
+            view_record.to_record_entry(view_record_key.clone())?,
+            metadata_record.to_record_entry(metadata_record_key.clone())?,
+        ])?;
+        Ok(StoredWalletContextRecord {
+            wallet_id: wallet_uuid.to_owned(),
+            derivation_index: view_bundle.derivation_index,
+            view_record_key,
+            metadata_record_key,
+        })
+    }
+
     pub fn store_wallet_metadata(
         &self,
         password: &str,
@@ -211,9 +327,13 @@ impl DesktopVaultStore {
                 decoded.metadata.wallet_uuid.clone_from(&wallet_id);
                 decoded.missing_lifecycle_fields = true;
             }
+            if decoded.missing_software_context {
+                decoded.metadata.software_context =
+                    Some(WalletSoftwareContext::standard(wallet_id.clone()));
+            }
             loaded.push(LoadedWalletMetadata {
                 metadata: decoded.metadata,
-                needs_persist: decoded.missing_lifecycle_fields,
+                needs_persist: decoded.missing_lifecycle_fields || decoded.missing_software_context,
                 missing_display_order: decoded.missing_display_order,
             });
         }
@@ -226,7 +346,7 @@ impl DesktopVaultStore {
             let label = default_wallet_label_for_metadata(&existing);
             loaded.push(LoadedWalletMetadata {
                 metadata: WalletMetadataBundle {
-                    wallet_uuid: wallet_id,
+                    wallet_uuid: wallet_id.clone(),
                     label,
                     derivation_index,
                     source: WalletSource::Imported,
@@ -235,6 +355,7 @@ impl DesktopVaultStore {
                     hardware_descriptor: None,
                     hardware_account: None,
                     pending_create_new_chain_ids: BTreeSet::new(),
+                    software_context: Some(WalletSoftwareContext::standard(wallet_id)),
                 },
                 needs_persist: true,
                 missing_display_order: true,
@@ -336,6 +457,7 @@ impl DesktopVaultStore {
             hardware_descriptor: None,
             hardware_account: None,
             pending_create_new_chain_ids,
+            software_context: Some(WalletSoftwareContext::standard(wallet_uuid)),
         })
     }
 
@@ -437,6 +559,7 @@ impl DesktopVaultStore {
             hardware_descriptor: Some(descriptor),
             hardware_account: None,
             pending_create_new_chain_ids,
+            software_context: None,
         })
     }
 
@@ -511,6 +634,46 @@ impl DesktopVaultStore {
             return Err(VaultError::WalletNotFound);
         };
         target.label = label;
+        let updated = target.clone();
+        self.store_wallet_metadata_with_view(view, &updated)?;
+        Ok(updated)
+    }
+
+    pub fn set_standard_context_auto_open_preference(
+        &self,
+        password: &str,
+        base_profile_uuid: &str,
+        enabled: bool,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let view = self.unlock_view(password)?;
+        self.set_standard_context_auto_open_preference_with_view_unlock(
+            &view,
+            base_profile_uuid,
+            enabled,
+        )
+    }
+
+    pub fn set_standard_context_auto_open_preference_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        base_profile_uuid: &str,
+        enabled: bool,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let _guard = wallet_metadata_update_guard();
+        let mut metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
+        let Some(target) = metadata.iter_mut().find(|metadata| {
+            metadata.wallet_uuid == base_profile_uuid
+                && metadata.software_context.as_ref().is_some_and(|context| {
+                    context.kind == WalletSoftwareContextKind::Standard
+                        && context.base_profile_uuid == base_profile_uuid
+                })
+        }) else {
+            return Err(VaultError::WalletNotFound);
+        };
+        let Some(context) = target.software_context.as_mut() else {
+            return Err(VaultError::InvalidWalletMetadata);
+        };
+        context.auto_open_standard_context = enabled;
         let updated = target.clone();
         self.store_wallet_metadata_with_view(view, &updated)?;
         Ok(updated)
@@ -663,6 +826,50 @@ impl DesktopVaultStore {
         self.delete_wallet_with_view(view, None, wallet_uuid)
     }
 
+    pub fn delete_software_profile_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        base_profile_uuid: &str,
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let _guard = wallet_metadata_update_guard();
+        let metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
+        let base = standard_base_profile(&metadata, base_profile_uuid)?;
+        let profile_ids = metadata
+            .iter()
+            .filter(|metadata| {
+                metadata.wallet_uuid == base_profile_uuid
+                    || metadata.software_context.as_ref().is_some_and(|context| {
+                        context.kind == WalletSoftwareContextKind::Passphrase
+                            && context.base_profile_uuid == base_profile_uuid
+                    })
+            })
+            .map(|metadata| metadata.wallet_uuid.clone())
+            .collect::<Vec<_>>();
+        if !metadata.iter().any(|metadata| {
+            metadata.status == WalletStatus::Active
+                && !profile_ids
+                    .iter()
+                    .any(|wallet_id| wallet_id == &metadata.wallet_uuid)
+        }) {
+            return Err(VaultError::LastActiveWallet);
+        }
+
+        let mut deleted = Vec::with_capacity(profile_ids.len());
+        for wallet_uuid in profile_ids
+            .iter()
+            .filter(|wallet_uuid| wallet_uuid.as_str() != base_profile_uuid)
+        {
+            deleted.push(self.delete_wallet_with_view_locked(view, None, wallet_uuid, false)?);
+        }
+        deleted.push(self.delete_wallet_with_view_locked(
+            view,
+            None,
+            base.wallet_uuid.as_str(),
+            true,
+        )?);
+        Ok(deleted)
+    }
+
     fn delete_wallet_with_view(
         &self,
         view: &ViewUnlock,
@@ -670,6 +877,16 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
         let _guard = wallet_metadata_update_guard();
+        self.delete_wallet_with_view_locked(view, view_session, wallet_uuid, false)
+    }
+
+    fn delete_wallet_with_view_locked(
+        &self,
+        view: &ViewUnlock,
+        view_session: Option<&DesktopViewSession>,
+        wallet_uuid: &str,
+        allow_standard_children: bool,
+    ) -> Result<WalletMetadataBundle, VaultError> {
         let metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
         let Some(target) = metadata
             .iter()
@@ -678,6 +895,20 @@ impl DesktopVaultStore {
         else {
             return Err(VaultError::WalletNotFound);
         };
+        if !allow_standard_children
+            && target
+                .software_context
+                .as_ref()
+                .is_some_and(|context| context.kind == WalletSoftwareContextKind::Standard)
+            && metadata.iter().any(|metadata| {
+                metadata.software_context.as_ref().is_some_and(|context| {
+                    context.kind == WalletSoftwareContextKind::Passphrase
+                        && context.base_profile_uuid == target.wallet_uuid
+                })
+            })
+        {
+            return Err(VaultError::StandardWalletHasPassphraseChildren);
+        }
         let active_count = metadata
             .iter()
             .filter(|metadata| metadata.status == WalletStatus::Active)
@@ -859,4 +1090,26 @@ impl DesktopVaultStore {
         })?;
         Ok(target)
     }
+}
+
+fn standard_base_profile<'a>(
+    metadata: &'a [WalletMetadataBundle],
+    base_profile_uuid: &str,
+) -> Result<&'a WalletMetadataBundle, VaultError> {
+    let Some(base) = metadata
+        .iter()
+        .find(|metadata| metadata.wallet_uuid == base_profile_uuid)
+    else {
+        return Err(VaultError::WalletNotFound);
+    };
+    let Some(context) = base.software_context.as_ref() else {
+        return Err(VaultError::InvalidWalletMetadata);
+    };
+    if base.source.is_hardware_derived()
+        || context.kind != WalletSoftwareContextKind::Standard
+        || context.base_profile_uuid != base.wallet_uuid
+    {
+        return Err(VaultError::InvalidWalletMetadata);
+    }
+    Ok(base)
 }

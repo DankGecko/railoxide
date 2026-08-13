@@ -278,6 +278,7 @@ fn wallet_with_metadata_stores_records_in_one_batch() {
         hardware_descriptor: None,
         hardware_account: None,
         pending_create_new_chain_ids: BTreeSet::new(),
+        software_context: Some(WalletSoftwareContext::standard(wallet_id)),
     };
 
     let stored = store

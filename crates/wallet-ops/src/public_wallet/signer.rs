@@ -13,7 +13,9 @@ use crate::hardware::{DEFAULT_HARDWARE_DERIVATION_PATH, parse_bip32_path};
 use crate::hardware::{HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode};
 use crate::hardware_typed_data::HardwareEip712Model;
 use crate::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
-use crate::vault::{DesktopVaultStore, DesktopViewSession, HardwareProfileSession};
+use crate::vault::{
+    DesktopVaultStore, DesktopViewSession, HardwareProfileSession, ProtectedSoftwareSeedSession,
+};
 
 use super::types::{
     HardwareTrezorPinMatrixProvider, WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
@@ -739,6 +741,7 @@ pub(crate) fn vaulted_public_signer(
     view_session: &DesktopViewSession,
     vault_password: Option<&str>,
     public_account_uuid: &str,
+    protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
     trezor_app_passphrase: Option<Zeroizing<String>>,
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
 ) -> Result<VaultedPublicSigner> {
@@ -778,7 +781,12 @@ pub(crate) fn vaulted_public_signer(
         .create_spend_grant(vault_password)
         .wrap_err("authorize public account spend")?;
     let private_key = vault_store
-        .public_account_signing_key(&mut grant, view_session, public_account_uuid)
+        .public_account_signing_key_with_session(
+            &mut grant,
+            view_session,
+            public_account_uuid,
+            protected_seed_session,
+        )
         .wrap_err("load public account signing key")?;
     let signer = SoftwareEvmSigner::from_private_key(*private_key)
         .wrap_err("create public account signer")?;

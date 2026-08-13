@@ -32,8 +32,8 @@ use wallet_ops::{
     subscribe_prover_cache_build,
     vault::{
         BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial,
-        PrivateAddressBookEntry, PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock,
-        WalletMetadataBundle,
+        PrivateAddressBookEntry, ProtectedSoftwareSeedSession, PublicAccountMetadata,
+        PublicAddressBookEntry, ViewUnlock, WalletMetadataBundle,
     },
 };
 use zeroize::Zeroizing;
@@ -133,15 +133,18 @@ use tokens::{
     token_display_metadata,
 };
 use ui_helpers::{
-    app_panel, app_refresh_button, app_status_tag, app_step_row, app_stepper_container,
-    centered_message, copyable_mono_field, count_label, dialog_content_max_height,
-    dialog_max_height, labeled_field, rgb_with_alpha, scrollable_dialog_content,
-    secondary_dialog_content_width, token_label_row,
+    ConfirmationDialogProps, app_panel, app_refresh_button, app_status_tag, app_step_row,
+    app_stepper_container, centered_message, confirmation_dialog, copyable_mono_field, count_label,
+    dialog_content_max_height, dialog_max_height, labeled_field, rgb_with_alpha,
+    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 use utxo::{
     BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table, should_refresh_utxo_ages,
 };
-use vault::{VaultState, WalletOption, WalletSetupMode, vault_error_kind};
+use vault::{
+    PassphraseOpenUi, PendingSoftwareProfileOpen, VaultState, WalletOption, WalletSetupMode,
+    vault_error_kind,
+};
 use wallet_header::{ChainSelectItem, WalletSelectItem};
 
 #[cfg(test)]
@@ -286,9 +289,9 @@ use vault::{
     HARDWARE_PROFILE_ADD_SUBACCOUNT_BUTTON_ID, HARDWARE_PROFILE_RECOVER_EXACT_BUTTON_ID,
     HARDWARE_PROFILE_RECOVER_RANGE_BUTTON_ID, default_hardware_wallet_setup_intent,
     hardware_profile_label_warning, hardware_wallet_creation_result_is_current,
-    load_preferred_password_unlockable_wallet_session, parse_hardware_exact_recovery_index,
-    parse_hardware_recovery_range, parse_hardware_wallet_restore_account_index,
-    remembered_wallet_option, trezor_passphrase_mode_copy, wallet_options_from_metadata,
+    parse_hardware_exact_recovery_index, parse_hardware_recovery_range,
+    parse_hardware_wallet_restore_account_index, should_focus_vault_input,
+    trezor_passphrase_mode_copy, wallet_options_from_metadata,
 };
 #[cfg(all(test, feature = "hardware"))]
 use vault::{
@@ -362,6 +365,13 @@ pub(crate) struct WalletRoot {
     vault_view_unlock: Option<Arc<ViewUnlock>>,
     spend_authorization_cache: Option<SpendAuthorizationCache>,
     spend_authorization_lifetime: SpendAuthorizationLifetime,
+    protected_software_seed_session: Option<Arc<ProtectedSoftwareSeedSession>>,
+    pending_software_profile_open: Option<PendingSoftwareProfileOpen>,
+    passphrase_open_ui: Entity<PassphraseOpenUi>,
+    pending_software_profile_open_operation_generation: u64,
+    pending_software_profile_open_lifetime_generation: u64,
+    pending_software_profile_base_profile_uuid: Option<Arc<str>>,
+    revealed_passphrase_context_id: Option<Arc<str>>,
     view_session: Option<Arc<DesktopViewSession>>,
     generated_seed: Option<GeneratedSeedMaterial>,
     hardware_wallet_creation_in_progress: bool,
@@ -606,6 +616,15 @@ fn complete_waku_worker_generation(
 
 impl Drop for WalletRoot {
     fn drop(&mut self) {
+        self.pending_software_profile_open = None;
+        self.pending_software_profile_open_operation_generation = self
+            .pending_software_profile_open_operation_generation
+            .wrapping_add(1);
+        self.pending_software_profile_open_lifetime_generation = self
+            .pending_software_profile_open_lifetime_generation
+            .wrapping_add(1);
+        self.protected_software_seed_session = None;
+        self.spend_authorization_cache = None;
         if let Some(command_tx) = self
             .private_broadcaster_progress
             .as_ref()
@@ -1093,6 +1112,8 @@ impl WalletRoot {
             SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
         });
         let root_weak = cx.weak_entity();
+        let root_entity = cx.entity();
+        let passphrase_open_ui = cx.new(|cx| PassphraseOpenUi::new(root_entity, window, cx));
         let broadcaster_preference_snapshot =
             Arc::new(RwLock::new(BroadcasterPreferences::default()));
         let preference_status_snapshot = Arc::clone(&broadcaster_preference_snapshot);
@@ -1171,6 +1192,13 @@ impl WalletRoot {
             vault_view_unlock: None,
             spend_authorization_cache: None,
             spend_authorization_lifetime: SpendAuthorizationLifetime::Once,
+            protected_software_seed_session: None,
+            pending_software_profile_open: None,
+            passphrase_open_ui,
+            pending_software_profile_open_operation_generation: 0,
+            pending_software_profile_open_lifetime_generation: 0,
+            pending_software_profile_base_profile_uuid: None,
+            revealed_passphrase_context_id: None,
             view_session: None,
             generated_seed: None,
             hardware_wallet_creation_in_progress: false,

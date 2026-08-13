@@ -77,8 +77,34 @@ pub enum VaultError {
     UnlockFailed,
     #[error("spend grant is invalid")]
     InvalidSpendGrant,
+    #[error("software seed session binding mismatch")]
+    SoftwareSeedSessionBindingMismatch,
+    #[error("protected software seed session is required")]
+    SoftwareSeedSessionRequired,
+    #[error("invalid software seed length")]
+    InvalidSoftwareSeedLength,
+    #[error("duplicate software context identity")]
+    DuplicateSoftwareContextIdentity,
+    #[error("invalid software context identity")]
+    InvalidSoftwareContextIdentity,
+    #[error("passphrase confirmation does not match")]
+    PassphraseConfirmationMismatch,
+    #[error("software context passphrase cannot be empty")]
+    EmptySoftwareContextPassphrase,
+    #[error("software context safe head is unavailable")]
+    SoftwareContextSafeHeadUnavailable,
+    #[error("software context safe head overflow")]
+    SoftwareContextSafeHeadOverflow,
+    #[error("wallet UUID already exists")]
+    DuplicateWalletUuid,
+    #[error("cannot delete a standard wallet while passphrase children remain")]
+    StandardWalletHasPassphraseChildren,
+    #[error("duplicate software context chain input")]
+    DuplicateSoftwareContextChainInput,
     #[error("wallet not found")]
     WalletNotFound,
+    #[error("invalid wallet metadata")]
+    InvalidWalletMetadata,
     #[error("wallet label cannot be empty")]
     InvalidWalletLabel,
     #[error("wallet label already exists")]
@@ -214,6 +240,7 @@ pub enum RecordKind {
     BroadcasterBannedEntry,
     WalletConnectRelayIdentity,
     WalletConnectSession,
+    SoftwareContextSeed,
 }
 
 impl RecordKind {
@@ -242,6 +269,7 @@ impl RecordKind {
             Self::BroadcasterBannedEntry => "broadcaster-banned-entry",
             Self::WalletConnectRelayIdentity => "walletconnect-relay-identity",
             Self::WalletConnectSession => "walletconnect-session",
+            Self::SoftwareContextSeed => "software-context-seed",
         }
     }
 
@@ -303,6 +331,14 @@ pub struct StoredWalletRecord {
     pub derivation_index: u32,
     pub view_record_key: String,
     pub spend_record_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredWalletContextRecord {
+    pub wallet_id: String,
+    pub derivation_index: u32,
+    pub view_record_key: String,
+    pub metadata_record_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

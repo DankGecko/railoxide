@@ -1,6 +1,7 @@
 use super::{
     Arc, HardwareDeviceKind, HardwareProfileMetadata, HardwareRailgunAccountMetadata,
-    WalletMetadataBundle, WalletOption, WalletSelectItem, WalletSource, sort_wallet_metadata,
+    RememberedWalletKind, WalletMetadataBundle, WalletOption, WalletSelectItem,
+    WalletSoftwareContextKind, WalletSource, sort_wallet_metadata,
 };
 
 pub(in crate::root) fn wallet_options_from_metadata(
@@ -17,14 +18,86 @@ pub(in crate::root) fn wallet_options_from_metadata(
         .collect()
 }
 
-pub(in crate::root) fn remembered_wallet_option<'a>(
-    wallet_options: &'a [WalletOption],
-    remembered_wallet_id: Option<&str>,
-) -> Option<&'a WalletOption> {
-    let remembered_wallet_id = remembered_wallet_id?;
-    wallet_options
+pub(in crate::root) fn visible_wallet_metadata(
+    metadata: &[WalletMetadataBundle],
+    revealed_wallet_id: Option<&str>,
+) -> Vec<WalletMetadataBundle> {
+    metadata
         .iter()
-        .find(|wallet| wallet.wallet_id.as_ref() == remembered_wallet_id)
+        .filter(|metadata| {
+            let concealed = metadata
+                .software_context
+                .as_ref()
+                .is_some_and(|context| context.kind == WalletSoftwareContextKind::Passphrase);
+            !concealed || revealed_wallet_id == Some(metadata.wallet_uuid.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+pub(in crate::root) fn passphrase_open_action_is_eligible(
+    metadata: Option<&WalletMetadataBundle>,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Some(context) = metadata.software_context.as_ref() else {
+        return false;
+    };
+    metadata.status == wallet_ops::vault::WalletStatus::Active
+        && !metadata.source.is_hardware_derived()
+        && context.kind == WalletSoftwareContextKind::Standard
+        && context.base_profile_uuid == metadata.wallet_uuid
+}
+
+pub(in crate::root) fn remembered_wallet_id_for_restore(
+    metadata: &[WalletMetadataBundle],
+    remembered_wallet_id: Option<&str>,
+    remembered_wallet_kind: RememberedWalletKind,
+) -> Option<Arc<str>> {
+    let remembered_wallet_id = remembered_wallet_id?;
+    let standard_context_for_base = |base_profile_uuid: &str| {
+        metadata.iter().find_map(|metadata| {
+            let context = metadata.software_context.as_ref()?;
+            (context.base_profile_uuid == base_profile_uuid
+                && context.kind == WalletSoftwareContextKind::Standard)
+                .then(|| Arc::from(metadata.wallet_uuid.clone()))
+        })
+    };
+
+    match remembered_wallet_kind {
+        RememberedWalletKind::SoftwareProfile => {
+            let base_profile_uuid = metadata
+                .iter()
+                .find(|metadata| metadata.wallet_uuid == remembered_wallet_id)
+                .and_then(|metadata| metadata.software_context.as_ref())
+                .filter(|context| context.kind == WalletSoftwareContextKind::Passphrase)
+                .map_or(remembered_wallet_id, |context| {
+                    context.base_profile_uuid.as_str()
+                });
+            standard_context_for_base(base_profile_uuid)
+        }
+        RememberedWalletKind::HardwareWallet => metadata
+            .iter()
+            .find(|metadata| {
+                metadata.wallet_uuid == remembered_wallet_id
+                    && metadata.source.is_hardware_derived()
+            })
+            .map(|metadata| Arc::from(metadata.wallet_uuid.clone())),
+        RememberedWalletKind::Unknown => {
+            let remembered = metadata
+                .iter()
+                .find(|metadata| metadata.wallet_uuid == remembered_wallet_id)?;
+            if let Some(context) = remembered
+                .software_context
+                .as_ref()
+                .filter(|context| context.kind == WalletSoftwareContextKind::Passphrase)
+            {
+                return standard_context_for_base(&context.base_profile_uuid);
+            }
+            Some(Arc::from(remembered.wallet_uuid.clone()))
+        }
+    }
 }
 
 pub(in crate::root) const fn hardware_device_wallet_select_value(
@@ -233,5 +306,60 @@ pub(in crate::root::vault) const fn hardware_device_kind_from_source(
         WalletSource::LedgerDerived => Some(HardwareDeviceKind::Ledger),
         WalletSource::TrezorDerived => Some(HardwareDeviceKind::Trezor),
         WalletSource::Generated | WalletSource::Imported => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wallet_ops::vault::WalletSoftwareContext;
+
+    fn metadata(wallet_uuid: &str, context: Option<WalletSoftwareContext>) -> WalletMetadataBundle {
+        WalletMetadataBundle {
+            wallet_uuid: wallet_uuid.to_owned(),
+            label: wallet_uuid.to_owned(),
+            derivation_index: 0,
+            source: WalletSource::Imported,
+            status: wallet_ops::vault::WalletStatus::Active,
+            display_order: 0,
+            hardware_descriptor: None,
+            hardware_account: None,
+            pending_create_new_chain_ids: std::collections::BTreeSet::default(),
+            software_context: context,
+        }
+    }
+
+    #[test]
+    fn concealed_passphrase_metadata_is_not_visible_without_an_open_context() {
+        let standard = metadata("base", Some(WalletSoftwareContext::standard("base")));
+        let child = metadata("child", Some(WalletSoftwareContext::passphrase("base")));
+        let visible = visible_wallet_metadata(&[standard, child], None);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].wallet_uuid, "base");
+    }
+
+    #[test]
+    fn only_the_selected_passphrase_context_is_revealed() {
+        let standard = metadata("base", Some(WalletSoftwareContext::standard("base")));
+        let first = metadata("first", Some(WalletSoftwareContext::passphrase("base")));
+        let second = metadata("second", Some(WalletSoftwareContext::passphrase("base")));
+        let visible = visible_wallet_metadata(&[standard, first, second], Some("second"));
+        assert_eq!(
+            visible
+                .iter()
+                .map(|metadata| metadata.wallet_uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base", "second"]
+        );
+    }
+
+    #[test]
+    fn passphrase_open_action_is_standard_only() {
+        let standard = metadata("base", Some(WalletSoftwareContext::standard("base")));
+        let child = metadata("child", Some(WalletSoftwareContext::passphrase("base")));
+
+        assert!(passphrase_open_action_is_eligible(Some(&standard)));
+        assert!(!passphrase_open_action_is_eligible(Some(&child)));
+        assert!(!passphrase_open_action_is_eligible(None));
     }
 }

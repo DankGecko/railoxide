@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
     StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
@@ -19,13 +20,15 @@ use ui::{icons, theme};
 use wallet_ops::hardware::HardwareDeviceKind;
 use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSource};
 
-use crate::assets::{LEDGER_LOGO_SHORT_WHITE_ICON_PATH, TREZOR_SYMBOL_WHITE_ICON_PATH};
+use crate::assets::{
+    LEDGER_LOGO_SHORT_WHITE_ICON_PATH, RailgunActionIcon, TREZOR_SYMBOL_WHITE_ICON_PATH,
+};
 
 use super::key_export::WALLET_EXPORT_MENU_LABEL;
 use super::utxo::short_hash;
 use super::vault::{
     HardwareWalletDisplayInfo, hardware_device_kind_from_wallet_select_value,
-    hardware_wallet_display_info,
+    hardware_wallet_display_info, passphrase_open_action_is_eligible,
 };
 use super::{
     APP_TEXT_SIZE, ChainUtxoState, WalletRoot, chain_load_overrides, dialog_content_max_height,
@@ -229,8 +232,17 @@ impl WalletRoot {
         let change_password_root = root.clone();
         let manage_root = root.clone();
         let export_root = root.clone();
+        let open_passphrase_root = root.clone();
         let repair_root = root;
+        let open_passphrase_wallet_id = self.selected_wallet_id.clone();
         let export_disabled = self.selected_wallet_id.is_none();
+        let can_open_passphrase_wallet = passphrase_open_action_is_eligible(
+            self.selected_wallet_id.as_deref().and_then(|wallet_id| {
+                self.wallet_metadata
+                    .iter()
+                    .find(|wallet| wallet.wallet_uuid == wallet_id)
+            }),
+        );
 
         app_button_base("wallet-actions-menu-trigger")
             .outline()
@@ -244,6 +256,8 @@ impl WalletRoot {
                 let change_password_root = change_password_root.clone();
                 let manage_root = manage_root.clone();
                 let export_root = export_root.clone();
+                let open_passphrase_root = open_passphrase_root.clone();
+                let open_passphrase_wallet_id = open_passphrase_wallet_id.clone();
                 let repair_root = repair_root.clone();
                 menu.min_w(px(190.0))
                     .item(
@@ -255,22 +269,26 @@ impl WalletRoot {
                                 });
                             }),
                     )
-                    .item(PopupMenuItem::new("Manage wallets").on_click(
-                        move |_event, window, cx| {
-                            manage_root.update(cx, |root, cx| {
-                                root.open_manage_wallets_dialog(window, cx);
-                            });
-                        },
-                    ))
-                    .item(PopupMenuItem::new("Change vault password").on_click(
-                        move |_event, window, cx| {
-                            change_password_root.update(cx, |root, cx| {
-                                root.open_change_vault_password_dialog(window, cx);
-                            });
-                        },
-                    ))
+                    .when(can_open_passphrase_wallet, |menu| {
+                        menu.item(
+                            PopupMenuItem::new("Open passphrase wallet")
+                                .icon(RailgunActionIcon::SquareAsterisk)
+                                .on_click(move |_event, window, cx| {
+                                    if let Some(wallet_id) = open_passphrase_wallet_id.as_ref() {
+                                        open_passphrase_root.update(cx, |root, cx| {
+                                            root.open_passphrase_wallet_authorization_dialog(
+                                                wallet_id.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        )
+                    })
                     .item(
                         PopupMenuItem::new(WALLET_EXPORT_MENU_LABEL)
+                            .icon(RailgunActionIcon::KeyRound)
                             .disabled(export_disabled)
                             .on_click(move |_event, window, cx| {
                                 export_root.update(cx, |root, cx| {
@@ -279,7 +297,26 @@ impl WalletRoot {
                             }),
                     )
                     .item(
+                        PopupMenuItem::new("Manage wallets")
+                            .icon(RailgunActionIcon::FolderCog)
+                            .on_click(move |_event, window, cx| {
+                                manage_root.update(cx, |root, cx| {
+                                    root.open_manage_wallets_dialog(window, cx);
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Change vault password")
+                            .icon(RailgunActionIcon::FilePenLine)
+                            .on_click(move |_event, window, cx| {
+                                change_password_root.update(cx, |root, cx| {
+                                    root.open_change_vault_password_dialog(window, cx);
+                                });
+                            }),
+                    )
+                    .item(
                         PopupMenuItem::new("Repair wallet cache")
+                            .icon(RailgunActionIcon::Wrench)
                             .disabled(disabled)
                             .on_click(move |_event, window, cx| {
                                 repair_root.update(cx, |_root, cx| {

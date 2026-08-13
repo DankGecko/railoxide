@@ -2093,6 +2093,9 @@ impl WalletRoot {
         &mut self,
         draft: PublicSendDraft,
         vault_password: Zeroizing<String>,
+        protected_software_seed_session: Option<
+            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+        >,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -2170,6 +2173,7 @@ impl WalletRoot {
             view_session,
             vault_store,
             vault_password,
+            protected_software_seed_session,
             trezor_app_passphrase,
             trezor_pin_matrix_provider,
             public_account_uuid: public_account_uuid.to_string(),
@@ -2409,6 +2413,9 @@ impl WalletRoot {
         &mut self,
         draft: PublicShieldDraft,
         vault_password: Zeroizing<String>,
+        protected_software_seed_session: Option<
+            Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
+        >,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -2487,6 +2494,7 @@ impl WalletRoot {
             view_session,
             vault_store,
             vault_password,
+            protected_software_seed_session,
             trezor_app_passphrase,
             trezor_pin_matrix_provider,
             public_account_uuid: public_account_uuid.to_string(),

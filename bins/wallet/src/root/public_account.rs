@@ -611,10 +611,11 @@ impl WalletRoot {
         }
         self.public_form.adding_account = true;
         self.public_form.error = None;
-        let result = store.add_derived_public_account(
+        let result = store.add_derived_public_account_with_session(
             password.as_str(),
             view_session.as_ref(),
             Some(&label),
+            self.protected_software_seed_session.as_deref(),
         );
         self.public_form.adding_account = false;
         match result {

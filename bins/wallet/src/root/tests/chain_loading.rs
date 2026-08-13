@@ -7,13 +7,14 @@ use crate::root::chain_load::{
     destructive_cache_reset_admission_is_allowed, installed_observer_is_exact_current,
     installed_observer_terminal_transition, ppoi_validation_completion_is_current,
     ppoi_validation_toast_scope_is_current, retain_auxiliary_stream, wallet_readiness_disposition,
-    wallet_sync_maintenance_allows_start,
+    wallet_sync_maintenance_allows_start, wallet_sync_start_is_admitted,
 };
 use crate::root::maintenance::{PublicSyncResetCompletion, public_sync_reset_restart_is_safe};
 use crate::root::shell::{
     PoiArtifactCacheRetryAttempts, ppoi_chunk_progress_label, ppoi_replay_progress_label,
     ppoi_retry_completion_is_current,
 };
+use crate::root::vault::wallet_replacement_finalize_is_admitted;
 use wallet_ops::{
     PoiArtifactCacheAttemptId, PoiArtifactCacheGraphProgress, PoiArtifactCachePhase,
     PoiArtifactCacheProgress, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
@@ -35,6 +36,14 @@ fn terminal_wallet_readiness_is_not_projected_as_syncing() {
         wallet_readiness_disposition(&WalletReadiness::Shutdown),
         WalletReadinessDisposition::Error(Arc::from("wallet sync session stopped")),
     );
+}
+
+#[test]
+fn pending_profile_has_no_wallet_sync_admission_until_verified() {
+    assert!(!wallet_sync_start_is_admitted(true, false, false, true));
+    assert!(!wallet_sync_start_is_admitted(false, false, true, true));
+    assert!(!wallet_sync_start_is_admitted(false, true, false, true));
+    assert!(wallet_sync_start_is_admitted(false, true, true, true));
 }
 
 fn observer_progress(current_block: u64) -> InitialCatchUpFingerprint {
@@ -999,6 +1008,14 @@ async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
     let cleanup_task = cleanup.spawn(&tokio::runtime::Handle::current());
     let admission_barrier = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task.clone()]);
     assert!(!admission_barrier.is_finished());
+    assert!(!wallet_replacement_finalize_is_admitted(
+        7,
+        7,
+        1,
+        1,
+        false,
+        admission_barrier.is_finished(),
+    ));
 
     let error = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task.clone()])
         .shutdown_with_timeout(Duration::from_millis(1))
@@ -1009,13 +1026,29 @@ async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
     let report = tokio::time::timeout(
         Duration::from_secs(1),
         WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task])
-            .shutdown_for_root_replacement(),
+            .shutdown_for_wallet_replacement(),
     )
     .await
     .expect("root replacement cleanup should not time out")
     .expect("cleanup should still complete");
     assert_eq!(report.stopped_startup_tasks, 1);
     assert!(admission_barrier.is_finished());
+    assert!(wallet_replacement_finalize_is_admitted(
+        7,
+        7,
+        1,
+        1,
+        false,
+        admission_barrier.is_finished(),
+    ));
+    assert!(!wallet_replacement_finalize_is_admitted(
+        6,
+        7,
+        1,
+        1,
+        false,
+        admission_barrier.is_finished(),
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
