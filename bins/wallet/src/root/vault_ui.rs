@@ -108,7 +108,9 @@ impl WalletRoot {
         match &self.vault_state {
             VaultState::CreateVault => self.render_create_vault(root).into_any_element(),
             VaultState::UnlockVault => self.render_unlock_vault(root).into_any_element(),
-            VaultState::SwitchingWallet => Self::render_switching_wallet().into_any_element(),
+            VaultState::SwitchingWallet => {
+                Self::render_switching_wallet(self.wallet_switch_delayed).into_any_element()
+            }
             VaultState::SetupWallet => self.render_wallet_setup(root).into_any_element(),
             VaultState::PendingSoftwareProfileOpen => {
                 self.passphrase_open_ui.clone().into_any_element()
@@ -138,15 +140,17 @@ impl WalletRoot {
             .into_any_element()
     }
 
-    fn render_switching_wallet() -> gpui::Div {
+    fn render_switching_wallet(delayed: bool) -> gpui::Div {
         div()
             .flex()
             .items_center()
             .gap_2()
             .child(Spinner::new().small())
-            .child(app_muted_text(
-                "Waiting for the previous wallet session to close...",
-            ))
+            .child(app_muted_text(if delayed {
+                "Opening your wallet is taking longer than expected…"
+            } else {
+                "Closing the previous wallet session…"
+            }))
     }
 
     fn render_pre_unlock_settings_gear(root: Entity<Self>) -> gpui::Div {

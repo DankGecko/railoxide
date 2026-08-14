@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::time::Duration;
 
-use super::super::chain_load::WalletSyncLifecycleCleanupWaitGroup;
+use super::super::chain_load::{
+    WalletSyncLifecycleCleanupReport, WalletSyncLifecycleCleanupWaitGroup,
+};
 #[cfg(not(feature = "hardware"))]
 use super::hardware_device_wallet_select_label;
 use super::{
@@ -16,6 +19,30 @@ use super::{
 };
 
 const PENDING_SOFTWARE_PROFILE_OPEN_TIMEOUT: Duration = Duration::from_mins(5);
+const WALLET_REPLACEMENT_DELAYED_THRESHOLD: Duration = Duration::from_secs(10);
+const WALLET_REPLACEMENT_PRESENTATION_CUTOFF: Duration = Duration::from_secs(30);
+pub(in crate::root) const WALLET_REPLACEMENT_TIMEOUT_MESSAGE: &str =
+    "Your wallet is still closing. Try again in a moment.";
+
+pub(in crate::root) enum WalletReplacementCleanupWaitOutcome {
+    Completed(Result<WalletSyncLifecycleCleanupReport, String>),
+    PresentationTimedOut,
+}
+
+pub(in crate::root) async fn wait_for_wallet_replacement_cleanup<F>(
+    cleanup: WalletSyncLifecycleCleanupWaitGroup,
+    presentation_cutoff: F,
+) -> WalletReplacementCleanupWaitOutcome
+where
+    F: Future<Output = ()>,
+{
+    tokio::select! {
+        cleanup_result = cleanup.shutdown_for_wallet_replacement() => {
+            WalletReplacementCleanupWaitOutcome::Completed(cleanup_result)
+        }
+        () = presentation_cutoff => WalletReplacementCleanupWaitOutcome::PresentationTimedOut,
+    }
+}
 
 pub(super) const fn pending_software_profile_open_timeout_is_current(
     captured_lifetime_generation: u64,
@@ -32,6 +59,9 @@ struct WalletContextInstallation {
     created_wallet_init_policy: wallet_ops::CreatedWalletChainInitPolicy,
     protected_seed_session: Option<wallet_ops::vault::ProtectedSoftwareSeedSession>,
     active_wallet_generation: u64,
+    wallet_switch_generation: u64,
+    profile_open_operation_generation: u64,
+    profile_open_lifetime_generation: u64,
     selected_chain: u64,
     #[cfg(feature = "hardware")]
     active_hardware_profile: Option<HardwareProfileMetadata>,
@@ -480,10 +510,16 @@ impl WalletRoot {
         self.pending_software_profile_open = None;
         self.pending_software_profile_base_profile_uuid = None;
         self.invalidate_pending_profile_open_tokens();
+        let profile_open_operation_generation =
+            self.pending_software_profile_open_operation_generation;
+        let profile_open_lifetime_generation =
+            self.pending_software_profile_open_lifetime_generation;
         if close_dialogs {
             window.close_all_dialogs(cx);
         }
         self.advance_active_wallet_generation();
+        self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
+        let wallet_switch_generation = self.wallet_switch_generation;
         clear_wallet_context_visibility(
             &mut self.view_session,
             &mut self.selected_wallet_id,
@@ -494,6 +530,7 @@ impl WalletRoot {
         );
         self.vault_view_unlock = None;
         self.vault_state = VaultState::SwitchingWallet;
+        self.wallet_switch_delayed = false;
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.focus_vault_input_on_render = false;
         self.setup_password = None;
@@ -523,51 +560,121 @@ impl WalletRoot {
             created_wallet_init_policy,
             protected_seed_session,
             active_wallet_generation: self.active_wallet_generation,
+            wallet_switch_generation,
+            profile_open_operation_generation,
+            profile_open_lifetime_generation,
             selected_chain: self.selected_chain,
             #[cfg(feature = "hardware")]
             active_hardware_profile,
             cleanup: self.wallet_sync_cleanup_wait_group(),
         };
+        let cleanup = installation.cleanup.clone();
+        let captured_wallet_generation = installation.active_wallet_generation;
+        let captured_switch_generation = installation.wallet_switch_generation;
+        let captured_operation_generation = installation.profile_open_operation_generation;
+        let captured_lifetime_generation = installation.profile_open_lifetime_generation;
+        let captured_chain = installation.selected_chain;
         cx.spawn_in(window, async move |this, cx| {
-            let cleanup_result = installation
-                .cleanup
-                .clone()
-                .shutdown_for_wallet_replacement()
+            cx.background_executor()
+                .timer(WALLET_REPLACEMENT_DELAYED_THRESHOLD)
                 .await;
-            let _ = this.update_in(cx, |root, window, cx| {
-                let installation = installation;
-                if !wallet_replacement_finalize_is_admitted(
-                    installation.active_wallet_generation,
+            let _ = this.update_in(cx, |root, _window, cx| {
+                if wallet_replacement_update_is_current(
+                    captured_wallet_generation,
                     root.active_wallet_generation,
-                    installation.selected_chain,
+                    captured_switch_generation,
+                    root.wallet_switch_generation,
+                    captured_operation_generation,
+                    root.pending_software_profile_open_operation_generation,
+                    captured_lifetime_generation,
+                    root.pending_software_profile_open_lifetime_generation,
+                    captured_chain,
                     root.selected_chain,
                     root.manage_wallets.deleting_wallet_id.is_some(),
                     root.view_session.is_none()
                         && root.vault_view_unlock.is_none()
                         && matches!(root.vault_state, VaultState::SwitchingWallet),
                 ) {
-                    return;
+                    root.wallet_switch_delayed = true;
+                    cx.notify();
                 }
-                let report = match cleanup_result {
-                    Ok(report) => report,
-                    Err(error) => {
-                        tracing::warn!(%error, "wallet replacement sync cleanup failed");
-                        root.set_wallet_replacement_error(
-                            "Previous wallet sync cleanup could not be completed. Retry the wallet replacement before continuing.",
-                            cx,
-                        );
-                        return;
-                    }
-                };
-                if report.failed_startup_tasks != 0 {
-                    root.set_wallet_replacement_error(
-                        "Previous wallet sync cleanup failed. Retry the wallet replacement.",
-                        cx,
-                    );
-                    return;
-                }
-                root.finish_view_session_installation(installation, window, cx);
             });
+        })
+        .detach();
+
+        cx.spawn_in(window, async move |this, cx| {
+            match wait_for_wallet_replacement_cleanup(
+                cleanup,
+                cx.background_executor().timer(WALLET_REPLACEMENT_PRESENTATION_CUTOFF),
+            )
+            .await
+            {
+                WalletReplacementCleanupWaitOutcome::Completed(cleanup_result) => {
+                    let _ = this.update_in(cx, |root, window, cx| {
+                        let installation = installation;
+                        if !wallet_replacement_update_is_current(
+                            captured_wallet_generation,
+                            root.active_wallet_generation,
+                            captured_switch_generation,
+                            root.wallet_switch_generation,
+                            captured_operation_generation,
+                            root.pending_software_profile_open_operation_generation,
+                            captured_lifetime_generation,
+                            root.pending_software_profile_open_lifetime_generation,
+                            captured_chain,
+                            root.selected_chain,
+                            root.manage_wallets.deleting_wallet_id.is_some(),
+                            root.view_session.is_none()
+                                && root.vault_view_unlock.is_none()
+                                && matches!(root.vault_state, VaultState::SwitchingWallet),
+                        ) {
+                            return;
+                        }
+                        let report = match cleanup_result {
+                            Ok(report) => report,
+                            Err(error) => {
+                                tracing::warn!(%error, "wallet replacement sync cleanup failed");
+                                root.set_wallet_replacement_error(
+                                    "Previous wallet sync cleanup could not be completed. Retry the wallet replacement before continuing.",
+                                    cx,
+                                );
+                                return;
+                            }
+                        };
+                        if report.failed_startup_tasks != 0 {
+                            root.set_wallet_replacement_error(
+                                "Previous wallet sync cleanup failed. Retry the wallet replacement.",
+                                cx,
+                            );
+                            return;
+                        }
+                        root.finish_view_session_installation(installation, window, cx);
+                    });
+                }
+                WalletReplacementCleanupWaitOutcome::PresentationTimedOut => {
+                    let _ = this.update_in(cx, |root, window, cx| {
+                        if wallet_replacement_update_is_current(
+                            captured_wallet_generation,
+                            root.active_wallet_generation,
+                            captured_switch_generation,
+                            root.wallet_switch_generation,
+                            captured_operation_generation,
+                            root.pending_software_profile_open_operation_generation,
+                            captured_lifetime_generation,
+                            root.pending_software_profile_open_lifetime_generation,
+                            captured_chain,
+                            root.selected_chain,
+                            root.manage_wallets.deleting_wallet_id.is_some(),
+                            root.view_session.is_none()
+                                && root.vault_view_unlock.is_none()
+                                && matches!(root.vault_state, VaultState::SwitchingWallet),
+                        ) {
+                            root.abandon_wallet_replacement_installation(window, cx);
+                        }
+                    });
+                    drop(installation);
+                }
+            }
         })
         .detach();
     }
@@ -584,6 +691,9 @@ impl WalletRoot {
             created_wallet_init_policy,
             protected_seed_session,
             active_wallet_generation: _,
+            wallet_switch_generation: _,
+            profile_open_operation_generation: _,
+            profile_open_lifetime_generation: _,
             selected_chain: _,
             #[cfg(feature = "hardware")]
             active_hardware_profile,
@@ -667,6 +777,7 @@ impl WalletRoot {
         self.clear_key_export_dialog_state(window, cx);
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
+        self.wallet_switch_delayed = false;
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.ensure_waku_started(cx);
         self.ensure_chain_load_with_start_policy(
@@ -677,6 +788,46 @@ impl WalletRoot {
         if created_wallet_init_policy != wallet_ops::CreatedWalletChainInitPolicy::Resumed {
             self.initialize_created_wallet_chain_metadata(created_wallet_init_policy);
         }
+        cx.notify();
+    }
+
+    fn abandon_wallet_replacement_installation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
+        self.pending_software_profile_open = None;
+        self.pending_software_profile_base_profile_uuid = None;
+        self.invalidate_pending_profile_open_tokens();
+        self.clear_protected_software_seed_session(cx);
+        clear_wallet_context_visibility(
+            &mut self.view_session,
+            &mut self.selected_wallet_id,
+            &mut self.revealed_passphrase_context_id,
+            &mut self.wallet_metadata,
+            &mut self.wallet_options,
+            &mut self.public_accounts,
+        );
+        self.vault_view_unlock = None;
+        self.private_address_book.clear();
+        self.public_address_book.clear();
+        self.reset_wallet_scoped_state(cx);
+        self.setup_password = None;
+        self.generated_seed = None;
+        self.clear_key_export_dialog_state(window, cx);
+        #[cfg(feature = "hardware")]
+        {
+            self.active_hardware_profile = None;
+            self.hardware_profile_unlock = HardwareProfileUnlockState::default();
+            self.clear_hardware_profile_sensitive_inputs(window, cx);
+        }
+        self.wallet_switch_delayed = false;
+        self.vault_error = Some(Arc::from(WALLET_REPLACEMENT_TIMEOUT_MESSAGE));
+        self.vault_state = VaultState::UnlockVault;
+        self.wallet_setup_mode = WalletSetupMode::Choose;
+        self.focus_vault_input_on_render = true;
+        self.sync_wallet_select(window, cx);
         cx.notify();
     }
 
@@ -1074,6 +1225,32 @@ impl WalletRoot {
         self.focus_vault_input_on_render = false;
         cx.notify();
     }
+}
+
+pub(in crate::root) const fn wallet_replacement_update_is_current(
+    captured_wallet_generation: u64,
+    current_wallet_generation: u64,
+    captured_switch_generation: u64,
+    current_switch_generation: u64,
+    captured_operation_generation: u64,
+    current_operation_generation: u64,
+    captured_lifetime_generation: u64,
+    current_lifetime_generation: u64,
+    captured_chain: u64,
+    current_chain: u64,
+    deleting_wallet: bool,
+    switching_wallet: bool,
+) -> bool {
+    wallet_replacement_finalize_is_admitted(
+        captured_wallet_generation,
+        current_wallet_generation,
+        captured_chain,
+        current_chain,
+        deleting_wallet,
+        switching_wallet,
+    ) && captured_switch_generation == current_switch_generation
+        && captured_operation_generation == current_operation_generation
+        && captured_lifetime_generation == current_lifetime_generation
 }
 
 #[cfg(test)]

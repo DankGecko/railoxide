@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, Context, ParentElement, SharedString, Styled, Window, div,
@@ -466,21 +466,49 @@ impl WalletSyncLifecycleCleanup {
             }
         }
 
-        for mut observer in self.installed_observers {
+        let observer_count = self.installed_observers.len();
+        let observer_cleanup_started_at = Instant::now();
+        tracing::debug!(
+            observer_count,
+            "wallet sync cleanup cancelling installed observers"
+        );
+        let mut completed_observer_count = 0;
+        for (observer_index, mut observer) in self.installed_observers.into_iter().enumerate() {
             let _ = observer.cancel_tx.send(true);
             while !*observer.completed_rx.borrow() {
+                tracing::debug!(
+                    observer_index = observer_index + 1,
+                    observer_count,
+                    elapsed_ms = observer_cleanup_started_at.elapsed().as_millis(),
+                    "wallet sync cleanup waiting for installed observer"
+                );
                 if observer.completed_rx.changed().await.is_err() {
                     break;
                 }
             }
+            if *observer.completed_rx.borrow() {
+                completed_observer_count += 1;
+            }
         }
+        tracing::debug!(
+            observer_count,
+            completed_observer_count,
+            elapsed_ms = observer_cleanup_started_at.elapsed().as_millis(),
+            "wallet sync cleanup installed observers cancelled"
+        );
 
         let shut_down_session_store = if let Some(store) = self
             .session_store
             .as_ref()
             .and_then(|session_store| session_store.get().cloned())
         {
+            let session_store_shutdown_started_at = Instant::now();
+            tracing::debug!("wallet sync cleanup shutting down session store");
             store.shutdown().await;
+            tracing::debug!(
+                elapsed_ms = session_store_shutdown_started_at.elapsed().as_millis(),
+                "wallet sync cleanup session store shut down"
+            );
             true
         } else {
             false
@@ -553,16 +581,6 @@ impl WalletSyncLifecycleCleanupWaitGroup {
         self.tasks
             .iter()
             .all(WalletSyncLifecycleCleanupTask::is_finished)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn shutdown_with_timeout(
-        self,
-        timeout: Duration,
-    ) -> Result<WalletSyncLifecycleCleanupReport, String> {
-        tokio::time::timeout(timeout, self.wait())
-            .await
-            .map_err(|_| "timed out stopping wallet sync; try again".to_string())?
     }
 
     async fn wait(self) -> Result<WalletSyncLifecycleCleanupReport, String> {

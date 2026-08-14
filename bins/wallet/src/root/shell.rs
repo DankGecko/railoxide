@@ -1983,7 +1983,7 @@ pub(super) fn ppoi_hover_heading(
     }
     match status {
         PresenceStatus::Healthy => "PPOI ready",
-        PresenceStatus::Active => "PPOI catching up",
+        PresenceStatus::Active => "PPOI action needed",
         PresenceStatus::Error => "PPOI checks blocked",
         PresenceStatus::Unknown => "PPOI status unavailable",
     }
@@ -2022,7 +2022,9 @@ pub(super) fn ppoi_hover_detail(
     }
     match status {
         PresenceStatus::Healthy => Some("Up to date and following the source."),
-        PresenceStatus::Active => Some("Catching up with the PPOI source."),
+        PresenceStatus::Active => {
+            Some("PPOI data is ready; one or more outputs still need proof submission or recovery.")
+        }
         PresenceStatus::Error => Some("PPOI checks are blocked until the artifact cache rebuilds."),
         PresenceStatus::Unknown => {
             Some("PPOI source or artifact-cache status is not available yet.")

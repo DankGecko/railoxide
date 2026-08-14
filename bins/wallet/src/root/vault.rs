@@ -101,7 +101,11 @@ pub(in crate::root) use hardware::{default_hardware_wallet_setup_intent, hardwar
 #[cfg(test)]
 pub(in crate::root) use inputs::should_focus_vault_input;
 #[cfg(test)]
-pub(in crate::root) use lifecycle::wallet_replacement_finalize_is_admitted;
+pub(in crate::root) use lifecycle::{
+    WALLET_REPLACEMENT_TIMEOUT_MESSAGE, WalletReplacementCleanupWaitOutcome,
+    wait_for_wallet_replacement_cleanup, wallet_replacement_finalize_is_admitted,
+    wallet_replacement_update_is_current,
+};
 pub(in crate::root) use passphrase_ui::PassphraseOpenUi;
 pub(in crate::root) use pending::{PendingSoftwareProfileOpen, PendingSoftwareProfileOpenStage};
 #[cfg(feature = "hardware")]

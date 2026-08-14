@@ -14,7 +14,11 @@ use crate::root::shell::{
     PoiArtifactCacheRetryAttempts, ppoi_chunk_progress_label, ppoi_replay_progress_label,
     ppoi_retry_completion_is_current,
 };
-use crate::root::vault::wallet_replacement_finalize_is_admitted;
+use crate::root::vault::{
+    WALLET_REPLACEMENT_TIMEOUT_MESSAGE, WalletReplacementCleanupWaitOutcome,
+    wait_for_wallet_replacement_cleanup, wallet_replacement_finalize_is_admitted,
+    wallet_replacement_update_is_current,
+};
 use wallet_ops::{
     PoiArtifactCacheAttemptId, PoiArtifactCacheGraphProgress, PoiArtifactCachePhase,
     PoiArtifactCacheProgress, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
@@ -1017,20 +1021,38 @@ async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
         admission_barrier.is_finished(),
     ));
 
-    let error = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task.clone()])
-        .shutdown_with_timeout(Duration::from_millis(1))
-        .await
-        .expect_err("cleanup should time out");
+    assert!(matches!(
+        wait_for_wallet_replacement_cleanup(
+            WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task.clone()]),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await,
+        WalletReplacementCleanupWaitOutcome::PresentationTimedOut
+    ));
+    assert!(!cleanup_task.is_finished());
+    assert!(!wallet_replacement_finalize_is_admitted(
+        7,
+        7,
+        1,
+        1,
+        false,
+        admission_barrier.is_finished(),
+    ));
 
-    assert_eq!(error, "timed out stopping wallet sync; try again");
-    let report = tokio::time::timeout(
-        Duration::from_secs(1),
-        WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task])
-            .shutdown_for_wallet_replacement(),
+    let report = match wait_for_wallet_replacement_cleanup(
+        WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task]),
+        tokio::time::sleep(Duration::from_secs(1)),
     )
     .await
-    .expect("root replacement cleanup should not time out")
-    .expect("cleanup should still complete");
+    {
+        WalletReplacementCleanupWaitOutcome::Completed(Ok(report)) => report,
+        WalletReplacementCleanupWaitOutcome::Completed(Err(error)) => {
+            panic!("retry cleanup failed: {error}")
+        }
+        WalletReplacementCleanupWaitOutcome::PresentationTimedOut => {
+            panic!("retry should wait on retained cleanup")
+        }
+    };
     assert_eq!(report.stopped_startup_tasks, 1);
     assert!(admission_barrier.is_finished());
     assert!(wallet_replacement_finalize_is_admitted(
@@ -1051,34 +1073,24 @@ async fn wallet_sync_lifecycle_cleanup_timeout_keeps_cleanup_retryable() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wallet_sync_lifecycle_wait_group_reuses_timed_out_cleanup() {
-    let mut lifecycle = WalletSyncLifecycle::new();
-    let registration = lifecycle.prepare_startup(1);
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let join = tokio::task::spawn_blocking(move || {
-        let _ = started_tx.send(());
-        std::thread::sleep(Duration::from_millis(100));
-    });
-    lifecycle.track_startup(&registration, join);
-    started_rx.await.expect("blocking cleanup task started");
-    let cleanup_task = lifecycle
-        .invalidate()
-        .spawn(&tokio::runtime::Handle::current());
-
-    let first_wait = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task.clone()])
-        .shutdown_with_timeout(Duration::from_millis(1))
-        .await;
+#[test]
+fn wallet_replacement_timeout_contract_rejects_stale_updates() {
     assert_eq!(
-        first_wait.expect_err("cleanup should time out"),
-        "timed out stopping wallet sync; try again"
+        WALLET_REPLACEMENT_TIMEOUT_MESSAGE,
+        "Your wallet is still closing. Try again in a moment."
     );
 
-    let report = WalletSyncLifecycleCleanupWaitGroup::new(vec![cleanup_task])
-        .shutdown_with_timeout(Duration::from_secs(1))
-        .await
-        .expect("retry should wait on retained cleanup");
-    assert_eq!(report.stopped_startup_tasks, 1);
+    let current = |switch, operation, lifetime, switching| {
+        wallet_replacement_update_is_current(
+            7, 7, switch, 11, operation, 13, lifetime, 17, 1, 1, false, switching,
+        )
+    };
+
+    assert!(current(11, 13, 17, true));
+    assert!(!current(10, 13, 17, true));
+    assert!(!current(11, 12, 17, true));
+    assert!(!current(11, 13, 16, true));
+    assert!(!current(11, 13, 17, false));
 }
 
 #[tokio::test]
