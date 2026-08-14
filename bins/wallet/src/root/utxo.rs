@@ -135,11 +135,19 @@ impl WalletRoot {
             .chain_states
             .get(&self.selected_chain)
             .is_some_and(ChainUtxoState::poi_refreshing);
+        let poi_retry_session_available = self
+            .chain_states
+            .get(&self.selected_chain)
+            .and_then(ChainUtxoState::poi_refresh_session)
+            .is_some();
         let finality_context = self.utxo_finality_context();
         self.utxo_table.update(cx, |state, cx| {
-            state
-                .delegate_mut()
-                .set_rows(rows, poi_refreshing, finality_context);
+            state.delegate_mut().set_rows(
+                rows,
+                poi_refreshing,
+                poi_retry_session_available,
+                finality_context,
+            );
             cx.notify();
         });
     }
@@ -868,8 +876,7 @@ impl WalletRoot {
         )
             .outline()
             .small()
-            .loading(poi_refreshing)
-            .disabled(poi_refreshing || poi_refresh_session.is_none())
+            .disabled(poi_refresh_session.is_none())
             .tooltip("PPOI submission is normally automatic. Retry also processes recipient and broadcaster-fee outputs created by this wallet.")
             .on_click(move |_event, _window, cx| {
                 poi_retry_root.update(cx, |root, cx| {
@@ -1121,6 +1128,7 @@ pub(super) struct UtxoDelegate {
     columns: [Column; 7],
     tx_search_input: Entity<InputState>,
     poi_refreshing: bool,
+    poi_retry_session_available: bool,
     finality_context: UtxoFinalityContext,
 }
 
@@ -1160,6 +1168,7 @@ impl UtxoDelegate {
             ],
             tx_search_input,
             poi_refreshing: false,
+            poi_retry_session_available: false,
             finality_context: UtxoFinalityContext::default(),
         }
     }
@@ -1168,10 +1177,12 @@ impl UtxoDelegate {
         &mut self,
         rows: Vec<UtxoDisplayRow>,
         poi_refreshing: bool,
+        poi_retry_session_available: bool,
         finality_context: UtxoFinalityContext,
     ) {
         self.rows = Arc::from(rows);
         self.poi_refreshing = poi_refreshing;
+        self.poi_retry_session_available = poi_retry_session_available;
         self.finality_context = finality_context;
     }
 
@@ -1362,6 +1373,7 @@ impl TableDelegate for UtxoDelegate {
                         row_ix,
                         self.root.clone(),
                         self.poi_refreshing,
+                        self.poi_retry_session_available,
                     ))
                 })
                 .into_any_element(),
@@ -1544,16 +1556,16 @@ fn ppoi_retry_action(
     row_ix: usize,
     root: WeakEntity<WalletRoot>,
     refreshing: bool,
+    session_available: bool,
 ) -> gpui::AnyElement {
     let tooltip = ppoi_retry_tooltip(row.ppoi_state);
     div()
         .child(
             app_button_base(SharedString::from(format!("wallet-retry-poi-{row_ix}")))
                 .xsmall()
-                .loading(refreshing)
-                .disabled(refreshing)
+                .disabled(!session_available)
                 .tooltip(tooltip)
-                .child("Retry")
+                .child(ppoi_row_retry_label(refreshing))
                 .on_click(move |_event, _window, cx| {
                     cx.stop_propagation();
                     let _ = root.update(cx, |root, cx| {
@@ -1819,20 +1831,23 @@ pub(super) fn should_show_ppoi_retry_action(row: &UtxoDisplayRow) -> bool {
 
 pub(super) const fn global_poi_retry_available(
     session_available: bool,
-    refreshing: bool,
+    _refreshing: bool,
     workflow_needs_attention: u64,
     owned_retry_candidates: usize,
 ) -> bool {
-    session_available
-        && (owned_retry_candidates > 0 || (!refreshing && workflow_needs_attention > 0))
+    session_available && (owned_retry_candidates > 0 || workflow_needs_attention > 0)
 }
 
 pub(super) const fn poi_retry_button_label(refreshing: bool) -> &'static str {
     if refreshing {
-        "Submitting PPOIs…"
+        "Queue PPOI retry"
     } else {
         "Retry PPOI submissions"
     }
+}
+
+pub(super) const fn ppoi_row_retry_label(refreshing: bool) -> &'static str {
+    if refreshing { "Queue retry" } else { "Retry" }
 }
 
 pub(super) const fn ppoi_state_detail(state: UtxoPpoiState) -> &'static str {

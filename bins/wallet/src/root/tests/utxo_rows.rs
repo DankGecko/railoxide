@@ -230,10 +230,12 @@ fn global_sender_retry_requires_actionable_work() {
     assert!(!global_poi_retry_available(true, false, 0, 0));
     assert!(!global_poi_retry_available(false, false, 1, 0));
     assert!(global_poi_retry_available(true, false, 1, 0));
-    assert!(!global_poi_retry_available(true, true, 1, 0));
+    assert!(global_poi_retry_available(true, true, 1, 0));
     assert!(global_poi_retry_available(true, true, 0, 1));
     assert_eq!(poi_retry_button_label(false), "Retry PPOI submissions");
-    assert_eq!(poi_retry_button_label(true), "Submitting PPOIs…");
+    assert_eq!(poi_retry_button_label(true), "Queue PPOI retry");
+    assert_eq!(ppoi_row_retry_label(false), "Retry");
+    assert_eq!(ppoi_row_retry_label(true), "Queue retry");
 }
 
 #[test]

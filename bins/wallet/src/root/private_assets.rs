@@ -1109,8 +1109,7 @@ impl WalletRoot {
                             )
                             .primary()
                             .small()
-                            .loading(retrying)
-                            .disabled(retrying || !retry_available)
+                            .disabled(!retry_available)
                             .on_click(move |_event, _window, cx| {
                                 retry_root.update(cx, |root, cx| {
                                     Self::retry_poi_submissions(root.selected_chain_session(), cx);
@@ -1393,7 +1392,7 @@ fn private_asset_pending_label(label: impl Into<SharedString>) -> gpui::Div {
 
 pub(super) fn retry_poi_label(count: usize, retrying: bool) -> String {
     if retrying {
-        "Submitting…".to_string()
+        "Queue PPOI retry".to_string()
     } else if count == 1 {
         "Retry".to_string()
     } else {
