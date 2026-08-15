@@ -287,8 +287,13 @@ fn wallet_session_observation(
     observation: &WalletObservation,
 ) -> Result<WalletSessionObservation> {
     let snapshot = Arc::new(match observation.view() {
-        WalletViewState::Current(_) => snapshot_from_view(chain_id, cache_key, observation.view())
-            .expect("observed current wallet view contains a snapshot"),
+        WalletViewState::Current(_) => snapshot_from_view(
+            chain_id,
+            cache_key,
+            observation.view(),
+            observation.ppoi_submission_statuses(),
+        )
+        .expect("observed current wallet view contains a snapshot"),
         WalletViewState::ResetPending { .. } => empty_wallet_snapshot(chain_id, cache_key),
         WalletViewState::Inactive { reason, .. } => {
             if observation.readiness() != &WalletReadiness::Shutdown {

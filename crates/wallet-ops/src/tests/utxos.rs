@@ -494,6 +494,7 @@ fn list_utxos_output_serializes_existing_field_names() {
                 "Unknown".to_string(),
             )]),
             ppoi_state: UtxoPpoiState::Unknown,
+            ppoi_last_submission_at: None,
             poi_spendable: false,
             source_tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
@@ -539,6 +540,7 @@ fn list_utxos_output_serializes_existing_field_names() {
                     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd": "Unknown",
                 },
                 "ppoi_state": "Unknown",
+                "ppoi_last_submission_at": null,
                 "poi_spendable": false,
                 "source_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
                 "source_block_number": 11,

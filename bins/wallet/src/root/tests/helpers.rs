@@ -80,6 +80,7 @@ pub(super) fn utxo_output_with_hashes(
         } else {
             UtxoPpoiState::Valid
         },
+        ppoi_last_submission_at: None,
         poi_spendable: !is_spent,
         source_tx_hash: source_tx_hash.to_string(),
         source_block_number: 11,
@@ -117,6 +118,7 @@ pub(super) fn unshield_utxo_output(
             "Valid".to_string(),
         )]),
         ppoi_state: UtxoPpoiState::Valid,
+        ppoi_last_submission_at: None,
         poi_spendable: true,
         source_tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
             .to_string(),

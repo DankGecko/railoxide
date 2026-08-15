@@ -59,6 +59,7 @@ use railgun_wallet::{
 use rand::seq::IndexedRandom;
 use reqwest::Url;
 use serde::Serialize;
+use sync_service::types::WalletPpoiSubmissionStatus;
 pub use sync_service::types::{
     WalletObservation, WalletPpoiWorkflowStatus, WalletReadiness, WalletReadinessError,
     WalletReadinessWaitError,

@@ -22,7 +22,10 @@ use super::public_action::{
 };
 use super::public_broadcaster_cost::public_broadcaster_cost_status;
 use super::shell::balance_sync_issue_detail;
-use super::utxo::{ppoi_workflow_status_detail, ppoi_workflow_status_title};
+use super::utxo::{
+    ppoi_row_state_detail_with_submission, ppoi_workflow_status_detail, ppoi_workflow_status_title,
+    should_show_ppoi_submission_age,
+};
 use super::*;
 
 mod address_book;

@@ -1087,6 +1087,7 @@ pub(super) struct UtxoDisplayRow {
     pub(super) activity_classification: String,
     pub(super) poi_status: String,
     pub(super) ppoi_state: UtxoPpoiState,
+    pub(super) ppoi_last_submission_at: Option<u64>,
     pub(super) poi_spendable: bool,
     pub(super) source_tx_hash: String,
     pub(super) source_block_number: u64,
@@ -1158,6 +1159,12 @@ impl UtxoDelegate {
                     .movable(false),
                 Column::new("poi", "PPOI")
                     .width(px(POI_COLUMN_WIDTH))
+                    .paddings(Edges {
+                        top: px(2.0),
+                        right: px(12.0),
+                        bottom: px(2.0),
+                        left: px(12.0),
+                    })
                     .movable(false),
                 Column::new("source_tx", "source tx")
                     .width(px(200.0))
@@ -1360,22 +1367,46 @@ impl TableDelegate for UtxoDelegate {
             4 => div()
                 .h_full()
                 .flex()
-                .items_center()
-                .gap_1()
+                .flex_col()
+                .items_start()
+                .justify_center()
+                .gap(px(2.0))
                 .opacity(if row.is_spent { 0.6 } else { 1.0 })
-                .child(poi_status_indicator(row, row_ix))
-                .when(should_show_blocked_shield_refund_action(row), |this| {
-                    this.child(blocked_shield_refund_action(row, row_ix, self.root.clone()))
-                })
-                .when(should_show_ppoi_retry_action(row), |this| {
-                    this.child(ppoi_retry_action(
-                        row,
-                        row_ix,
-                        self.root.clone(),
-                        self.poi_refreshing,
-                        self.poi_retry_session_available,
-                    ))
-                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(poi_status_indicator(row, row_ix))
+                        .when(should_show_blocked_shield_refund_action(row), |this| {
+                            this.child(blocked_shield_refund_action(row, row_ix, self.root.clone()))
+                        })
+                        .when(should_show_ppoi_retry_action(row), |this| {
+                            this.child(ppoi_retry_action(
+                                row,
+                                row_ix,
+                                self.root.clone(),
+                                self.poi_refreshing,
+                                self.poi_retry_session_available,
+                            ))
+                        }),
+                )
+                .when_some(
+                    row.ppoi_last_submission_at
+                        .filter(|_| should_show_ppoi_submission_age(row)),
+                    |this, timestamp| {
+                        this.child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(SharedString::from(format_ppoi_submission_age(
+                                    timestamp,
+                                    now_epoch_secs(),
+                                ))),
+                        )
+                    },
+                )
                 .into_any_element(),
             5 => source_tx_cell(
                 row,
@@ -1426,7 +1457,11 @@ fn poi_status_indicator(row: &UtxoDisplayRow, row_ix: usize) -> gpui::AnyElement
         Some(display) => (display.label, display.detail, true),
         None => (
             row.poi_status.clone(),
-            ppoi_row_state_detail(row.ppoi_state, row.is_spent),
+            ppoi_row_state_detail_with_submission(
+                row.ppoi_state,
+                row.is_spent,
+                row.ppoi_last_submission_at,
+            ),
             false,
         ),
     };
@@ -1829,6 +1864,12 @@ pub(super) fn should_show_ppoi_retry_action(row: &UtxoDisplayRow) -> bool {
         && row.ppoi_state.retry_eligible()
 }
 
+pub(super) fn should_show_ppoi_submission_age(row: &UtxoDisplayRow) -> bool {
+    row.ppoi_last_submission_at
+        .is_some_and(|timestamp| timestamp != 0)
+        && should_show_ppoi_retry_action(row)
+}
+
 pub(super) const fn global_poi_retry_available(
     session_available: bool,
     _refreshing: bool,
@@ -1863,12 +1904,26 @@ pub(super) const fn ppoi_state_detail(state: UtxoPpoiState) -> &'static str {
     }
 }
 
-pub(super) const fn ppoi_row_state_detail(state: UtxoPpoiState, is_spent: bool) -> &'static str {
+pub(super) fn ppoi_row_state_detail_with_submission(
+    state: UtxoPpoiState,
+    is_spent: bool,
+    last_submission_at: Option<u64>,
+) -> &'static str {
     if is_spent && matches!(state, UtxoPpoiState::Valid) {
-        "Verified — already spent."
-    } else {
-        ppoi_state_detail(state)
+        return "Verified — already spent.";
     }
+    if last_submission_at.unwrap_or_default() != 0
+        && matches!(
+            state,
+            UtxoPpoiState::Missing
+                | UtxoPpoiState::Unknown
+                | UtxoPpoiState::ProofSubmitted
+                | UtxoPpoiState::Mixed
+        )
+    {
+        return "Submission acknowledged; verification is pending.";
+    }
+    ppoi_state_detail(state)
 }
 
 pub(super) const fn ppoi_workflow_status_title(
@@ -2145,6 +2200,7 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
             activity_classification: row.activity_classification.clone(),
             poi_status: format_poi_status(row),
             ppoi_state: row.ppoi_state,
+            ppoi_last_submission_at: row.ppoi_last_submission_at,
             poi_spendable: row.poi_spendable,
             source_tx_hash: row.source_tx_hash.clone(),
             source_block_number: row.source_block_number,
@@ -2184,6 +2240,7 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         activity_classification: row.activity_classification.clone(),
         poi_status: format_poi_status(row),
         ppoi_state: row.ppoi_state,
+        ppoi_last_submission_at: row.ppoi_last_submission_at,
         poi_spendable: row.poi_spendable,
         source_tx_hash: row.source_tx_hash.clone(),
         source_block_number: row.source_block_number,
@@ -2227,6 +2284,29 @@ fn format_tree_position(tree: u32, position: u64) -> String {
 fn generated_age_label(timestamp: u64) -> String {
     let age_secs = now_epoch_secs().saturating_sub(timestamp);
     ui::format::format_relative_age(Duration::from_secs(age_secs))
+}
+
+pub(super) fn format_ppoi_submission_age(timestamp: u64, now_epoch_secs: u64) -> String {
+    let age_secs = now_epoch_secs.saturating_sub(timestamp);
+    if age_secs < SECONDS_PER_HOUR {
+        let age = if age_secs < SECONDS_PER_MINUTE {
+            format!("{age_secs}s")
+        } else {
+            let minutes = age_secs / SECONDS_PER_MINUTE;
+            let seconds = age_secs % SECONDS_PER_MINUTE;
+            if seconds == 0 {
+                format!("{minutes}m")
+            } else {
+                format!("{minutes}m {seconds}s")
+            }
+        };
+        return format!("Submitted {age} ago");
+    }
+
+    format!(
+        "Submitted {}",
+        ui::format::format_relative_age(Duration::from_secs(age_secs))
+    )
 }
 
 fn local_datetime_label(timestamp: u64) -> String {

@@ -5,6 +5,7 @@ pub(super) fn snapshot_from_view(
     chain_id: u64,
     cache_key: &str,
     view: &WalletViewState,
+    ppoi_submission_statuses: &[WalletPpoiSubmissionStatus],
 ) -> Option<ListUtxosOutput> {
     let snapshot = view.current_snapshot()?;
     let utxos = snapshot.utxos.to_vec();
@@ -14,6 +15,7 @@ pub(super) fn snapshot_from_view(
     let (utxo_outputs, totals) = utxo_outputs_from_utxos(utxos);
     let mut utxo_outputs = utxo_outputs;
     apply_pending_overlay_to_outputs(&confirmed_utxos, pending_overlay.clone(), &mut utxo_outputs);
+    apply_ppoi_submission_statuses(&mut utxo_outputs, ppoi_submission_statuses);
     let unspent_count = utxo_outputs.iter().filter(|utxo| !utxo.is_spent).count();
     let spent_count = utxo_outputs.len().saturating_sub(unspent_count);
 
@@ -27,6 +29,25 @@ pub(super) fn snapshot_from_view(
         utxos: utxo_outputs,
         totals,
     })
+}
+
+fn apply_ppoi_submission_statuses(
+    outputs: &mut [UtxoOutput],
+    statuses: &[WalletPpoiSubmissionStatus],
+) {
+    let timestamps = statuses
+        .iter()
+        .map(|status| {
+            (
+                hex::encode_prefixed(status.output_commitment),
+                status.last_submission_at,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for output in outputs {
+        output.ppoi_last_submission_at = timestamps.get(&output.commitment).copied();
+    }
 }
 
 pub(super) struct SyncedViewWallet {
@@ -734,6 +755,70 @@ mod tests {
             .map_or(0, |duration| duration.as_nanos());
         let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
         dir.join(format!("db-{pid}-{nanos}-{counter}"))
+    }
+
+    fn submission_output(commitment: FixedBytes<32>, pending_new: bool) -> UtxoOutput {
+        UtxoOutput {
+            tree: 0,
+            position: if pending_new { 1 } else { 0 },
+            token: "0x0000000000000000000000000000000000000001".to_string(),
+            value: "1".to_string(),
+            commitment_kind: "Transact".to_string(),
+            activity_classification: "Private Output".to_string(),
+            blocked_shield_rescue: None,
+            commitment: hex::encode_prefixed(commitment),
+            npk: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            blinded_commitment:
+                "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            poi_statuses: BTreeMap::new(),
+            ppoi_state: UtxoPpoiState::Unknown,
+            ppoi_last_submission_at: None,
+            poi_spendable: false,
+            source_tx_hash: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            source_block_number: 0,
+            source_block_timestamp: 0,
+            is_spent: false,
+            pending_new,
+            pending_spent: false,
+            local_pending_spent: false,
+            spent_tx_hash: None,
+            spent_block_number: None,
+        }
+    }
+
+    #[test]
+    fn ppoi_submission_projection_matches_exact_commitments_and_clears_absent_statuses() {
+        let mut outputs = vec![
+            submission_output(FixedBytes::from([1; 32]), false),
+            submission_output(FixedBytes::from([2; 32]), true),
+        ];
+        outputs[0].ppoi_last_submission_at = Some(10);
+        outputs[1].ppoi_last_submission_at = Some(20);
+
+        apply_ppoi_submission_statuses(
+            &mut outputs,
+            &[
+                WalletPpoiSubmissionStatus {
+                    output_commitment: FixedBytes::from([1; 32]),
+                    last_submission_at: 100,
+                },
+                WalletPpoiSubmissionStatus {
+                    output_commitment: FixedBytes::from([9; 32]),
+                    last_submission_at: 900,
+                },
+            ],
+        );
+
+        assert_eq!(outputs[0].ppoi_last_submission_at, Some(100));
+        assert_eq!(outputs[1].ppoi_last_submission_at, None);
+
+        apply_ppoi_submission_statuses(&mut outputs, &[]);
+        assert!(
+            outputs
+                .iter()
+                .all(|output| output.ppoi_last_submission_at.is_none())
+        );
     }
 
     #[test]

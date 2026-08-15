@@ -130,7 +130,7 @@ fn recoverable_poi_candidate_count_only_counts_actionable_transact_outputs() {
 }
 
 #[test]
-fn ppoi_row_retry_eligibility_includes_actionable_states_and_excludes_spent() {
+fn ppoi_row_retry_and_submission_age_visibility_includes_actionable_states_and_excludes_spent() {
     for state in [
         UtxoPpoiState::Missing,
         UtxoPpoiState::Unknown,
@@ -139,6 +139,7 @@ fn ppoi_row_retry_eligibility_includes_actionable_states_and_excludes_spent() {
         let mut output = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
         output.ppoi_state = state;
         output.poi_spendable = false;
+        output.ppoi_last_submission_at = Some(1_700_000_000);
         let row = display_rows_from_output(
             &ListUtxosOutput {
                 chain_id: 1,
@@ -155,10 +156,12 @@ fn ppoi_row_retry_eligibility_includes_actionable_states_and_excludes_spent() {
         )
         .remove(0);
         assert!(should_show_ppoi_retry_action(&row), "state {state:?}");
+        assert!(should_show_ppoi_submission_age(&row), "state {state:?}");
 
         let mut spent = row.clone();
         spent.is_spent = true;
         assert!(!should_show_ppoi_retry_action(&spent));
+        assert!(!should_show_ppoi_submission_age(&spent));
 
         let pending_overlays: [fn(&mut UtxoDisplayRow); 3] = [
             |row: &mut UtxoDisplayRow| row.pending_new = true,
@@ -169,6 +172,21 @@ fn ppoi_row_retry_eligibility_includes_actionable_states_and_excludes_spent() {
             let mut pending = row.clone();
             apply_pending(&mut pending);
             assert!(!should_show_ppoi_retry_action(&pending));
+            assert!(!should_show_ppoi_submission_age(&pending));
+        }
+
+        if state == UtxoPpoiState::Missing {
+            let mut no_timestamp = row.clone();
+            no_timestamp.ppoi_last_submission_at = None;
+            assert!(!should_show_ppoi_submission_age(&no_timestamp));
+
+            let mut zero_timestamp = row.clone();
+            zero_timestamp.ppoi_last_submission_at = Some(0);
+            assert!(!should_show_ppoi_submission_age(&zero_timestamp));
+
+            let mut non_private = row.clone();
+            non_private.activity_classification = "Shield".to_string();
+            assert!(!should_show_ppoi_submission_age(&non_private));
         }
     }
 
@@ -210,6 +228,14 @@ fn ppoi_state_details_use_concise_user_copy() {
     assert_eq!(
         ppoi_state_detail(UtxoPpoiState::Unknown),
         "Status not yet checked."
+    );
+    assert_eq!(
+        ppoi_row_state_detail_with_submission(UtxoPpoiState::Missing, false, None),
+        "No proof has been submitted for this output yet. Retrying usually resolves it."
+    );
+    assert_eq!(
+        ppoi_row_state_detail_with_submission(UtxoPpoiState::Missing, false, Some(1)),
+        "Submission acknowledged; verification is pending."
     );
 }
 
@@ -299,11 +325,17 @@ fn ppoi_workflow_status_copy_tracks_automatic_and_actionable_states() {
 #[test]
 fn spent_valid_ppoi_detail_is_historical_not_spendable() {
     assert_eq!(
-        ppoi_row_state_detail(UtxoPpoiState::Valid, true),
+        ppoi_row_state_detail_with_submission(UtxoPpoiState::Valid, true, None),
         "Verified — already spent."
     );
-    assert!(!ppoi_row_state_detail(UtxoPpoiState::Valid, true).contains("spendable"));
-    assert!(ppoi_row_state_detail(UtxoPpoiState::Valid, false).contains("spendable"));
+    assert!(
+        !ppoi_row_state_detail_with_submission(UtxoPpoiState::Valid, true, None)
+            .contains("spendable")
+    );
+    assert!(
+        ppoi_row_state_detail_with_submission(UtxoPpoiState::Valid, false, None)
+            .contains("spendable")
+    );
 }
 
 #[test]
