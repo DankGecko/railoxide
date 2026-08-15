@@ -89,10 +89,10 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            rust_commit: 322782fc93167b9d80f804ec51bb524ca9d734de9563ccfd57ae6a49d2962833
+            rust_commit: 385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            rust_commit: 26759a8cf4f379f1484726e0a6bc8aa866e282e3c6fc96c364278dd07019fc1e
+            rust_commit: 2687c4277fcc861b72fe6deda54a765cc1ef7939ac1214d37430f886a5768497
     runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08@sha256:2f06ee4d6948bf5ab39b7d6cb6d4c9e73847323ae46ddb6b57313a0dee75d4ff
