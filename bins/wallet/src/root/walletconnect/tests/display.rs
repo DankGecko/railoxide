@@ -109,3 +109,61 @@ fn format_unix_seconds_uses_local_datetime() {
     assert!(formatted.contains('-'));
     assert!(formatted.contains(':'));
 }
+
+#[test]
+fn request_expiry_status_is_missing_bounded_and_expired() {
+    assert_eq!(
+        walletconnect_request_expiry_status(None, 100),
+        WalletConnectRequestExpiryStatus::Missing
+    );
+    assert_eq!(
+        walletconnect_request_expiry_status(Some(125), 100),
+        WalletConnectRequestExpiryStatus::Remaining(25)
+    );
+    assert_eq!(
+        walletconnect_request_expiry_status(Some(100), 101),
+        WalletConnectRequestExpiryStatus::Expired
+    );
+    assert_eq!(
+        walletconnect_request_expiry_status(Some(0), u64::MAX),
+        WalletConnectRequestExpiryStatus::Expired
+    );
+    assert!(walletconnect_request_approval_admitted(None, u64::MAX));
+    assert!(!walletconnect_request_approval_admitted(Some(100), 100));
+}
+
+#[test]
+fn request_disclosures_are_isolated_and_pruned_when_requests_disappear() {
+    let mut states = BTreeMap::from([
+        (
+            "session-topic:1".to_owned(),
+            WalletConnectRequestDisclosureState::default(),
+        ),
+        (
+            "session-topic:2".to_owned(),
+            WalletConnectRequestDisclosureState::default(),
+        ),
+    ]);
+    toggle_request_disclosure_state(
+        states.get_mut("session-topic:1").expect("first state"),
+        WalletConnectRequestDisclosure::TransactionDetails,
+    );
+    toggle_request_disclosure_state(
+        states.get_mut("session-topic:2").expect("second state"),
+        WalletConnectRequestDisclosure::RawRequest,
+    );
+
+    assert!(states["session-topic:1"].transaction_details_open);
+    assert!(!states["session-topic:1"].raw_request_open);
+    assert!(!states["session-topic:2"].transaction_details_open);
+    assert!(states["session-topic:2"].raw_request_open);
+
+    let mut pending = BTreeMap::new();
+    pending.insert(
+        "session-topic:1".to_owned(),
+        test_walletconnect_request("session-topic:1", None),
+    );
+    prune_request_disclosure_states(&mut states, &pending);
+    assert_eq!(states.len(), 1);
+    assert!(states.contains_key("session-topic:1"));
+}

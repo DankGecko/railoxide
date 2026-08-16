@@ -147,26 +147,42 @@ pub struct WalletConnectPendingRequest {
     pub chain_id: String,
     pub method: WalletConnectSupportedMethod,
     pub account: Address,
-    pub decoded_summary: Option<WalletConnectErc20CallSummary>,
+    pub decoded_transaction: Option<WalletConnectDecodedTransaction>,
     pub raw_details: Value,
     pub expiry_timestamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WalletConnectErc20CallSummary {
-    Approve {
+pub struct WalletConnectDecodedTransaction {
+    pub target: Option<Address>,
+    pub native_value: U256,
+    pub kind: WalletConnectDecodedCallKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletConnectDecodedCallKind {
+    NativeTransfer,
+    Erc20Approve {
         spender: Address,
         amount: U256,
     },
-    Transfer {
+    Erc20Transfer {
         recipient: Address,
         amount: U256,
     },
-    TransferFrom {
+    Erc20TransferFrom {
         from: Address,
         to: Address,
         amount: U256,
     },
+    WrappedDeposit,
+    WrappedWithdraw {
+        amount: U256,
+    },
+    ContractCall {
+        selector: Option<[u8; 4]>,
+    },
+    ContractCreation,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -371,9 +387,9 @@ pub fn validate_walletconnect_session_request_with_account_support(
             chain_id: chain_id.to_owned(),
             method: request.method(),
             account,
-            decoded_summary: match &request {
+            decoded_transaction: match &request {
                 WalletConnectParsedRequest::EthSendTransaction { transaction } => {
-                    transaction.data.as_deref().and_then(decode_erc20_call)
+                    Some(decode_walletconnect_transaction(transaction))
                 }
                 _ => None,
             },
@@ -767,33 +783,105 @@ fn parse_u64_value(value: &Value) -> Option<u64> {
     }
 }
 
-fn decode_erc20_call(data: &str) -> Option<WalletConnectErc20CallSummary> {
-    let data = data.strip_prefix("0x").unwrap_or(data);
-    if data.len() < 8 {
-        return None;
+fn decode_walletconnect_transaction(
+    transaction: &WalletConnectEvmTransaction,
+) -> WalletConnectDecodedTransaction {
+    let native_value = transaction.value.unwrap_or(U256::ZERO);
+    let target = transaction.to;
+    let encoded_data = transaction
+        .data
+        .as_deref()
+        .map_or("", |data| data.strip_prefix("0x").unwrap_or(data));
+    let decoded_data = hex::decode(encoded_data);
+    let selector = decoded_data
+        .as_ref()
+        .ok()
+        .and_then(|data| data.get(..4))
+        .and_then(|selector| <[u8; 4]>::try_from(selector).ok())
+        .or_else(|| decode_selector_prefix(encoded_data));
+
+    let kind = match target {
+        None => WalletConnectDecodedCallKind::ContractCreation,
+        Some(_) => match decoded_data {
+            Ok(data) if data.is_empty() => {
+                if native_value.is_zero() {
+                    WalletConnectDecodedCallKind::ContractCall { selector: None }
+                } else {
+                    WalletConnectDecodedCallKind::NativeTransfer
+                }
+            }
+            Ok(data) => decode_call_kind(&data, selector),
+            Err(_) => WalletConnectDecodedCallKind::ContractCall { selector },
+        },
+    };
+
+    WalletConnectDecodedTransaction {
+        target,
+        native_value,
+        kind,
     }
-    let selector = &data[..8];
-    let payload = hex::decode(&data[8..]).ok()?;
+}
+
+fn decode_call_kind(data: &[u8], selector: Option<[u8; 4]>) -> WalletConnectDecodedCallKind {
+    let Some(selector) = selector else {
+        return WalletConnectDecodedCallKind::ContractCall { selector: None };
+    };
+    let payload = &data[4..];
     match selector {
-        "095ea7b3" => Some(WalletConnectErc20CallSummary::Approve {
-            spender: decode_abi_address(&payload, 0)?,
-            amount: decode_abi_u256(&payload, 1)?,
-        }),
-        "a9059cbb" => Some(WalletConnectErc20CallSummary::Transfer {
-            recipient: decode_abi_address(&payload, 0)?,
-            amount: decode_abi_u256(&payload, 1)?,
-        }),
-        "23b872dd" => Some(WalletConnectErc20CallSummary::TransferFrom {
-            from: decode_abi_address(&payload, 0)?,
-            to: decode_abi_address(&payload, 1)?,
-            amount: decode_abi_u256(&payload, 2)?,
-        }),
-        _ => None,
+        [0x09, 0x5e, 0xa7, 0xb3] if payload.len() == 64 => {
+            match (decode_abi_address(payload, 0), decode_abi_u256(payload, 1)) {
+                (Some(spender), Some(amount)) => {
+                    WalletConnectDecodedCallKind::Erc20Approve { spender, amount }
+                }
+                _ => WalletConnectDecodedCallKind::ContractCall {
+                    selector: Some(selector),
+                },
+            }
+        }
+        [0xa9, 0x05, 0x9c, 0xbb] if payload.len() == 64 => {
+            match (decode_abi_address(payload, 0), decode_abi_u256(payload, 1)) {
+                (Some(recipient), Some(amount)) => {
+                    WalletConnectDecodedCallKind::Erc20Transfer { recipient, amount }
+                }
+                _ => WalletConnectDecodedCallKind::ContractCall {
+                    selector: Some(selector),
+                },
+            }
+        }
+        [0x23, 0xb8, 0x72, 0xdd] if payload.len() == 96 => match (
+            decode_abi_address(payload, 0),
+            decode_abi_address(payload, 1),
+            decode_abi_u256(payload, 2),
+        ) {
+            (Some(from), Some(to), Some(amount)) => {
+                WalletConnectDecodedCallKind::Erc20TransferFrom { from, to, amount }
+            }
+            _ => WalletConnectDecodedCallKind::ContractCall {
+                selector: Some(selector),
+            },
+        },
+        [0xd0, 0xe3, 0x0d, 0xb0] if data.len() == 4 => WalletConnectDecodedCallKind::WrappedDeposit,
+        [0x2e, 0x1a, 0x7d, 0x4d] if payload.len() == 32 => {
+            WalletConnectDecodedCallKind::WrappedWithdraw {
+                amount: U256::from_be_slice(payload),
+            }
+        }
+        _ => WalletConnectDecodedCallKind::ContractCall {
+            selector: Some(selector),
+        },
     }
+}
+
+fn decode_selector_prefix(encoded_data: &str) -> Option<[u8; 4]> {
+    let selector = encoded_data.get(..8)?;
+    <[u8; 4]>::try_from(hex::decode(selector).ok()?).ok()
 }
 
 fn decode_abi_address(payload: &[u8], slot: usize) -> Option<Address> {
     let value = payload.get(slot * 32..slot * 32 + 32)?;
+    if value[..12].iter().any(|byte| *byte != 0) {
+        return None;
+    }
     Some(Address::from_slice(value.get(12..32)?))
 }
 

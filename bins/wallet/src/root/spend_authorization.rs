@@ -272,16 +272,6 @@ impl SpendAuthorizationSummary {
     }
 
     #[cfg(test)]
-    pub(in crate::root) fn title_for_test(&self) -> &str {
-        self.title.as_ref()
-    }
-
-    #[cfg(test)]
-    pub(in crate::root) fn detail_for_test(&self) -> &str {
-        self.detail.as_ref()
-    }
-
-    #[cfg(test)]
     pub(in crate::root) fn rows_for_test(&self) -> Vec<(String, String)> {
         self.rows
             .iter()

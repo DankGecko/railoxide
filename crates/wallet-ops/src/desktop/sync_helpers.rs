@@ -760,7 +760,7 @@ mod tests {
     fn submission_output(commitment: FixedBytes<32>, pending_new: bool) -> UtxoOutput {
         UtxoOutput {
             tree: 0,
-            position: if pending_new { 1 } else { 0 },
+            position: u64::from(pending_new),
             token: "0x0000000000000000000000000000000000000001".to_string(),
             value: "1".to_string(),
             commitment_kind: "Transact".to_string(),

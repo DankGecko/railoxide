@@ -40,7 +40,7 @@ pub use relay::{
     WalletConnectRelaySubscriptionPayload, WalletConnectRelaySubscriptionRequest,
 };
 pub use request::{
-    WalletConnectErc20CallSummary, WalletConnectEvmTransaction,
+    WalletConnectDecodedCallKind, WalletConnectDecodedTransaction, WalletConnectEvmTransaction,
     WalletConnectLifecycleRequestOutcome, WalletConnectParsedRequest, WalletConnectPendingRequest,
     WalletConnectPendingRequestQueue, WalletConnectRequestErrorKind,
     WalletConnectRequestValidation, build_walletconnect_jsonrpc_error,

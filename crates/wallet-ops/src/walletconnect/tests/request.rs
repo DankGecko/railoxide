@@ -9,8 +9,9 @@ use crate::vault::{
     WalletConnectSessionAccountResolution,
 };
 use crate::walletconnect::{
-    WalletConnectErc20CallSummary, WalletConnectError, WalletConnectNamespaceAccountSupport,
-    WalletConnectParsedRequest, WalletConnectPendingRequestQueue, approve_walletconnect_session,
+    WalletConnectDecodedCallKind, WalletConnectDecodedTransaction, WalletConnectError,
+    WalletConnectNamespaceAccountSupport, WalletConnectParsedRequest,
+    WalletConnectPendingRequestQueue, approve_walletconnect_session,
     approve_walletconnect_session_with_account_support, parse_walletconnect_session_request,
     validate_walletconnect_session_request,
     validate_walletconnect_session_request_with_account_support,
@@ -187,51 +188,224 @@ fn hardware_typed_data_request_validation_allows_unknown_capability_probe() {
 }
 
 #[test]
-fn validates_request_permissions_and_builds_erc20_approval_item() {
-    let (session, account) = approved_request_session(&[
-        "eth_accounts",
-        "personal_sign",
-        "eth_sendTransaction",
-        "eth_signTypedData_v4",
-        "wallet_switchEthereumChain",
-    ]);
+fn decodes_complete_transaction_review_states_and_strict_call_shapes() {
+    let (session, account) = approved_request_session(&["eth_sendTransaction"]);
     let resolution = WalletConnectSessionAccountResolution::Usable(account.clone());
-    let approve_data = concat!(
-        "0x095ea7b3",
-        "0000000000000000000000002222222222222222222222222222222222222222",
-        "0000000000000000000000000000000000000000000000000000000000000001"
+    let decode = |id: u64, transaction: serde_json::Value| {
+        let request =
+            parse_walletconnect_session_request(id, "eth_sendTransaction", &json!([transaction]))
+                .expect("transaction request");
+        validate_walletconnect_session_request(
+            &session,
+            &resolution,
+            &session.session_topic,
+            id,
+            "eip155:1",
+            request,
+            Some(NOW + 300),
+            NOW,
+        )
+        .expect("transaction validation")
+        .approval_item
+        .expect("transaction approval")
+        .decoded_transaction
+        .expect("transaction decode")
+    };
+
+    let recipient = address!("2222222222222222222222222222222222222222");
+    let spender = address!("3333333333333333333333333333333333333333");
+    let token = address!("4444444444444444444444444444444444444444");
+
+    assert_eq!(
+        decode(
+            100,
+            json!({
+                "from": account.address.to_string(),
+                "to": recipient.to_string(),
+                "value": "0x5"
+            }),
+        ),
+        WalletConnectDecodedTransaction {
+            target: Some(recipient),
+            native_value: U256::from(5),
+            kind: WalletConnectDecodedCallKind::NativeTransfer,
+        }
     );
-    let request = parse_walletconnect_session_request(
-        10,
-        "eth_sendTransaction",
-        &json!([{
-            "from": account.address.to_string(),
-            "to": "0x3333333333333333333333333333333333333333",
-            "data": approve_data,
-            "chainId": "0x1"
-        }]),
-    )
-    .unwrap();
+    assert_eq!(
+        decode(
+            101,
+            json!({
+                "from": account.address.to_string(),
+                "to": token.to_string()
+            }),
+        ),
+        WalletConnectDecodedTransaction {
+            target: Some(token),
+            native_value: U256::ZERO,
+            kind: WalletConnectDecodedCallKind::ContractCall { selector: None },
+        }
+    );
+    assert_eq!(
+        decode(
+            102,
+            json!({
+                "from": account.address.to_string(),
+                "value": "0x7",
+                "data": "0x6000"
+            }),
+        ),
+        WalletConnectDecodedTransaction {
+            target: None,
+            native_value: U256::from(7),
+            kind: WalletConnectDecodedCallKind::ContractCreation,
+        }
+    );
+    assert_eq!(
+        decode(
+            103,
+            json!({
+                "from": account.address.to_string(),
+                "to": token.to_string(),
+                "data": concat!(
+                    "0xa9059cbb",
+                    "0000000000000000000000002222222222222222222222222222222222222222",
+                    "0000000000000000000000000000000000000000000000000000000000000008"
+                ),
+                "value": "0x4"
+            }),
+        ),
+        WalletConnectDecodedTransaction {
+            target: Some(token),
+            native_value: U256::from(4),
+            kind: WalletConnectDecodedCallKind::Erc20Transfer {
+                recipient,
+                amount: U256::from(8),
+            },
+        }
+    );
+    assert_eq!(
+        decode(
+            104,
+            json!({
+                "from": account.address.to_string(),
+                "to": token.to_string(),
+                "data": concat!(
+                    "0x23b872dd",
+                    "0000000000000000000000002222222222222222222222222222222222222222",
+                    "0000000000000000000000003333333333333333333333333333333333333333",
+                    "0000000000000000000000000000000000000000000000000000000000000009"
+                )
+            }),
+        ),
+        WalletConnectDecodedTransaction {
+            target: Some(token),
+            native_value: U256::ZERO,
+            kind: WalletConnectDecodedCallKind::Erc20TransferFrom {
+                from: recipient,
+                to: spender,
+                amount: U256::from(9),
+            },
+        }
+    );
+    assert_eq!(
+        decode(
+            105,
+            json!({
+                "from": account.address.to_string(),
+                "to": token.to_string(),
+                "value": "0xa",
+                "data": "0xd0e30db0"
+            }),
+        ),
+        WalletConnectDecodedTransaction {
+            target: Some(token),
+            native_value: U256::from(10),
+            kind: WalletConnectDecodedCallKind::WrappedDeposit,
+        }
+    );
+    assert_eq!(
+        decode(
+            106,
+            json!({
+                "from": account.address.to_string(),
+                "to": token.to_string(),
+                "value": "0x2",
+                "data": concat!(
+                    "0x2e1a7d4d",
+                    "000000000000000000000000000000000000000000000000000000000000000b"
+                )
+            }),
+        ),
+        WalletConnectDecodedTransaction {
+            target: Some(token),
+            native_value: U256::from(2),
+            kind: WalletConnectDecodedCallKind::WrappedWithdraw {
+                amount: U256::from(11),
+            },
+        }
+    );
 
-    let validation = validate_walletconnect_session_request(
-        &session,
-        &resolution,
-        &session.session_topic,
-        10,
-        "eip155:1",
-        request,
-        Some(NOW + 300),
-        NOW,
-    )
-    .unwrap();
-    let approval = validation.approval_item.expect("approval item");
+    for (id, data) in [
+        (
+            107,
+            concat!(
+                "0x095ea7b3",
+                "0000000000000000000000002222222222222222222222222222222222222222",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "00"
+            ),
+        ),
+        (
+            108,
+            concat!(
+                "0x095ea7b3",
+                "0100000000000000000000002222222222222222222222222222222222222222",
+                "0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+        ),
+    ] {
+        assert_eq!(
+            decode(
+                id,
+                json!({
+                    "from": account.address.to_string(),
+                    "to": token.to_string(),
+                    "data": data
+                }),
+            )
+            .kind,
+            WalletConnectDecodedCallKind::ContractCall {
+                selector: Some([0x09, 0x5e, 0xa7, 0xb3]),
+            }
+        );
+    }
 
-    assert_eq!(approval.method.as_str(), "eth_sendTransaction");
-    assert!(matches!(
-        approval.decoded_summary,
-        Some(WalletConnectErc20CallSummary::Approve { spender, amount })
-            if spender == address!("2222222222222222222222222222222222222222") && amount == U256::from(1)
-    ));
+    assert_eq!(
+        decode(
+            109,
+            json!({
+                "from": account.address.to_string(),
+                "to": token.to_string(),
+                "data": "0xdeadbeef0102"
+            }),
+        )
+        .kind,
+        WalletConnectDecodedCallKind::ContractCall {
+            selector: Some([0xde, 0xad, 0xbe, 0xef]),
+        }
+    );
+    assert_eq!(
+        decode(
+            110,
+            json!({
+                "from": account.address.to_string(),
+                "to": token.to_string(),
+                "data": "0x1234"
+            }),
+        )
+        .kind,
+        WalletConnectDecodedCallKind::ContractCall { selector: None }
+    );
 }
 
 #[test]
@@ -452,9 +626,15 @@ fn validates_aave_style_approve_send_transaction_as_pending_request() {
         json!("0xdAC17F958D2ee523a2206206994597C13D831ec7")
     );
     assert!(matches!(
-        approval.decoded_summary,
-        Some(WalletConnectErc20CallSummary::Approve { spender, amount })
-            if spender == address!("2222222222222222222222222222222222222222") && amount == U256::MAX
+        approval.decoded_transaction,
+        Some(WalletConnectDecodedTransaction {
+            target: Some(target),
+            native_value,
+            kind: WalletConnectDecodedCallKind::Erc20Approve { spender, amount },
+        }) if target == address!("dac17f958d2ee523a2206206994597c13d831ec7")
+            && native_value.is_zero()
+            && spender == address!("2222222222222222222222222222222222222222")
+            && amount == U256::MAX
     ));
 }
 

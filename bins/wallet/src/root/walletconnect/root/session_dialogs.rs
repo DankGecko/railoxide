@@ -378,7 +378,13 @@ impl WalletRoot {
             self.walletconnect.sessions.clear();
             self.walletconnect.approval_handoff_sessions.clear();
             self.walletconnect.pending_requests.clear();
+            self.walletconnect.request_disclosure_states.clear();
             self.walletconnect.dismissed_request_dialog_keys.clear();
+            self.walletconnect.request_dialog_refresh_active = false;
+            self.walletconnect.request_dialog_refresh_generation = self
+                .walletconnect
+                .request_dialog_refresh_generation
+                .wrapping_add(1);
             self.walletconnect.subscriptions.clear();
             self.walletconnect.request_expiry_timer_active = false;
             self.walletconnect.request_expiry_generation =

@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 impl WalletRoot {
     pub(in crate::root) fn open_next_walletconnect_request_dialog_if_idle(
@@ -81,6 +82,7 @@ impl WalletRoot {
                 .remove(current_key);
         }
         self.clear_trezor_app_passphrase_input(window, cx);
+        self.stop_walletconnect_request_dialog_refresh();
         self.walletconnect.request_dialog_open = false;
         self.walletconnect.request_dialog_key = None;
     }
@@ -113,6 +115,7 @@ impl WalletRoot {
         self.walletconnect.request_dialog_open = true;
         self.walletconnect.request_dialog_deferred_logged = false;
         self.walletconnect.request_dialog_key = Some(Arc::clone(&request_key));
+        self.start_walletconnect_request_dialog_refresh(cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
         let dialog_max_height = (window.viewport_size().height * 0.88).min(px(820.0));
@@ -142,6 +145,60 @@ impl WalletRoot {
             root.walletconnect.request_dialog_focus.focus(window);
         });
         cx.notify();
+    }
+
+    fn start_walletconnect_request_dialog_refresh(&mut self, cx: &Context<'_, Self>) {
+        if self.walletconnect.request_dialog_refresh_active {
+            return;
+        }
+        self.walletconnect.request_dialog_refresh_active = true;
+        self.walletconnect.request_dialog_refresh_generation = self
+            .walletconnect
+            .request_dialog_refresh_generation
+            .wrapping_add(1);
+        let generation = self.walletconnect.request_dialog_refresh_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let keep_running = this
+                    .update(cx, |root, cx| {
+                        if root.walletconnect.request_dialog_refresh_generation != generation
+                            || !root.walletconnect.request_dialog_open
+                            || root
+                                .walletconnect
+                                .request_dialog_key
+                                .as_deref()
+                                .is_none_or(|key| {
+                                    !root.walletconnect.pending_requests.contains_key(key)
+                                        && !root
+                                            .walletconnect
+                                            .completed_request_dialogs
+                                            .contains_key(key)
+                                })
+                        {
+                            root.walletconnect.request_dialog_refresh_active = false;
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(in crate::root::walletconnect::root) const fn stop_walletconnect_request_dialog_refresh(
+        &mut self,
+    ) {
+        self.walletconnect.request_dialog_refresh_active = false;
+        self.walletconnect.request_dialog_refresh_generation = self
+            .walletconnect
+            .request_dialog_refresh_generation
+            .wrapping_add(1);
     }
 
     pub(in crate::root::walletconnect) fn render_walletconnect_request_dialog_content(
@@ -194,11 +251,6 @@ impl WalletRoot {
         {
             return content.child(self.render_walletconnect_completed_request(root, completed));
         }
-        if let Some(error) = self.walletconnect.error.as_ref() {
-            content = content.child(
-                Alert::error("walletconnect-request-dialog-error", error.to_string()).small(),
-            );
-        }
         if let Some(nav) =
             walletconnect_request_dialog_nav(&self.walletconnect.pending_requests, request_key)
             && nav.total > 1
@@ -206,7 +258,9 @@ impl WalletRoot {
             content = content.child(Self::render_walletconnect_request_dialog_nav(root, &nav));
         }
         match self.walletconnect.pending_requests.get(request_key) {
-            Some(request) => content.child(self.render_walletconnect_request(root, request)),
+            Some(request) => {
+                content.child(self.render_walletconnect_request(root, request, content_width))
+            }
             None => content.child(app_muted_text(
                 "This WalletConnect request was already resolved or is no longer available.",
             )),

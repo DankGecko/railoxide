@@ -267,45 +267,6 @@ fn walletconnect_hash_fallback_mode_uses_request_session_account() {
 }
 
 #[test]
-fn walletconnect_authorization_summary_includes_request_context() {
-    let account = alloy::primitives::Address::from([0x11; 20]);
-    let request = WalletConnectRequestUi {
-        key: "session-topic:7".to_owned(),
-        review_token: 1,
-        session: test_walletconnect_session("session-topic"),
-        parsed: WalletConnectParsedRequest::EthAccounts,
-        item: WalletConnectPendingRequest {
-            id: 7,
-            topic: "session-topic".to_owned(),
-            dapp_name: "Aave".to_owned(),
-            chain_id: "eip155:1".to_owned(),
-            method: WalletConnectSupportedMethod::EthSendTransaction,
-            account,
-            decoded_summary: Some(WalletConnectErc20CallSummary::Approve {
-                spender: alloy::primitives::Address::from([0x22; 20]),
-                amount: U256::from(1),
-            }),
-            raw_details: json!({ "to": "0xdAC17F958D2ee523a2206206994597C13D831ec7" }),
-            expiry_timestamp: Some(1_700_000_300),
-        },
-        account_source: PublicAccountSource::Imported,
-    };
-
-    let summary = walletconnect_request_authorization_summary(&request);
-    let rows = summary.rows_for_test();
-
-    assert_eq!(summary.title_for_test(), "Authorize WalletConnect request");
-    assert!(summary.detail_for_test().contains("eth_sendTransaction"));
-    assert!(rows.contains(&("Dapp".to_owned(), "Aave".to_owned())));
-    assert!(rows.contains(&("Method".to_owned(), "eth_sendTransaction".to_owned())));
-    assert!(
-        rows.iter().any(|(label, value)| {
-            label == "Decoded request" && value.contains("ERC-20 approve")
-        })
-    );
-}
-
-#[test]
 fn switch_chain_event_uses_eip1193_hex_chain_id() {
     let (root_dir, store) = walletconnect_test_store();
     let view_session = import_test_wallet(&store, "wc-switch-event", "WC Switch Event");

@@ -3,6 +3,7 @@ use super::{
         current_unix_seconds, parse_caip2_chain_id, walletconnect_await_before_request_expiry,
         walletconnect_pending_request_expired,
     },
+    intent::{WalletConnectIntentView, walletconnect_selected_account_provenance_visible},
     relay::{publish_walletconnect_session_response, publish_walletconnect_session_response_ref},
     render::chain_label_for_caip2,
     *,
@@ -431,41 +432,45 @@ pub(super) fn walletconnect_request_should_queue(
     !pending_requests.contains_key(request_key) && !handled_request_keys.contains(request_key)
 }
 
-pub(super) fn erc20_summary_label(summary: &WalletConnectErc20CallSummary) -> String {
-    match summary {
-        WalletConnectErc20CallSummary::Approve { spender, amount } => {
-            format!("ERC-20 approve {spender:#x} for {amount}")
-        }
-        WalletConnectErc20CallSummary::Transfer { recipient, amount } => {
-            format!("ERC-20 transfer {amount} to {recipient:#x}")
-        }
-        WalletConnectErc20CallSummary::TransferFrom { from, to, amount } => {
-            format!("ERC-20 transferFrom {amount} from {from:#x} to {to:#x}")
-        }
-    }
-}
-
 pub(super) fn walletconnect_request_authorization_summary(
     request: &WalletConnectRequestUi,
+    intent: &WalletConnectIntentView<'_>,
 ) -> SpendAuthorizationSummary {
-    let mut rows = vec![
-        SpendAuthorizationSummaryRow::new("Dapp", request.item.dapp_name.clone()),
-        SpendAuthorizationSummaryRow::new("Method", request.item.method.as_str().to_owned()),
-        SpendAuthorizationSummaryRow::new("Chain", chain_label_for_caip2(&request.item.chain_id)),
-        SpendAuthorizationSummaryRow::new("Public account", request.item.account.to_string()),
-    ];
-    if let Some(summary) = request.item.decoded_summary.as_ref() {
+    let mut rows = vec![SpendAuthorizationSummaryRow::new(
+        "Site",
+        intent.provenance.site.clone(),
+    )];
+    if let Some(name) = intent.provenance.dapp_name.as_ref() {
+        rows.push(SpendAuthorizationSummaryRow::new("Dapp", name.clone()));
+    }
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Method",
+        request.item.method.as_str().to_owned(),
+    ));
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Chain",
+        chain_label_for_caip2(&request.item.chain_id),
+    ));
+    if walletconnect_selected_account_provenance_visible(request.item.account, &intent.parties) {
         rows.push(SpendAuthorizationSummaryRow::new(
-            "Decoded request",
-            erc20_summary_label(summary),
+            "Public account",
+            request.item.account.to_string(),
         ));
     }
+    rows.push(
+        SpendAuthorizationSummaryRow::new("Intent", intent.authorization.clone())
+            .with_icon(intent.icon.clone()),
+    );
+    let requester = intent.provenance.dapp_name.as_ref().map_or_else(
+        || intent.provenance.site.clone(),
+        |name| format!("{} ({name})", intent.provenance.site),
+    );
     SpendAuthorizationSummary::new(
         "Authorize WalletConnect request",
         format!(
             "Authorize this one {} request from {}. The dapp will not receive a signature or transaction response until you continue.",
             request.item.method.as_str(),
-            request.item.dapp_name,
+            requester,
         ),
         rows,
     )

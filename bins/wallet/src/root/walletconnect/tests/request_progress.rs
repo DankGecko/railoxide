@@ -126,7 +126,7 @@ fn walletconnect_hash_fallback_warning_uses_explicit_continue_label() {
         )
     );
     assert_eq!(
-        walletconnect_request_approve_label(false, true, false),
+        walletconnect_request_approve_label(false, true, false, false),
         "Approve on device"
     );
     assert!(
@@ -136,12 +136,16 @@ fn walletconnect_hash_fallback_warning_uses_explicit_continue_label() {
         )
     );
     assert_eq!(
-        walletconnect_request_approve_label(false, true, true),
+        walletconnect_request_approve_label(false, true, true, false),
         "Continue with hash fallback"
     );
     assert_eq!(
-        walletconnect_request_approve_label(true, true, true),
+        walletconnect_request_approve_label(true, true, true, true),
         "Waiting for device..."
+    );
+    assert_eq!(
+        walletconnect_request_approve_label(false, false, false, true),
+        "Approve unlimited"
     );
 }
 

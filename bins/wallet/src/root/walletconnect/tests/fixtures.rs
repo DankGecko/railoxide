@@ -121,7 +121,7 @@ pub(super) fn test_walletconnect_request(
             chain_id: "eip155:1".to_owned(),
             method: WalletConnectSupportedMethod::EthSendTransaction,
             account,
-            decoded_summary: None,
+            decoded_transaction: None,
             raw_details: json!({}),
             expiry_timestamp,
         },

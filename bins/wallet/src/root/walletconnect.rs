@@ -31,16 +31,15 @@ use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     HardwareTrezorPinMatrixProvider, HttpContext, PublicActionGasFeeSelection,
     PublicActionSessionEvent, PublicActionSessionEventSender, PublicBalanceSnapshot,
-    TokenAnchorRateCache, WALLETCONNECT_DEFAULT_PROJECT_ID, WalletConnectErc20CallSummary,
-    WalletConnectError, WalletConnectEvmTransaction,
-    WalletConnectHardwareTypedDataCapabilityRequest, WalletConnectJsonRpcRequest,
-    WalletConnectJsonRpcResponse, WalletConnectLifecycleRequestOutcome,
-    WalletConnectNamespaceAccountSupport, WalletConnectNamespaceNegotiation,
-    WalletConnectPairingUri, WalletConnectParsedRequest, WalletConnectPendingRequest,
-    WalletConnectPersonalSignRequest, WalletConnectProposalRejectionReason,
-    WalletConnectRelayClient, WalletConnectRelayClientAuth, WalletConnectRelayConfig,
-    WalletConnectRelayRpc, WalletConnectRelaySocket, WalletConnectRelayStep,
-    WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
+    TokenAnchorRateCache, WALLETCONNECT_DEFAULT_PROJECT_ID, WalletConnectError,
+    WalletConnectEvmTransaction, WalletConnectHardwareTypedDataCapabilityRequest,
+    WalletConnectJsonRpcRequest, WalletConnectJsonRpcResponse,
+    WalletConnectLifecycleRequestOutcome, WalletConnectNamespaceAccountSupport,
+    WalletConnectNamespaceNegotiation, WalletConnectPairingUri, WalletConnectParsedRequest,
+    WalletConnectPendingRequest, WalletConnectPersonalSignRequest,
+    WalletConnectProposalRejectionReason, WalletConnectRelayClient, WalletConnectRelayClientAuth,
+    WalletConnectRelayConfig, WalletConnectRelayRpc, WalletConnectRelaySocket,
+    WalletConnectRelayStep, WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
     WalletConnectSendTransactionRequest, WalletConnectSessionProposal,
     WalletConnectSupportedMethod, WalletConnectTypedDataSignRequest,
     approve_walletconnect_session_with_account_support, build_walletconnect_disconnect_plan,
@@ -84,6 +83,7 @@ use super::{
 
 mod account_select;
 mod helpers;
+mod intent;
 mod relay;
 mod render;
 mod requests;
@@ -159,6 +159,9 @@ pub(super) struct WalletConnectUiState {
     request_dialog_open: bool,
     request_dialog_key: Option<Arc<str>>,
     request_dialog_focus: FocusHandle,
+    request_dialog_refresh_active: bool,
+    request_dialog_refresh_generation: u64,
+    request_disclosure_states: BTreeMap<String, WalletConnectRequestDisclosureState>,
     dismissed_request_dialog_keys: BTreeSet<String>,
     handled_request_keys: BTreeSet<String>,
     handled_request_key_order: VecDeque<String>,
@@ -200,6 +203,18 @@ struct WalletConnectApprovalStepState {
 struct WalletConnectApprovalProgress {
     generation: u64,
     steps: Vec<WalletConnectApprovalStepState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WalletConnectRequestDisclosureState {
+    transaction_details_open: bool,
+    raw_request_open: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalletConnectRequestDisclosure {
+    TransactionDetails,
+    RawRequest,
 }
 
 #[derive(Clone)]
@@ -244,6 +259,9 @@ impl WalletConnectUiState {
             request_dialog_open: false,
             request_dialog_key: None,
             request_dialog_focus,
+            request_dialog_refresh_active: false,
+            request_dialog_refresh_generation: 0,
+            request_disclosure_states: BTreeMap::new(),
             dismissed_request_dialog_keys: BTreeSet::new(),
             handled_request_keys: BTreeSet::new(),
             handled_request_key_order: VecDeque::new(),
@@ -278,6 +296,10 @@ impl WalletConnectUiState {
         self.connection_dialog_open = false;
         self.request_dialog_open = false;
         self.request_dialog_key = None;
+        self.request_dialog_refresh_active = false;
+        self.request_dialog_refresh_generation =
+            self.request_dialog_refresh_generation.wrapping_add(1);
+        self.request_disclosure_states.clear();
         self.dismissed_request_dialog_keys.clear();
         self.handled_request_keys.clear();
         self.handled_request_key_order.clear();
@@ -305,6 +327,7 @@ impl WalletConnectUiState {
     fn remove_pending_request(&mut self, request_key: &str) -> Option<WalletConnectRequestUi> {
         self.dismissed_request_dialog_keys.remove(request_key);
         self.request_approval_progress.remove(request_key);
+        self.request_disclosure_states.remove(request_key);
         let request = self.pending_requests.remove(request_key);
         if request.is_some() {
             self.remember_handled_request(request_key);
@@ -333,6 +356,7 @@ impl WalletConnectUiState {
             .retain(|key, request| keep(key, request));
         self.prune_dismissed_request_dialog_keys();
         self.prune_request_approval_progress();
+        self.prune_request_disclosure_states();
     }
 
     fn dismiss_request_dialog(&mut self, request_key: &str) {
@@ -350,6 +374,35 @@ impl WalletConnectUiState {
     fn prune_request_approval_progress(&mut self) {
         self.request_approval_progress
             .retain(|key, _| self.pending_requests.contains_key(key));
+    }
+
+    fn request_disclosure_state(&self, request_key: &str) -> WalletConnectRequestDisclosureState {
+        self.request_disclosure_states
+            .get(request_key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn toggle_request_disclosure(
+        &mut self,
+        request_key: &str,
+        disclosure: WalletConnectRequestDisclosure,
+    ) {
+        if !self.pending_requests.contains_key(request_key) {
+            return;
+        }
+        let state = self
+            .request_disclosure_states
+            .entry(request_key.to_owned())
+            .or_default();
+        toggle_request_disclosure_state(state, disclosure);
+    }
+
+    fn prune_request_disclosure_states(&mut self) {
+        prune_request_disclosure_states(
+            &mut self.request_disclosure_states,
+            &self.pending_requests,
+        );
     }
 
     fn start_request_approval_progress(
@@ -398,6 +451,27 @@ impl WalletConnectUiState {
         }
         progress.fail(message);
     }
+}
+
+const fn toggle_request_disclosure_state(
+    state: &mut WalletConnectRequestDisclosureState,
+    disclosure: WalletConnectRequestDisclosure,
+) {
+    match disclosure {
+        WalletConnectRequestDisclosure::TransactionDetails => {
+            state.transaction_details_open = !state.transaction_details_open;
+        }
+        WalletConnectRequestDisclosure::RawRequest => {
+            state.raw_request_open = !state.raw_request_open;
+        }
+    }
+}
+
+fn prune_request_disclosure_states(
+    states: &mut BTreeMap<String, WalletConnectRequestDisclosureState>,
+    pending_requests: &BTreeMap<String, WalletConnectRequestUi>,
+) {
+    states.retain(|key, _| pending_requests.contains_key(key));
 }
 
 impl WalletConnectApprovalProgress {
@@ -740,6 +814,7 @@ const fn walletconnect_request_approve_label(
     in_flight: bool,
     hardware_request: bool,
     hash_fallback: bool,
+    unlimited_allowance: bool,
 ) -> &'static str {
     if in_flight {
         if hardware_request {
@@ -751,6 +826,8 @@ const fn walletconnect_request_approve_label(
         "Continue with hash fallback"
     } else if hardware_request {
         "Approve on device"
+    } else if unlimited_allowance {
+        "Approve unlimited"
     } else {
         "Approve"
     }

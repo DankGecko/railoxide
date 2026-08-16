@@ -1,5 +1,8 @@
 use super::*;
 
+pub(super) const WALLETCONNECT_TRANSACTION_DETAILS_LABEL: &str = "Transaction details";
+pub(super) const WALLETCONNECT_RAW_REQUEST_LABEL: &str = "Raw request";
+
 pub(super) fn parse_caip2_chain_id(value: &str) -> Option<u64> {
     value.strip_prefix("eip155:")?.parse().ok()
 }
@@ -165,6 +168,38 @@ pub(super) fn walletconnect_pending_request_expired(
     now: u64,
 ) -> bool {
     expiry_timestamp.is_some_and(|expiry| expiry <= now)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WalletConnectRequestExpiryStatus {
+    Missing,
+    Remaining(u64),
+    Expired,
+}
+
+pub(super) const fn walletconnect_request_expiry_status(
+    expiry_timestamp: Option<u64>,
+    now: u64,
+) -> WalletConnectRequestExpiryStatus {
+    let Some(expiry_timestamp) = expiry_timestamp else {
+        return WalletConnectRequestExpiryStatus::Missing;
+    };
+    let remaining = expiry_timestamp.saturating_sub(now);
+    if remaining == 0 {
+        WalletConnectRequestExpiryStatus::Expired
+    } else {
+        WalletConnectRequestExpiryStatus::Remaining(remaining)
+    }
+}
+
+pub(super) const fn walletconnect_request_approval_admitted(
+    expiry_timestamp: Option<u64>,
+    now: u64,
+) -> bool {
+    matches!(
+        walletconnect_request_expiry_status(expiry_timestamp, now),
+        WalletConnectRequestExpiryStatus::Missing | WalletConnectRequestExpiryStatus::Remaining(_)
+    )
 }
 
 pub(super) fn walletconnect_validate_pending_request_expiry(
