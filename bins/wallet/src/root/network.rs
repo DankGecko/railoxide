@@ -12,6 +12,7 @@ use gpui::{
 use gpui_component::{Disableable, Icon, Sizable, alert::Alert, button::ButtonVariants};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
+use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::format::{format_compact_duration, format_compact_latency, format_relative_age};
 use ui::theme::{self, APP_TEXT_SIZE};
@@ -694,10 +695,17 @@ pub(super) fn render_network_status_popover_content(
                                 .child("Querying exit IP through Tor...")
                                 .into_any_element(),
                             TorExitIpQueryState::Success(ip) => div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
                                 .text_size(px(12.0))
                                 .line_height(px(17.0))
                                 .text_color(rgb(theme::SUCCESS))
                                 .child(format!("Exit IP: {ip}"))
+                                .child(clipboard_with_toast(
+                                    "wallet-network-exit-ip-copy",
+                                    ip.to_string(),
+                                ))
                                 .into_any_element(),
                             TorExitIpQueryState::Error(error) => div()
                                 .text_size(px(12.0))
