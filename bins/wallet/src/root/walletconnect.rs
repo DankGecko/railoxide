@@ -29,17 +29,17 @@ use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    HardwareTrezorPinMatrixProvider, HttpContext, PublicActionGasFeeSelection,
-    PublicActionSessionEvent, PublicActionSessionEventSender, PublicBalanceSnapshot,
-    TokenAnchorRateCache, WALLETCONNECT_DEFAULT_PROJECT_ID, WalletConnectError,
-    WalletConnectEvmTransaction, WalletConnectHardwareTypedDataCapabilityRequest,
-    WalletConnectJsonRpcRequest, WalletConnectJsonRpcResponse,
-    WalletConnectLifecycleRequestOutcome, WalletConnectNamespaceAccountSupport,
-    WalletConnectNamespaceNegotiation, WalletConnectPairingUri, WalletConnectParsedRequest,
-    WalletConnectPendingRequest, WalletConnectPersonalSignRequest,
-    WalletConnectProposalRejectionReason, WalletConnectRelayClient, WalletConnectRelayClientAuth,
-    WalletConnectRelayConfig, WalletConnectRelayRpc, WalletConnectRelaySocket,
-    WalletConnectRelayStep, WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
+    HardwareTrezorPinMatrixProvider, HttpContext, PublicActionSessionEvent,
+    PublicActionSessionEventSender, PublicBalanceSnapshot, TokenAnchorRateCache,
+    WALLETCONNECT_DEFAULT_PROJECT_ID, WalletConnectError, WalletConnectEvmTransaction,
+    WalletConnectHardwareTypedDataCapabilityRequest, WalletConnectJsonRpcRequest,
+    WalletConnectJsonRpcResponse, WalletConnectLifecycleRequestOutcome,
+    WalletConnectNamespaceAccountSupport, WalletConnectNamespaceNegotiation,
+    WalletConnectPairingUri, WalletConnectParsedRequest, WalletConnectPendingRequest,
+    WalletConnectPersonalSignRequest, WalletConnectProposalRejectionReason,
+    WalletConnectRelayClient, WalletConnectRelayClientAuth, WalletConnectRelayConfig,
+    WalletConnectRelayRpc, WalletConnectRelaySocket, WalletConnectRelayStep,
+    WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
     WalletConnectSendTransactionRequest, WalletConnectSessionProposal,
     WalletConnectSupportedMethod, WalletConnectTypedDataSignRequest,
     approve_walletconnect_session_with_account_support, build_walletconnect_disconnect_plan,
@@ -66,6 +66,7 @@ use wallet_ops::{
 use zeroize::Zeroizing;
 
 use crate::assets::WALLETCONNECT_ICON_PATH;
+use crate::root::gas_fee::{Eip1559GasFeeEditTarget, Eip1559GasFeeEditorState};
 
 use super::public_action::{
     PublicActionStepStatus, public_action_step_color, render_public_action_step_marker,
@@ -82,6 +83,7 @@ use super::{
 };
 
 mod account_select;
+mod fee;
 mod helpers;
 mod intent;
 mod relay;
@@ -99,6 +101,8 @@ pub(in crate::root) use account_select::{
 };
 pub(in crate::root) use render::walletconnect_logo_with_presence;
 
+use fee::WalletConnectFeeState;
+pub(super) use fee::WalletConnectReviewedFeeProjection;
 use render::walletconnect_approval_progress_steps;
 
 const WALLETCONNECT_RELAY_TTL_SECS: u64 = 300;
@@ -161,6 +165,9 @@ pub(super) struct WalletConnectUiState {
     request_dialog_focus: FocusHandle,
     request_dialog_refresh_active: bool,
     request_dialog_refresh_generation: u64,
+    walletconnect_gas_fee: Eip1559GasFeeEditorState,
+    walletconnect_fee_state: Option<WalletConnectFeeState>,
+    walletconnect_fee_request_generation: u64,
     request_disclosure_states: BTreeMap<String, WalletConnectRequestDisclosureState>,
     dismissed_request_dialog_keys: BTreeSet<String>,
     handled_request_keys: BTreeSet<String>,
@@ -207,12 +214,14 @@ struct WalletConnectApprovalProgress {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct WalletConnectRequestDisclosureState {
+    network_fee_open: bool,
     transaction_details_open: bool,
     raw_request_open: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WalletConnectRequestDisclosure {
+    NetworkFee,
     TransactionDetails,
     RawRequest,
 }
@@ -244,6 +253,49 @@ impl WalletConnectUiState {
             SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
         });
         let request_dialog_focus = cx.focus_handle();
+        let walletconnect_gas_fee = Eip1559GasFeeEditorState::new(window, cx);
+        let max_fee_input = walletconnect_gas_fee.max_fee_input.clone();
+        let max_priority_fee_input = walletconnect_gas_fee.max_priority_fee_input.clone();
+        cx.subscribe(
+            &max_fee_input,
+            |root, input, event: &gpui_component::input::InputEvent, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    if root
+                        .walletconnect
+                        .walletconnect_gas_fee
+                        .consume_programmatic_input_change(
+                            Eip1559GasFeeEditTarget::MaxFee,
+                            input.read(cx).value().as_ref(),
+                        )
+                    {
+                        return;
+                    }
+                    root.walletconnect_fee_editor_changed(cx);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &max_priority_fee_input,
+            |root, input, event: &gpui_component::input::InputEvent, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    if root
+                        .walletconnect
+                        .walletconnect_gas_fee
+                        .consume_programmatic_input_change(
+                            Eip1559GasFeeEditTarget::MaxTip,
+                            input.read(cx).value().as_ref(),
+                        )
+                    {
+                        return;
+                    }
+                    root.walletconnect_fee_editor_changed(cx);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         Self {
             uri_input,
             account_select,
@@ -261,6 +313,9 @@ impl WalletConnectUiState {
             request_dialog_focus,
             request_dialog_refresh_active: false,
             request_dialog_refresh_generation: 0,
+            walletconnect_gas_fee,
+            walletconnect_fee_state: None,
+            walletconnect_fee_request_generation: 0,
             request_disclosure_states: BTreeMap::new(),
             dismissed_request_dialog_keys: BTreeSet::new(),
             handled_request_keys: BTreeSet::new(),
@@ -299,6 +354,15 @@ impl WalletConnectUiState {
         self.request_dialog_refresh_active = false;
         self.request_dialog_refresh_generation =
             self.request_dialog_refresh_generation.wrapping_add(1);
+        self.walletconnect_gas_fee.refresh_id =
+            self.walletconnect_gas_fee.refresh_id.wrapping_add(1);
+        self.walletconnect_gas_fee.quote = None;
+        self.walletconnect_gas_fee.refreshing = false;
+        self.walletconnect_gas_fee.error = None;
+        self.walletconnect_gas_fee.quote_error = None;
+        self.walletconnect_fee_state = None;
+        self.walletconnect_fee_request_generation =
+            self.walletconnect_fee_request_generation.wrapping_add(1);
         self.request_disclosure_states.clear();
         self.dismissed_request_dialog_keys.clear();
         self.handled_request_keys.clear();
@@ -329,6 +393,13 @@ impl WalletConnectUiState {
         self.request_approval_progress.remove(request_key);
         self.request_disclosure_states.remove(request_key);
         let request = self.pending_requests.remove(request_key);
+        if self
+            .walletconnect_fee_state
+            .as_ref()
+            .is_some_and(|state| state.request_key.as_ref() == request_key)
+        {
+            self.walletconnect_fee_state = None;
+        }
         if request.is_some() {
             self.remember_handled_request(request_key);
         }
@@ -357,6 +428,13 @@ impl WalletConnectUiState {
         self.prune_dismissed_request_dialog_keys();
         self.prune_request_approval_progress();
         self.prune_request_disclosure_states();
+        if self.walletconnect_fee_state.as_ref().is_some_and(|state| {
+            !self
+                .pending_requests
+                .contains_key(state.request_key.as_ref())
+        }) {
+            self.walletconnect_fee_state = None;
+        }
     }
 
     fn dismiss_request_dialog(&mut self, request_key: &str) {
@@ -458,6 +536,9 @@ const fn toggle_request_disclosure_state(
     disclosure: WalletConnectRequestDisclosure,
 ) {
     match disclosure {
+        WalletConnectRequestDisclosure::NetworkFee => {
+            state.network_fee_open = !state.network_fee_open;
+        }
         WalletConnectRequestDisclosure::TransactionDetails => {
             state.transaction_details_open = !state.transaction_details_open;
         }

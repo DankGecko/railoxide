@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use alloy::primitives::{Address, B256, Bytes, U256};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{TransactionRequest, transaction::AccessList};
 use serde_json::Value;
+use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::TxReceiptOutput;
@@ -15,9 +16,39 @@ use crate::vault::{
     DesktopVaultStore, DesktopViewSession, HardwareProfileSession, ProtectedSoftwareSeedSession,
     PublicAccountMetadata,
 };
+use crate::walletconnect::WalletConnectDecodedTransaction;
 
 pub type PublicActionGasFeeQuote = crate::SelfBroadcastGasFeeQuote;
 pub type PublicActionGasFeeSelection = crate::SelfBroadcastGasFeeSelection;
+pub type PublicActionResolvedGasFee = crate::SelfBroadcastResolvedGasFee;
+
+#[derive(Debug, Error)]
+pub enum PublicAdvancedTransactionSimulationError {
+    #[error("simulation would revert: {0}")]
+    Reverted(String),
+    #[error("simulation unavailable: {0}")]
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicActionFeeSource {
+    OperationTable,
+    NetworkSimulation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicActionFeeProjection {
+    pub source: PublicActionFeeSource,
+    pub raw_gas_limit: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub expected_fee_per_gas: u128,
+    pub expected_gas_cost: U256,
+    pub maximum_gas_cost: U256,
+    pub expected_native_usd_micro_value: Option<U256>,
+    pub maximum_native_usd_micro_value: Option<U256>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicActionGasFeeQuoteBundle {
@@ -250,11 +281,13 @@ pub struct PublicAdvancedTransactionEstimateRequest {
     pub from: Address,
     pub intent: PublicTransactionIntent,
     pub gas_fee: PublicActionGasFeeSelection,
+    pub access_list: Option<AccessList>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicAdvancedTransactionEstimate {
     pub payload_fingerprint: B256,
+    pub raw_gas_limit: u64,
     pub gas_limit: u64,
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
@@ -390,9 +423,24 @@ pub struct WalletConnectSendTransactionRequest {
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub tx_req: TransactionRequest,
+    pub decoded_transaction: Option<WalletConnectDecodedTransaction>,
+    pub reviewed_transaction: Option<WalletConnectReviewedTransaction>,
+    pub reviewed_fee: Option<WalletConnectReviewedFee>,
     pub gas_fee: PublicActionGasFeeSelection,
     pub expiry_timestamp: Option<u64>,
     pub event_tx: Option<PublicActionSessionEventSender>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletConnectReviewedFee {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletConnectReviewedTransaction {
+    pub payload_fingerprint: B256,
+    pub gas_limit: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

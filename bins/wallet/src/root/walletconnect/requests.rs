@@ -1,3 +1,4 @@
+use super::fee::WalletConnectReviewedFeeProjection;
 use super::{
     helpers::{
         current_unix_seconds, parse_caip2_chain_id, walletconnect_await_before_request_expiry,
@@ -8,6 +9,7 @@ use super::{
     render::chain_label_for_caip2,
     *,
 };
+use crate::root::tokens::format_native_token_amount_for_display;
 
 pub(super) async fn approve_walletconnect_request_task(
     request: WalletConnectRequestUi,
@@ -21,6 +23,7 @@ pub(super) async fn approve_walletconnect_request_task(
     context: WalletConnectClientContext,
     http: HttpContext,
     hash_fallback_confirmed: bool,
+    reviewed_fee: super::fee::WalletConnectReviewedFeeProjection,
     event_tx: Option<PublicActionSessionEventSender>,
 ) -> Result<WalletConnectRequestApprovalOutcome, String> {
     let expiry_timestamp = request.item.expiry_timestamp;
@@ -83,7 +86,10 @@ pub(super) async fn approve_walletconnect_request_task(
                                 .selected_public_account_uuid
                                 .clone(),
                             tx_req,
-                            gas_fee: PublicActionGasFeeSelection::Auto,
+                            decoded_transaction: request.item.decoded_transaction.clone(),
+                            reviewed_transaction: reviewed_fee.reviewed_transaction(),
+                            reviewed_fee: reviewed_fee.wallet_ops_fee(),
+                            gas_fee: reviewed_fee.selection,
                             expiry_timestamp,
                             event_tx,
                         },
@@ -432,9 +438,20 @@ pub(super) fn walletconnect_request_should_queue(
     !pending_requests.contains_key(request_key) && !handled_request_keys.contains(request_key)
 }
 
+#[cfg(test)]
 pub(super) fn walletconnect_request_authorization_summary(
     request: &WalletConnectRequestUi,
     intent: &WalletConnectIntentView<'_>,
+) -> SpendAuthorizationSummary {
+    let reviewed_fee =
+        WalletConnectReviewedFeeProjection::unresolved(request.key.as_str(), request.review_token);
+    walletconnect_request_authorization_summary_with_fee(request, intent, &reviewed_fee)
+}
+
+pub(super) fn walletconnect_request_authorization_summary_with_fee(
+    request: &WalletConnectRequestUi,
+    intent: &WalletConnectIntentView<'_>,
+    reviewed_fee: &WalletConnectReviewedFeeProjection,
 ) -> SpendAuthorizationSummary {
     let mut rows = vec![SpendAuthorizationSummaryRow::new(
         "Site",
@@ -461,6 +478,15 @@ pub(super) fn walletconnect_request_authorization_summary(
         SpendAuthorizationSummaryRow::new("Intent", intent.authorization.clone())
             .with_icon(intent.icon.clone()),
     );
+    if let (Some(chain_id), Some(maximum)) = (
+        parse_caip2_chain_id(&request.item.chain_id),
+        reviewed_fee.maximum_gas_cost,
+    ) {
+        rows.push(SpendAuthorizationSummaryRow::new(
+            "Maximum network cost",
+            format_native_token_amount_for_display(chain_id, maximum),
+        ));
+    }
     let requester = intent.provenance.dapp_name.as_ref().map_or_else(
         || intent.provenance.site.clone(),
         |name| format!("{} ({name})", intent.provenance.site),
@@ -474,6 +500,7 @@ pub(super) fn walletconnect_request_authorization_summary(
         ),
         rows,
     )
+    .requiring_explicit_review()
 }
 
 pub(super) const fn hardware_walletconnect_notice(

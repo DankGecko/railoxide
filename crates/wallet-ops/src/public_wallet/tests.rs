@@ -2,18 +2,23 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
-use alloy::primitives::{Bytes, TxKind, U256, address};
-use alloy::rpc::types::TransactionRequest;
-use alloy::sol_types::SolCall;
+use alloy::network::TransactionBuilder as _;
+use alloy::primitives::{B256, Bytes, TxKind, U256, address};
+use alloy::rpc::types::{TransactionRequest, transaction::AccessList};
+use alloy::sol_types::{Revert, SolCall, SolError};
 use alloy::uint;
 use eyre::eyre;
 use local_db::{DbConfig, DbStore};
+use reqwest::Url;
+use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use super::types::PlannedPublicBalanceCall;
 use super::*;
+use crate::WalletConnectDecodedCallKind;
 use crate::hardware::{
     ConfirmedHardwarePublicAccount, HardwareDerivationDescriptor, HardwareDeviceKind,
     HardwareOperationOutput, HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode,
@@ -21,7 +26,9 @@ use crate::hardware::{
     synthetic_entropy_from_hardware_output,
 };
 use crate::hardware_typed_data::HardwareEip712Model;
-use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings};
+use crate::settings::{
+    EffectiveChainConfig, EffectiveChainGasSettings, IndexedArtifactSourceModeSetting,
+};
 use crate::signer::SoftwareEvmSigner;
 use crate::vault::{
     CreateSoftwareContextResult, DesktopVaultStore, DesktopViewSession, HardwareProfileBinding,
@@ -30,7 +37,7 @@ use crate::vault::{
     SoftwareSeedSessionBinding, TrezorPassphraseMode, VaultError, VaultSessionId, WalletSource,
     bip39_seed_from_mnemonic,
 };
-use crate::{GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback};
+use crate::{GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback, WalletNetworkMode};
 
 const TEST_PASSWORD: &str = "correct horse battery staple";
 const TEST_MNEMONIC: &str =
@@ -38,6 +45,287 @@ const TEST_MNEMONIC: &str =
 const TEST_IMPORTED_PRIVATE_KEY: &str =
     "0x59c6995e998f97a5a0044966f0945387e7d5e4a4dbd4b3f1b530b87d9b4a5c2f";
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+struct MockRpcCall {
+    method: String,
+    params: Value,
+    route: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum MockRpcEstimateResult {
+    Success(u64),
+    Error {
+        code: i64,
+        message: String,
+        data: Option<String>,
+    },
+}
+
+struct MockRpcServer {
+    url: String,
+    calls: Arc<Mutex<Vec<MockRpcCall>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockRpcServer {
+    async fn spawn(fail_requests: bool, estimate_gas: u64) -> Self {
+        Self::spawn_with_estimate_result(
+            fail_requests,
+            MockRpcEstimateResult::Success(estimate_gas),
+        )
+        .await
+    }
+
+    async fn spawn_revert(reason: &str) -> Self {
+        let data = Revert::from(reason).abi_encode();
+        Self::spawn_with_estimate_result(
+            false,
+            MockRpcEstimateResult::Error {
+                code: -32000,
+                message: "execution reverted".to_owned(),
+                data: Some(format!("0x{}", alloy::hex::encode(data))),
+            },
+        )
+        .await
+    }
+
+    async fn spawn_with_estimate_result(
+        fail_requests: bool,
+        estimate_result: MockRpcEstimateResult,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind mock RPC listener");
+        let address = listener.local_addr().expect("mock RPC address");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let task_calls = Arc::clone(&calls);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let calls = Arc::clone(&task_calls);
+                tokio::spawn(handle_mock_rpc_connection(
+                    stream,
+                    calls,
+                    fail_requests,
+                    estimate_result.clone(),
+                ));
+            }
+        });
+        Self {
+            url: format!("http://{address}"),
+            calls,
+            task,
+        }
+    }
+
+    fn calls(&self) -> Vec<MockRpcCall> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for MockRpcServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn handle_mock_rpc_connection(
+    mut stream: tokio::net::TcpStream,
+    calls: Arc<Mutex<Vec<MockRpcCall>>>,
+    fail_requests: bool,
+    estimate_result: MockRpcEstimateResult,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let (body_start, content_length) = loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("content-length:")
+                    .then(|| {
+                        line.split_once(':')
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0)
+                    })
+            })
+            .unwrap_or(0);
+        break (header_end, content_length);
+    };
+    while request.len() < body_start + content_length {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+
+    let headers = String::from_utf8_lossy(&request[..body_start]);
+    let route = headers.lines().find_map(|line| {
+        line.to_ascii_lowercase()
+            .starts_with("x-railoxide-test-route:")
+            .then(|| {
+                line.split_once(':')
+                    .map(|(_, value)| value.trim().to_owned())
+            })
+            .flatten()
+    });
+    let body: Value = serde_json::from_slice(&request[body_start..body_start + content_length])
+        .expect("mock RPC JSON request");
+    let method = body["method"].as_str().unwrap_or_default().to_owned();
+    let params = body["params"].clone();
+    calls
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(MockRpcCall {
+            method: method.clone(),
+            params,
+            route,
+        });
+
+    let result = if fail_requests {
+        json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "error": { "code": -32000, "message": "mock route failure" }
+        })
+    } else {
+        let result = match method.as_str() {
+            "eth_gasPrice" => json!("0x64"),
+            "eth_maxPriorityFeePerGas" => json!("0x2"),
+            "eth_feeHistory" => json!({
+                "oldestBlock": "0x1",
+                "baseFeePerGas": ["0x5", "0x5"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x1", "0x2", "0x3", "0x4"]]
+            }),
+            "eth_estimateGas" => match &estimate_result {
+                MockRpcEstimateResult::Success(estimate_gas) => {
+                    json!(format!("0x{estimate_gas:x}"))
+                }
+                MockRpcEstimateResult::Error {
+                    code,
+                    message,
+                    data,
+                } => json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": { "code": code, "message": message, "data": data }
+                }),
+            },
+            "eth_getTransactionCount" => json!("0x7"),
+            "eth_getBalance" => json!("0x3635c9adc5dea00000"),
+            _ => json!("0x1"),
+        };
+        if method == "eth_estimateGas"
+            && matches!(&estimate_result, MockRpcEstimateResult::Error { .. })
+        {
+            result
+        } else {
+            json!({ "jsonrpc": "2.0", "id": body["id"], "result": result })
+        }
+    };
+    let response = serde_json::to_vec(&result).expect("mock RPC response JSON");
+    let response_headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.len()
+    );
+    stream.write_all(response_headers.as_bytes()).await?;
+    stream.write_all(&response).await
+}
+
+fn effective_chain_for_rpc(rpc_url: String, gas_limit_buffer: u64) -> EffectiveChainConfig {
+    let defaults = chain_defaults_for_public_chain(1).expect("Ethereum defaults");
+    EffectiveChainConfig {
+        chain_id: 1,
+        enabled: true,
+        rpc_endpoints: vec![rpc_url],
+        sponsored_bundle_relays: Vec::new(),
+        archive_rpc_url: None,
+        quick_sync_enabled: false,
+        quick_sync_endpoint: defaults.quick_sync_endpoint.map(|url| url.to_string()),
+        indexed_artifact_source_mode: IndexedArtifactSourceModeSetting::Disabled,
+        indexed_artifact_source: None,
+        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
+        deployment_block: defaults.deployment_block,
+        v2_start_block: defaults.v2_start_block,
+        legacy_shield_block: defaults.legacy_shield_block,
+        archive_until_block: defaults.archive_until_block,
+        railgun_contract: defaults.contract.to_string(),
+        relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
+        relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
+        wrapped_native_token: None,
+        multicall_contract: defaults.multicall_contract.to_string(),
+        coinbase_payer: None,
+        finality_depth: defaults.finality_depth,
+        block_time: defaults.block_time,
+        block_range: None,
+        poll_interval_secs: None,
+        gas: EffectiveChainGasSettings {
+            gas_limit_buffer,
+            gas_price_buffer_numerator: 0,
+            gas_price_buffer_denominator: 1,
+        },
+    }
+}
+
+fn http_context_for_route(mode: WalletNetworkMode, route: &str) -> HttpContext {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-railoxide-test-route",
+        reqwest::header::HeaderValue::from_str(route).expect("route header"),
+    );
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("mock RPC client");
+    HttpContext::with_rpc_client_for_tests(client, mode)
+}
+
+fn rpc_calls_for<'a>(calls: &'a [MockRpcCall], method: &str) -> Vec<&'a MockRpcCall> {
+    calls.iter().filter(|call| call.method == method).collect()
+}
+
+fn contains_transaction_field(value: &Value) -> bool {
+    const TRANSACTION_FIELDS: [&str; 10] = [
+        "from",
+        "to",
+        "input",
+        "data",
+        "value",
+        "gas",
+        "gasPrice",
+        "maxFeePerGas",
+        "maxPriorityFeePerGas",
+        "nonce",
+    ];
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            TRANSACTION_FIELDS.contains(&key.as_str()) || contains_transaction_field(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_transaction_field),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
 
 #[test]
 fn public_action_attempt_errors_distinguish_signing_from_retryable_sending() {
@@ -748,6 +1036,459 @@ fn public_action_gas_cost_separates_execution_and_signed_units() {
                 + PUBLIC_NATIVE_SHIELD_GAS_UNITS
                 + (2 * GAS_LIMIT_BUFFER),
         )
+    );
+}
+
+#[test]
+fn walletconnect_decoded_intents_use_only_the_fixed_operation_table() {
+    let address = address!("0x3333333333333333333333333333333333333333");
+    let amount = U256::from(7_u64);
+    let cases = [
+        (
+            WalletConnectDecodedCallKind::NativeTransfer,
+            PUBLIC_NATIVE_SEND_GAS_UNITS,
+        ),
+        (
+            WalletConnectDecodedCallKind::Erc20Transfer {
+                recipient: address,
+                amount,
+            },
+            PUBLIC_ERC20_SEND_GAS_UNITS,
+        ),
+        (
+            WalletConnectDecodedCallKind::Erc20TransferFrom {
+                from: address,
+                to: address,
+                amount,
+            },
+            PUBLIC_ERC20_SEND_GAS_UNITS,
+        ),
+        (
+            WalletConnectDecodedCallKind::Erc20Approve {
+                spender: address,
+                amount,
+            },
+            PUBLIC_NATIVE_APPROVE_GAS_UNITS,
+        ),
+        (
+            WalletConnectDecodedCallKind::WrappedDeposit,
+            PUBLIC_NATIVE_WRAP_GAS_UNITS,
+        ),
+        (
+            WalletConnectDecodedCallKind::WrappedWithdraw { amount },
+            PUBLIC_NATIVE_UNWRAP_GAS_UNITS,
+        ),
+    ];
+    for (kind, expected) in cases {
+        assert_eq!(
+            public_native_action_gas_units_from_walletconnect_intent(&kind),
+            Some(expected)
+        );
+    }
+    assert_eq!(
+        public_native_action_gas_units_from_walletconnect_intent(
+            &WalletConnectDecodedCallKind::ContractCall { selector: None },
+        ),
+        None
+    );
+    assert_eq!(
+        public_native_action_gas_units_from_walletconnect_intent(
+            &WalletConnectDecodedCallKind::ContractCreation,
+        ),
+        None
+    );
+    assert_eq!(
+        public_walletconnect_operation_gas_limit(
+            &WalletConnectDecodedCallKind::NativeTransfer,
+            123,
+        ),
+        Some(PUBLIC_NATIVE_SEND_GAS_UNITS + 123)
+    );
+    assert_eq!(
+        public_walletconnect_operation_gas_limit(
+            &WalletConnectDecodedCallKind::ContractCreation,
+            123,
+        ),
+        None
+    );
+}
+
+#[test]
+fn walletconnect_fee_projection_keeps_raw_buffered_source_and_optional_usd() {
+    let quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 100,
+        current_base_fee_per_gas: Some(200),
+        suggested_max_fee_per_gas: 120,
+        suggested_max_priority_fee_per_gas: 3,
+    };
+    let resolved = PublicActionResolvedGasFee {
+        rpc_gas_price: 100,
+        max_fee_per_gas: 120,
+        max_priority_fee_per_gas: 3,
+    };
+    let projection = project_public_action_fee(
+        100,
+        110,
+        quote,
+        resolved,
+        PublicActionFeeSource::OperationTable,
+        Some(U256::from(2_000_000_u64)),
+    );
+    assert_eq!(projection.expected_fee_per_gas, 120);
+    assert_eq!(projection.expected_gas_cost, U256::from(12_000));
+    assert_eq!(projection.maximum_gas_cost, U256::from(13_200));
+    assert_eq!(projection.source, PublicActionFeeSource::OperationTable);
+    assert_eq!(projection.expected_native_usd_micro_value, Some(U256::ZERO));
+    assert_eq!(
+        crate::expected_eip1559_fee_per_gas(quote, 120, 3),
+        120,
+        "fee history caps the projected effective fee at the selected maximum"
+    );
+    assert_eq!(
+        crate::expected_eip1559_fee_per_gas(
+            PublicActionGasFeeQuote {
+                current_base_fee_per_gas: None,
+                ..quote
+            },
+            120,
+            3,
+        ),
+        120,
+        "gas-price fallback uses the selected maximum as the expected fee"
+    );
+    let estimate = PublicAdvancedTransactionEstimate {
+        payload_fingerprint: B256::ZERO,
+        raw_gas_limit: 100,
+        gas_limit: 110,
+        max_fee_per_gas: 120,
+        max_priority_fee_per_gas: 3,
+        expected_fee_per_gas: 120,
+        expected_gas_cost: U256::from(12_000_u64),
+        max_gas_cost: U256::from(13_200_u64),
+    };
+    let estimate_projection =
+        estimate.fee_projection(Some(U256::from(1_000_000_000_000_000_000_u128)));
+    assert_eq!(
+        estimate_projection.source,
+        PublicActionFeeSource::NetworkSimulation
+    );
+    assert_eq!(estimate_projection.raw_gas_limit, estimate.raw_gas_limit);
+    assert_eq!(estimate_projection.gas_limit, estimate.gas_limit);
+    assert_eq!(
+        estimate_projection.expected_fee_per_gas,
+        estimate.expected_fee_per_gas
+    );
+    assert_eq!(
+        estimate_projection.expected_gas_cost,
+        estimate.expected_gas_cost
+    );
+    assert_eq!(estimate_projection.maximum_gas_cost, estimate.max_gas_cost);
+    assert_eq!(
+        estimate_projection.expected_native_usd_micro_value,
+        Some(estimate.expected_gas_cost)
+    );
+    assert_eq!(
+        estimate_projection.maximum_native_usd_micro_value,
+        Some(estimate.max_gas_cost)
+    );
+    assert!(public_action_maximum_gas_cost_is_significant(
+        projection.expected_gas_cost,
+        projection.maximum_gas_cost,
+    ));
+
+    assert!(!public_action_maximum_gas_cost_is_significant(
+        U256::from(100_u64),
+        U256::from(100_u64),
+    ));
+    assert!(!public_action_maximum_gas_cost_is_significant(
+        U256::from(100_u64),
+        U256::from(109_u64),
+    ));
+    assert!(public_action_maximum_gas_cost_is_significant(
+        U256::ZERO,
+        U256::from(1_u64),
+    ));
+}
+
+#[test]
+fn walletconnect_reviewed_fingerprint_rejects_changed_payload() {
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let to = address!("0x2222222222222222222222222222222222222222");
+    let request = TransactionRequest::default()
+        .with_from(from)
+        .with_to(to)
+        .with_value(U256::from(1_u64));
+    let fingerprint = walletconnect_transaction_payload_fingerprint(1, from, &request);
+    assert!(
+        validate_walletconnect_reviewed_transaction(1, from, &request, fingerprint, 55).is_ok()
+    );
+    let changed = request.clone().with_value(U256::from(2_u64));
+    assert!(
+        validate_walletconnect_reviewed_transaction(1, from, &changed, fingerprint, 55).is_err()
+    );
+    assert!(
+        validate_walletconnect_reviewed_transaction(1, from, &request, fingerprint, 0).is_err()
+    );
+}
+
+#[test]
+fn walletconnect_custom_fee_resolves_without_an_automatic_quote() {
+    let custom = PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 17,
+        max_priority_fee_per_gas: 3,
+    };
+    let resolved = super::gas::resolve_public_action_gas_fee(
+        1,
+        PublicShieldTransactionProfile::Railoxide,
+        custom,
+        None,
+    )
+    .expect("custom WalletConnect fee does not need an automatic quote");
+    assert_eq!(resolved.max_fee_per_gas, 17);
+    assert_eq!(resolved.max_priority_fee_per_gas, 3);
+    assert!(
+        super::gas::resolve_public_action_gas_fee(
+            1,
+            PublicShieldTransactionProfile::Railoxide,
+            PublicActionGasFeeSelection::Auto,
+            None,
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_context() {
+    let server = MockRpcServer::spawn(false, 50_000).await;
+    let chain = effective_chain_for_rpc(server.url.clone(), 12_345);
+
+    for (mode, route) in [
+        (WalletNetworkMode::Tor, "tor"),
+        (WalletNetworkMode::Proxy, "proxy"),
+        (WalletNetworkMode::Direct, "direct"),
+    ] {
+        let http = http_context_for_route(mode, route);
+        quote_public_action_gas_fee(1, Some(&chain), &http)
+            .await
+            .expect("request-independent fee quote");
+    }
+
+    let quote_calls = server.calls();
+    assert!(!quote_calls.is_empty());
+    assert!(quote_calls.iter().all(|call| {
+        matches!(
+            call.method.as_str(),
+            "eth_gasPrice" | "eth_maxPriorityFeePerGas" | "eth_feeHistory"
+        ) && !contains_transaction_field(&call.params)
+    }));
+    for route in ["tor", "proxy", "direct"] {
+        assert!(
+            quote_calls
+                .iter()
+                .any(|call| call.route.as_deref() == Some(route))
+        );
+    }
+    assert!(rpc_calls_for(&quote_calls, "eth_estimateGas").is_empty());
+
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let to = address!("0x2222222222222222222222222222222222222222");
+    let custom_fee = PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 100,
+        max_priority_fee_per_gas: 2,
+    };
+    let http = http_context_for_route(WalletNetworkMode::Direct, "direct");
+    let pool = crate::query_rpc_pool_with_http_client(
+        vec![Url::parse(&server.url).expect("mock RPC URL")],
+        &http,
+    );
+    let recognized_request = TransactionRequest::default()
+        .with_to(to)
+        .with_value(U256::from(1_u64));
+    super::submission::public_action_preflight_from_rpc_pool_with_mode(
+        &pool,
+        WalletNetworkMode::Direct,
+        1,
+        from,
+        recognized_request,
+        custom_fee,
+        &chain.gas,
+        PublicShieldTransactionProfile::Railoxide,
+        super::types::PublicActionGasLimitStrategy::ChainBuffer,
+        None,
+        None,
+        Some(65_000 + chain.gas.gas_limit_buffer),
+        super::submission::PublicActionPreflightMode::Managed,
+        None,
+        false,
+    )
+    .await
+    .expect("recognized operation preflight");
+    assert!(rpc_calls_for(&server.calls(), "eth_estimateGas").is_empty());
+
+    let unknown_request = TransactionRequest::default()
+        .with_to(to)
+        .with_value(U256::from(1_u64))
+        .with_input(Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]));
+    let before_submission_estimate = rpc_calls_for(&server.calls(), "eth_estimateGas").len();
+    super::submission::public_action_preflight_from_rpc_pool_with_mode(
+        &pool,
+        WalletNetworkMode::Direct,
+        1,
+        from,
+        unknown_request,
+        PublicActionGasFeeSelection::Auto,
+        &chain.gas,
+        PublicShieldTransactionProfile::Railoxide,
+        super::types::PublicActionGasLimitStrategy::ChainBuffer,
+        None,
+        None,
+        None,
+        super::submission::PublicActionPreflightMode::Managed,
+        None,
+        false,
+    )
+    .await
+    .expect("managed post-approval resolution");
+    let after_submission_calls = server.calls();
+    assert_eq!(
+        rpc_calls_for(&after_submission_calls, "eth_estimateGas").len(),
+        before_submission_estimate + 1
+    );
+    assert!(
+        rpc_calls_for(&after_submission_calls, "eth_estimateGas")
+            .last()
+            .is_some_and(|call| contains_transaction_field(&call.params))
+    );
+
+    let simulation_server = MockRpcServer::spawn(false, 42_000).await;
+    let simulation_chain = effective_chain_for_rpc(simulation_server.url.clone(), 8_000);
+    let simulation_http = http_context_for_route(WalletNetworkMode::Direct, "direct");
+    let simulation_request = PublicAdvancedTransactionEstimateRequest {
+        chain_id: 1,
+        effective_chain: Some(simulation_chain),
+        from,
+        intent: PublicTransactionIntent::Raw {
+            to: Some(to),
+            value: U256::from(7_u64),
+            data: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+        },
+        gas_fee: custom_fee,
+        access_list: None,
+    };
+    let simulation_quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 100,
+        current_base_fee_per_gas: Some(80),
+        suggested_max_fee_per_gas: 100,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+    let simulation_resolved = PublicActionResolvedGasFee {
+        rpc_gas_price: 100,
+        max_fee_per_gas: 100,
+        max_priority_fee_per_gas: 2,
+    };
+    assert!(rpc_calls_for(&simulation_server.calls(), "eth_estimateGas").is_empty());
+    let simulation = simulate_public_advanced_transaction_with_fee(
+        simulation_request,
+        simulation_quote,
+        simulation_resolved,
+        &simulation_http,
+    )
+    .await
+    .expect("explicit simulation after action");
+    assert_eq!(simulation.raw_gas_limit, 42_000);
+    assert_eq!(
+        rpc_calls_for(&simulation_server.calls(), "eth_estimateGas").len(),
+        1
+    );
+
+    for (mode, route) in [
+        (WalletNetworkMode::Tor, "tor"),
+        (WalletNetworkMode::Proxy, "proxy"),
+    ] {
+        let failed_server = MockRpcServer::spawn(true, 50_000).await;
+        let failed_chain = effective_chain_for_rpc(failed_server.url.clone(), 0);
+        let failed_http = http_context_for_route(mode, route);
+        let _ = quote_public_action_gas_fee(1, Some(&failed_chain), &failed_http).await;
+        let failed_calls = failed_server.calls();
+        assert!(!failed_calls.is_empty());
+        assert!(
+            failed_calls
+                .iter()
+                .all(|call| call.route.as_deref() == Some(route))
+        );
+        assert!(
+            !failed_calls
+                .iter()
+                .any(|call| call.route.as_deref() == Some("direct"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn advanced_simulation_uses_each_provider_once_and_selects_revert_plurality() {
+    let revert_servers = [
+        MockRpcServer::spawn_revert("Order has expired").await,
+        MockRpcServer::spawn_revert("Order has expired").await,
+        MockRpcServer::spawn_revert("Order has expired").await,
+    ];
+    let unavailable_server = MockRpcServer::spawn(true, 50_000).await;
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let to = address!("0x2222222222222222222222222222222222222222");
+    let mut chain = effective_chain_for_rpc(revert_servers[0].url.clone(), 8_000);
+    chain.rpc_endpoints = revert_servers
+        .iter()
+        .map(|server| server.url.clone())
+        .chain(std::iter::once(unavailable_server.url.clone()))
+        .collect();
+    let request = PublicAdvancedTransactionEstimateRequest {
+        chain_id: 1,
+        effective_chain: Some(chain),
+        from,
+        intent: PublicTransactionIntent::Raw {
+            to: Some(to),
+            value: U256::from(7_u64),
+            data: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+        },
+        gas_fee: PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 2,
+        },
+        access_list: None,
+    };
+    let quote = PublicActionGasFeeQuote {
+        rpc_gas_price: 100,
+        current_base_fee_per_gas: Some(80),
+        suggested_max_fee_per_gas: 100,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+    let resolved = PublicActionResolvedGasFee {
+        rpc_gas_price: 100,
+        max_fee_per_gas: 100,
+        max_priority_fee_per_gas: 2,
+    };
+
+    let result = simulate_public_advanced_transaction_with_fee(
+        request,
+        quote,
+        resolved,
+        &HttpContext::direct_for_tests(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(PublicAdvancedTransactionSimulationError::Reverted(reason))
+            if reason == "Order has expired"
+    ));
+    for server in &revert_servers {
+        assert_eq!(
+            rpc_calls_for(&server.calls(), "eth_estimateGas").len(),
+            1,
+            "each configured provider should receive one estimate request"
+        );
+    }
+    assert_eq!(
+        rpc_calls_for(&unavailable_server.calls(), "eth_estimateGas").len(),
+        1
     );
 }
 
@@ -1475,40 +2216,31 @@ fn railway_profile_uses_legacy_envelope_only_on_bnb() {
 }
 
 #[test]
-fn walletconnect_transaction_fill_preserves_supplied_fee_and_nonce_fields() {
+fn walletconnect_transaction_sanitizer_discards_dapp_envelope_and_preserves_access_list() {
     let from = address!("0x1111111111111111111111111111111111111111");
     let recipient = address!("0x2222222222222222222222222222222222222222");
-    let legacy = TransactionRequest {
+    let access_list = AccessList::default();
+    let request = TransactionRequest {
         from: Some(from),
         to: Some(recipient.into()),
         gas_price: Some(9),
         gas: Some(21_000),
         nonce: Some(4),
+        max_fee_per_gas: Some(99),
+        max_priority_fee_per_gas: Some(3),
+        transaction_type: Some(1),
+        access_list: Some(access_list.clone()),
         ..Default::default()
     };
-
-    let legacy = public_action_fill_walletconnect_transaction_request(legacy, 1, from, 42, 3, 4)
-        .expect("fill legacy request");
-
-    assert_eq!(legacy.gas_price, Some(9));
-    assert_eq!(legacy.max_fee_per_gas, None);
-    assert_eq!(legacy.max_priority_fee_per_gas, None);
-    assert_eq!(legacy.gas, Some(21_000));
-    assert_eq!(legacy.nonce, Some(4));
-
-    let eip1559 = TransactionRequest {
-        from: Some(from),
-        to: Some(recipient.into()),
-        max_fee_per_gas: Some(42),
-        nonce: Some(5),
-        ..Default::default()
-    };
-    let eip1559 = public_action_fill_walletconnect_transaction_request(eip1559, 1, from, 99, 3, 5)
-        .expect("fill eip1559 request");
-
-    assert_eq!(eip1559.max_fee_per_gas, Some(42));
-    assert_eq!(eip1559.max_priority_fee_per_gas, Some(3));
-    assert_eq!(eip1559.nonce, Some(5));
+    let sanitized = sanitize_walletconnect_transaction_request(request, 1, from);
+    assert_eq!(sanitized.to, Some(recipient.into()));
+    assert_eq!(sanitized.gas, None);
+    assert_eq!(sanitized.gas_price, None);
+    assert_eq!(sanitized.max_fee_per_gas, None);
+    assert_eq!(sanitized.max_priority_fee_per_gas, None);
+    assert_eq!(sanitized.nonce, None);
+    assert_eq!(sanitized.transaction_type, None);
+    assert_eq!(sanitized.access_list, Some(access_list));
 }
 
 #[test]

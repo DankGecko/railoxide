@@ -34,7 +34,7 @@ pub(super) enum Eip1559GasFeeEditTarget {
     MaxTip,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Eip1559GasFeeTarget {
     Private {
         key: UnshieldAssetKey,
@@ -43,12 +43,17 @@ pub(super) enum Eip1559GasFeeTarget {
     Public {
         mode: PublicActionMode,
     },
+    WalletConnect {
+        request_key: Arc<str>,
+    },
 }
 
 pub(super) struct Eip1559GasFeeEditorState {
     pub(super) mode: Eip1559GasFeeMode,
     pub(super) max_fee_input: Entity<InputState>,
     pub(super) max_priority_fee_input: Entity<InputState>,
+    pub(super) pending_programmatic_max_fee_input: Option<Arc<str>>,
+    pub(super) pending_programmatic_max_priority_fee_input: Option<Arc<str>>,
     pub(super) quote: Option<SelfBroadcastGasFeeQuote>,
     pub(super) refreshing: bool,
     pub(super) refresh_id: u64,
@@ -145,6 +150,8 @@ impl Eip1559GasFeeEditorState {
             max_fee_input: cx.new(|cx| InputState::new(window, cx).placeholder("max fee gwei")),
             max_priority_fee_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder("max tip gwei")),
+            pending_programmatic_max_fee_input: None,
+            pending_programmatic_max_priority_fee_input: None,
             quote: None,
             refreshing: false,
             refresh_id: 0,
@@ -170,8 +177,23 @@ impl Eip1559GasFeeEditorState {
         }
     }
 
+    pub(super) fn reset_for_request<T>(&mut self, window: &mut Window, cx: &mut Context<'_, T>) {
+        self.mode = Eip1559GasFeeMode::Auto;
+        self.quote = None;
+        self.refreshing = false;
+        self.refresh_id = self.refresh_id.wrapping_add(1);
+        self.error = None;
+        self.quote_error = None;
+        self.pending_programmatic_max_fee_input = Some(Arc::from(""));
+        self.pending_programmatic_max_priority_fee_input = Some(Arc::from(""));
+        self.max_fee_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.max_priority_fee_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    }
+
     pub(super) fn seed_custom_from_auto_if_empty(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<'_, WalletRoot>,
     ) {
@@ -191,6 +213,9 @@ impl Eip1559GasFeeEditorState {
 
         let max_fee = format_gwei(quote.suggested_max_fee_per_gas);
         let max_priority_fee = format_gwei(quote.suggested_max_priority_fee_per_gas);
+        self.pending_programmatic_max_fee_input = Some(Arc::from(max_fee.as_str()));
+        self.pending_programmatic_max_priority_fee_input =
+            Some(Arc::from(max_priority_fee.as_str()));
         self.max_fee_input
             .update(cx, |input, cx| input.set_value(max_fee, window, cx));
         self.max_priority_fee_input.update(cx, |input, cx| {
@@ -199,7 +224,7 @@ impl Eip1559GasFeeEditorState {
     }
 
     pub(super) fn overwrite_custom_from_auto(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<'_, WalletRoot>,
     ) -> bool {
@@ -208,6 +233,9 @@ impl Eip1559GasFeeEditorState {
         };
         let max_fee = format_gwei(quote.suggested_max_fee_per_gas);
         let max_priority_fee = format_gwei(quote.suggested_max_priority_fee_per_gas);
+        self.pending_programmatic_max_fee_input = Some(Arc::from(max_fee.as_str()));
+        self.pending_programmatic_max_priority_fee_input =
+            Some(Arc::from(max_priority_fee.as_str()));
         self.max_fee_input
             .update(cx, |input, cx| input.set_value(max_fee, window, cx));
         self.max_priority_fee_input.update(cx, |input, cx| {
@@ -215,6 +243,30 @@ impl Eip1559GasFeeEditorState {
         });
         true
     }
+
+    pub(super) fn consume_programmatic_input_change(
+        &mut self,
+        target: Eip1559GasFeeEditTarget,
+        current: &str,
+    ) -> bool {
+        let pending = match target {
+            Eip1559GasFeeEditTarget::MaxFee => &mut self.pending_programmatic_max_fee_input,
+            Eip1559GasFeeEditTarget::MaxTip => {
+                &mut self.pending_programmatic_max_priority_fee_input
+            }
+        };
+        consume_pending_programmatic_input_change(pending, current)
+    }
+}
+
+pub(super) fn consume_pending_programmatic_input_change(
+    pending: &mut Option<Arc<str>>,
+    current: &str,
+) -> bool {
+    let Some(expected) = pending.take() else {
+        return false;
+    };
+    expected.as_ref() == current
 }
 
 impl WalletRoot {
@@ -232,6 +284,9 @@ impl WalletRoot {
             Eip1559GasFeeTarget::Public { mode: action_mode } => {
                 self.set_public_action_gas_fee_mode(action_mode, mode, window, cx);
             }
+            Eip1559GasFeeTarget::WalletConnect { request_key } => {
+                self.set_walletconnect_gas_fee_mode(&request_key, mode, window, cx);
+            }
         }
     }
 
@@ -246,6 +301,9 @@ impl WalletRoot {
             }
             Eip1559GasFeeTarget::Public { mode } => {
                 self.refresh_public_action_gas_fee_quote(mode, cx);
+            }
+            Eip1559GasFeeTarget::WalletConnect { request_key } => {
+                self.refresh_walletconnect_gas_fee_quote(request_key, cx);
             }
         }
     }
@@ -264,13 +322,21 @@ impl WalletRoot {
             Eip1559GasFeeTarget::Public { mode } => {
                 self.customize_public_action_gas_fee_from_auto(mode, edit_target, window, cx);
             }
+            Eip1559GasFeeTarget::WalletConnect { request_key } => {
+                self.customize_walletconnect_gas_fee_from_auto(
+                    &request_key,
+                    edit_target,
+                    window,
+                    cx,
+                );
+            }
         }
     }
 }
 
 pub(super) fn render_eip1559_gas_fee_editor(
     root: Entity<WalletRoot>,
-    target: Eip1559GasFeeTarget,
+    target: &Eip1559GasFeeTarget,
     state: &Eip1559GasFeeEditorState,
     disabled: bool,
 ) -> gpui::Div {
@@ -279,6 +345,7 @@ pub(super) fn render_eip1559_gas_fee_editor(
     let auto_selected = state.mode == Eip1559GasFeeMode::Auto;
     let custom_selected = state.mode == Eip1559GasFeeMode::Custom;
     let target_id = gas_fee_target_id(target);
+    let mode_target = target.clone();
 
     div()
         .flex()
@@ -292,24 +359,48 @@ pub(super) fn render_eip1559_gas_fee_editor(
             .outline()
             .compact()
             .disabled(disabled)
-            .child(app_segment_button(
-                SharedString::from(format!("wallet-eip1559-gas-auto-{target_id}")),
-                "Auto",
-                auto_selected,
-                Some(render_auto_refresh_button(
-                    refresh_root,
-                    SharedString::from(format!("wallet-eip1559-gas-refresh-{target_id}")),
-                    target,
-                    auto_selected && state.refreshing,
-                    auto_selected && !disabled && !state.refreshing,
-                )),
-            ))
-            .child(app_segment_button(
-                SharedString::from(format!("wallet-eip1559-gas-custom-{target_id}")),
-                "Custom",
-                custom_selected,
-                None,
-            ))
+            .child(
+                app_segment_button(
+                    SharedString::from(format!("wallet-eip1559-gas-auto-{target_id}")),
+                    "Auto",
+                    auto_selected,
+                    Some(render_auto_refresh_button(
+                        refresh_root,
+                        SharedString::from(format!("wallet-eip1559-gas-refresh-{target_id}")),
+                        target.clone(),
+                        auto_selected && state.refreshing,
+                        auto_selected && !disabled && !state.refreshing,
+                    )),
+                )
+                .bg(if auto_selected {
+                    rgb(theme::SURFACE_HOVER)
+                } else {
+                    gpui::transparent_black().into()
+                })
+                .text_color(rgb(if auto_selected {
+                    theme::PRIMARY
+                } else {
+                    theme::TEXT_MUTED
+                })),
+            )
+            .child(
+                app_segment_button(
+                    SharedString::from(format!("wallet-eip1559-gas-custom-{target_id}")),
+                    "Custom",
+                    custom_selected,
+                    None,
+                )
+                .bg(if custom_selected {
+                    rgb(theme::SURFACE_HOVER)
+                } else {
+                    gpui::transparent_black().into()
+                })
+                .text_color(rgb(if custom_selected {
+                    theme::PRIMARY
+                } else {
+                    theme::TEXT_MUTED
+                })),
+            )
             .on_click(move |selected, window, cx| {
                 let Some(index) = selected.first() else {
                     return;
@@ -320,7 +411,7 @@ pub(super) fn render_eip1559_gas_fee_editor(
                     Eip1559GasFeeMode::Custom
                 };
                 mode_root.update(cx, |root, cx| {
-                    root.set_eip1559_gas_fee_mode(target, mode, window, cx);
+                    root.set_eip1559_gas_fee_mode(mode_target.clone(), mode, window, cx);
                 });
             }),
         ))
@@ -352,7 +443,7 @@ fn render_auto_refresh_button(
         enabled,
         move |_window, cx| {
             root.update(cx, |root, cx| {
-                root.refresh_eip1559_gas_fee_quote(target, cx);
+                root.refresh_eip1559_gas_fee_quote(target.clone(), cx);
             });
         },
     )
@@ -362,7 +453,7 @@ fn render_auto_refresh_button(
 
 fn render_gas_fee_inputs(
     root: Entity<WalletRoot>,
-    target: Eip1559GasFeeTarget,
+    target: &Eip1559GasFeeTarget,
     state: &Eip1559GasFeeEditorState,
     disabled: bool,
 ) -> gpui::Div {
@@ -379,6 +470,7 @@ fn render_gas_fee_inputs(
     let target_id = gas_fee_target_id(target);
     div()
         .flex()
+        .flex_wrap()
         .items_end()
         .gap_3()
         .child(render_gas_fee_input_slot(
@@ -389,7 +481,7 @@ fn render_gas_fee_inputs(
                     Some(render_auto_gas_fee_edit_button(
                         root.clone(),
                         SharedString::from(format!("wallet-eip1559-gas-edit-max-fee-{target_id}")),
-                        target,
+                        target.clone(),
                         Eip1559GasFeeEditTarget::MaxFee,
                         edit_enabled,
                     )),
@@ -397,6 +489,7 @@ fn render_gas_fee_inputs(
                 .into_any_element()
             } else {
                 private_action_input(&state.max_fee_input)
+                    .text_color(rgb(theme::TEXT))
                     .disabled(disabled)
                     .into_any_element()
             },
@@ -409,7 +502,7 @@ fn render_gas_fee_inputs(
                     Some(render_auto_gas_fee_edit_button(
                         root,
                         SharedString::from(format!("wallet-eip1559-gas-edit-max-tip-{target_id}")),
-                        target,
+                        target.clone(),
                         Eip1559GasFeeEditTarget::MaxTip,
                         edit_enabled,
                     )),
@@ -417,6 +510,7 @@ fn render_gas_fee_inputs(
                 .into_any_element()
             } else {
                 private_action_input(&state.max_priority_fee_input)
+                    .text_color(rgb(theme::TEXT))
                     .disabled(disabled)
                     .into_any_element()
             },
@@ -424,7 +518,7 @@ fn render_gas_fee_inputs(
 }
 
 fn render_gas_fee_input_slot(label: &'static str, input: gpui::AnyElement) -> gpui::Div {
-    labeled_field(label, input).flex_1().min_w(px(0.0))
+    labeled_field(label, input).flex_1().min_w(px(150.0))
 }
 
 fn render_auto_gas_fee_value(
@@ -466,24 +560,32 @@ fn render_auto_gas_fee_edit_button(
         .on_click(move |_event, window, cx| {
             cx.stop_propagation();
             root.update(cx, |root, cx| {
-                root.customize_eip1559_gas_fee_from_auto(gas_target, edit_target, window, cx);
+                root.customize_eip1559_gas_fee_from_auto(
+                    gas_target.clone(),
+                    edit_target,
+                    window,
+                    cx,
+                );
             });
         })
         .into_any_element()
 }
 
-fn gas_fee_target_id(target: Eip1559GasFeeTarget) -> String {
+fn gas_fee_target_id(target: &Eip1559GasFeeTarget) -> String {
     match target {
         Eip1559GasFeeTarget::Private { key, kind } => {
             format!(
                 "private-{}-{}-{}",
                 key.chain_id,
                 key.token,
-                gas_fee_kind_id(kind)
+                gas_fee_kind_id(*kind)
             )
         }
         Eip1559GasFeeTarget::Public { mode } => {
-            format!("public-{}", public_action_mode_id(mode))
+            format!("public-{}", public_action_mode_id(*mode))
+        }
+        Eip1559GasFeeTarget::WalletConnect { request_key } => {
+            format!("walletconnect-{request_key}")
         }
     }
 }

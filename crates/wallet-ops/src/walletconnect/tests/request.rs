@@ -406,6 +406,55 @@ fn decodes_complete_transaction_review_states_and_strict_call_shapes() {
         .kind,
         WalletConnectDecodedCallKind::ContractCall { selector: None }
     );
+
+    assert_eq!(
+        WalletConnectDecodedCallKind::Erc20Approve {
+            spender,
+            amount: U256::ZERO,
+        }
+        .selector(),
+        Some([0x09, 0x5e, 0xa7, 0xb3])
+    );
+    assert_eq!(
+        WalletConnectDecodedCallKind::Erc20Transfer {
+            recipient,
+            amount: U256::ZERO,
+        }
+        .selector(),
+        Some([0xa9, 0x05, 0x9c, 0xbb])
+    );
+    assert_eq!(
+        WalletConnectDecodedCallKind::Erc20TransferFrom {
+            from: recipient,
+            to: spender,
+            amount: U256::ZERO,
+        }
+        .selector(),
+        Some([0x23, 0xb8, 0x72, 0xdd])
+    );
+    assert_eq!(
+        WalletConnectDecodedCallKind::WrappedDeposit.selector(),
+        Some([0xd0, 0xe3, 0x0d, 0xb0])
+    );
+    assert_eq!(
+        WalletConnectDecodedCallKind::WrappedWithdraw { amount: U256::ZERO }.selector(),
+        Some([0x2e, 0x1a, 0x7d, 0x4d])
+    );
+    assert_eq!(
+        WalletConnectDecodedCallKind::ContractCall {
+            selector: Some([0xde, 0xad, 0xbe, 0xef]),
+        }
+        .selector(),
+        Some([0xde, 0xad, 0xbe, 0xef])
+    );
+    assert_eq!(
+        WalletConnectDecodedCallKind::NativeTransfer.selector(),
+        None
+    );
+    assert_eq!(
+        WalletConnectDecodedCallKind::ContractCreation.selector(),
+        None
+    );
 }
 
 #[test]

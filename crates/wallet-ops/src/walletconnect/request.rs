@@ -5,6 +5,8 @@ use alloy::dyn_abi::TypedData;
 use alloy::hex;
 use alloy::primitives::{Address, U256};
 use alloy::rpc::types::transaction::AccessList;
+use alloy::sol;
+use alloy::sol_types::SolCall;
 use serde_json::{Value, json};
 
 use crate::vault::{
@@ -183,6 +185,34 @@ pub enum WalletConnectDecodedCallKind {
         selector: Option<[u8; 4]>,
     },
     ContractCreation,
+}
+
+sol! {
+    interface Erc20 {
+        function approve(address spender, uint256 amount) external returns (bool);
+        function transfer(address recipient, uint256 amount) external returns (bool);
+        function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    }
+
+    interface WrappedNative {
+        function deposit() external payable;
+        function withdraw(uint256 amount) external;
+    }
+}
+
+impl WalletConnectDecodedCallKind {
+    #[must_use]
+    pub const fn selector(&self) -> Option<[u8; 4]> {
+        match self {
+            Self::Erc20Approve { .. } => Some(Erc20::approveCall::SELECTOR),
+            Self::Erc20Transfer { .. } => Some(Erc20::transferCall::SELECTOR),
+            Self::Erc20TransferFrom { .. } => Some(Erc20::transferFromCall::SELECTOR),
+            Self::WrappedDeposit => Some(WrappedNative::depositCall::SELECTOR),
+            Self::WrappedWithdraw { .. } => Some(WrappedNative::withdrawCall::SELECTOR),
+            Self::ContractCall { selector } => *selector,
+            Self::NativeTransfer | Self::ContractCreation => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -828,7 +858,7 @@ fn decode_call_kind(data: &[u8], selector: Option<[u8; 4]>) -> WalletConnectDeco
     };
     let payload = &data[4..];
     match selector {
-        [0x09, 0x5e, 0xa7, 0xb3] if payload.len() == 64 => {
+        Erc20::approveCall::SELECTOR if payload.len() == 64 => {
             match (decode_abi_address(payload, 0), decode_abi_u256(payload, 1)) {
                 (Some(spender), Some(amount)) => {
                     WalletConnectDecodedCallKind::Erc20Approve { spender, amount }
@@ -838,7 +868,7 @@ fn decode_call_kind(data: &[u8], selector: Option<[u8; 4]>) -> WalletConnectDeco
                 },
             }
         }
-        [0xa9, 0x05, 0x9c, 0xbb] if payload.len() == 64 => {
+        Erc20::transferCall::SELECTOR if payload.len() == 64 => {
             match (decode_abi_address(payload, 0), decode_abi_u256(payload, 1)) {
                 (Some(recipient), Some(amount)) => {
                     WalletConnectDecodedCallKind::Erc20Transfer { recipient, amount }
@@ -848,7 +878,7 @@ fn decode_call_kind(data: &[u8], selector: Option<[u8; 4]>) -> WalletConnectDeco
                 },
             }
         }
-        [0x23, 0xb8, 0x72, 0xdd] if payload.len() == 96 => match (
+        Erc20::transferFromCall::SELECTOR if payload.len() == 96 => match (
             decode_abi_address(payload, 0),
             decode_abi_address(payload, 1),
             decode_abi_u256(payload, 2),
@@ -860,8 +890,10 @@ fn decode_call_kind(data: &[u8], selector: Option<[u8; 4]>) -> WalletConnectDeco
                 selector: Some(selector),
             },
         },
-        [0xd0, 0xe3, 0x0d, 0xb0] if data.len() == 4 => WalletConnectDecodedCallKind::WrappedDeposit,
-        [0x2e, 0x1a, 0x7d, 0x4d] if payload.len() == 32 => {
+        WrappedNative::depositCall::SELECTOR if data.len() == 4 => {
+            WalletConnectDecodedCallKind::WrappedDeposit
+        }
+        WrappedNative::withdrawCall::SELECTOR if payload.len() == 32 => {
             WalletConnectDecodedCallKind::WrappedWithdraw {
                 amount: U256::from_be_slice(payload),
             }

@@ -153,8 +153,12 @@ async fn expired_approval_task_publishes_expired_response() {
 
     let task_store = Arc::clone(&store);
     let task_view_session = Arc::clone(&view_session);
+    let reviewed_fee = super::super::fee::WalletConnectReviewedFeeProjection::unresolved(
+        request.key.as_str(),
+        request.review_token,
+    );
     let approval = tokio::spawn(async move {
-        approve_walletconnect_request_task(
+        Box::pin(approve_walletconnect_request_task(
             request,
             task_store,
             task_view_session,
@@ -166,8 +170,9 @@ async fn expired_approval_task_publishes_expired_response() {
             context,
             http,
             false,
+            reviewed_fee,
             None,
-        )
+        ))
         .await
     });
 

@@ -275,7 +275,10 @@ pub(in crate::root) fn render_public_advanced_transaction_estimate(
             ),
         ))
         .when(
-            maximum_gas_cost_is_significant(estimate.expected_gas_cost, estimate.max_gas_cost),
+            public_action_maximum_gas_cost_is_significant(
+                estimate.expected_gas_cost,
+                estimate.max_gas_cost,
+            ),
             |this| {
                 this.child(public_action_muted_fee_row(
                     "Maximum gas cost",

@@ -211,7 +211,7 @@ impl WalletRoot {
                     ))
                     .child(render_eip1559_gas_fee_editor(
                         gas_fee_root,
-                        Eip1559GasFeeTarget::Public {
+                        &Eip1559GasFeeTarget::Public {
                             mode: PublicActionMode::Shield,
                         },
                         &self.public_form.shield_gas_fee,
@@ -360,7 +360,7 @@ impl WalletRoot {
                         )
                         .child(render_eip1559_gas_fee_editor(
                             gas_fee_root,
-                            Eip1559GasFeeTarget::Public {
+                            &Eip1559GasFeeTarget::Public {
                                 mode: PublicActionMode::Send,
                             },
                             &self.public_form.send_gas_fee,
@@ -461,7 +461,7 @@ impl WalletRoot {
                         ))
                         .child(render_eip1559_gas_fee_editor(
                             gas_fee_root,
-                            Eip1559GasFeeTarget::Public {
+                            &Eip1559GasFeeTarget::Public {
                                 mode: PublicActionMode::Send,
                             },
                             &self.public_form.send_gas_fee,
@@ -645,6 +645,7 @@ impl WalletRoot {
                     from,
                     intent,
                     gas_fee,
+                    access_list: None,
                 },
                 &http,
             )
@@ -1736,7 +1737,7 @@ impl WalletRoot {
         let expected_gas_cost = gas_cost.map(|cost| format_gas_cost(cost.expected_cost));
         let maximum_gas_cost = gas_cost.map(|cost| format_gas_cost(cost.maximum_cost));
         let show_maximum_gas_cost = gas_cost.is_some_and(|cost| {
-            maximum_gas_cost_is_significant(cost.expected_cost, cost.maximum_cost)
+            public_action_maximum_gas_cost_is_significant(cost.expected_cost, cost.maximum_cost)
         });
         let protocol_fee = if mode == PublicActionMode::Shield {
             amount.map(|amount| {
@@ -1983,7 +1984,7 @@ impl WalletRoot {
                         maximum_usd_micro_value,
                         false,
                     )),
-                    show_maximum_gas_cost: maximum_gas_cost_is_significant(
+                    show_maximum_gas_cost: public_action_maximum_gas_cost_is_significant(
                         estimate.expected_gas_cost,
                         estimate.max_gas_cost,
                     ),

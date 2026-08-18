@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::TransactionBuilder as _;
-use alloy::primitives::{Address, FixedBytes, U256, keccak256};
+use alloy::primitives::{Address, FixedBytes, TxKind, U256, keccak256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
@@ -44,19 +44,11 @@ pub(super) struct PublicActionPreflight {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PublicActionPreflightMode {
     Managed,
-    PreserveRequestFields,
 }
 
 impl PublicActionPreflightMode {
-    const fn needs_fee_quote(self, tx_req: &TransactionRequest) -> bool {
-        match self {
-            Self::Managed => true,
-            Self::PreserveRequestFields => {
-                tx_req.gas_price.is_none()
-                    && (tx_req.max_fee_per_gas.is_none()
-                        || tx_req.max_priority_fee_per_gas.is_none())
-            }
-        }
+    const fn needs_fee_quote(self, gas_fee: PublicActionGasFeeSelection) -> bool {
+        matches!(self, Self::Managed) && matches!(gas_fee, PublicActionGasFeeSelection::Auto)
     }
 }
 
@@ -623,7 +615,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     railway_auto: bool,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
-    let quote = if mode.needs_fee_quote(&base_tx_req)
+    let quote = if mode.needs_fee_quote(gas_fee)
         && (profile != PublicShieldTransactionProfile::Railway || railway_auto)
     {
         Some(
@@ -657,7 +649,6 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
             authorized_gas_limit,
             nonce,
             gas_limit,
-            mode,
             authorized_fee_ceiling,
             railway_auto,
         )
@@ -697,22 +688,11 @@ async fn public_action_preflight(
     authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
     gas_limit: Option<u64>,
-    mode: PublicActionPreflightMode,
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     railway_auto: bool,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
     let provider = &provider_handle.provider;
-    let resolved = match quote {
-        Some(quote) => resolve_public_action_gas_fee(chain_id, profile, gas_fee, Some(quote))?,
-        None => match mode {
-            PublicActionPreflightMode::Managed => {
-                resolve_public_action_gas_fee(chain_id, profile, gas_fee, None)?
-            }
-            PublicActionPreflightMode::PreserveRequestFields => {
-                walletconnect_resolved_gas_fee_from_request(&base_tx_req)?
-            }
-        },
-    };
+    let resolved = resolve_public_action_gas_fee(chain_id, profile, gas_fee, quote)?;
     if railway_auto {
         let within_ceiling = railway_auto_fee_within_authorized_ceiling(
             chain_id,
@@ -730,15 +710,7 @@ async fn public_action_preflight(
             });
         }
     }
-    let requested_nonce = match mode {
-        PublicActionPreflightMode::Managed => nonce,
-        PublicActionPreflightMode::PreserveRequestFields => base_tx_req.nonce.or(nonce),
-    };
-    let requested_gas_limit = match mode {
-        PublicActionPreflightMode::Managed => gas_limit,
-        PublicActionPreflightMode::PreserveRequestFields => base_tx_req.gas.or(gas_limit),
-    };
-    let nonce = if let Some(nonce) = requested_nonce {
+    let nonce = if let Some(nonce) = nonce {
         nonce
     } else {
         provider
@@ -746,37 +718,23 @@ async fn public_action_preflight(
             .await
             .wrap_err("fetch public action nonce")?
     };
-    let tx_req = match mode {
-        PublicActionPreflightMode::Managed => {
-            if profile.uses_legacy_envelope(chain_id) {
-                public_action_legacy_transaction_request(
-                    base_tx_req,
-                    chain_id,
-                    from,
-                    resolved.max_fee_per_gas,
-                    nonce,
-                )
-            } else {
-                public_action_eip1559_transaction_request(
-                    base_tx_req,
-                    chain_id,
-                    from,
-                    resolved.max_fee_per_gas,
-                    resolved.max_priority_fee_per_gas,
-                    nonce,
-                )
-            }
-        }
-        PublicActionPreflightMode::PreserveRequestFields => {
-            public_action_fill_walletconnect_transaction_request(
-                base_tx_req,
-                chain_id,
-                from,
-                resolved.max_fee_per_gas,
-                resolved.max_priority_fee_per_gas,
-                nonce,
-            )?
-        }
+    let tx_req = if profile.uses_legacy_envelope(chain_id) {
+        public_action_legacy_transaction_request(
+            base_tx_req,
+            chain_id,
+            from,
+            resolved.max_fee_per_gas,
+            nonce,
+        )
+    } else {
+        public_action_eip1559_transaction_request(
+            base_tx_req,
+            chain_id,
+            from,
+            resolved.max_fee_per_gas,
+            resolved.max_priority_fee_per_gas,
+            nonce,
+        )
     };
     let max_fee_per_gas = tx_req
         .max_fee_per_gas
@@ -796,7 +754,7 @@ async fn public_action_preflight(
             .wrap_err("re-estimate authorized advanced public transaction gas")?;
         ensure_advanced_gas_estimate_authorized(estimated_gas, authorized_gas_limit)?;
         authorized_gas_limit
-    } else if let Some(gas_limit) = requested_gas_limit {
+    } else if let Some(gas_limit) = gas_limit {
         gas_limit
     } else {
         match gas_limit_strategy {
@@ -872,72 +830,70 @@ pub(super) fn public_action_legacy_transaction_request(
         .with_nonce(nonce)
 }
 
-pub(super) fn public_action_fill_walletconnect_transaction_request(
-    mut tx_req: TransactionRequest,
+pub fn sanitize_walletconnect_transaction_request(
+    tx_req: TransactionRequest,
     chain_id: u64,
     from: Address,
-    max_fee_per_gas: u128,
-    max_priority_fee_per_gas: u128,
-    nonce: u64,
-) -> Result<TransactionRequest> {
-    tx_req = tx_req
-        .with_chain_id(chain_id)
-        .with_from(from)
-        .with_nonce(nonce);
-    if tx_req.gas_price.is_some() {
-        return Ok(tx_req);
+) -> TransactionRequest {
+    TransactionRequest {
+        chain_id: Some(chain_id),
+        from: Some(from),
+        to: tx_req.to,
+        value: tx_req.value,
+        input: tx_req.input,
+        access_list: tx_req.access_list,
+        ..Default::default()
     }
-    if tx_req.max_fee_per_gas.is_none() {
-        tx_req = tx_req.with_max_fee_per_gas(max_fee_per_gas);
-    }
-    if tx_req.max_priority_fee_per_gas.is_none() {
-        tx_req = tx_req.with_max_priority_fee_per_gas(max_priority_fee_per_gas);
-    }
-    if let (Some(max_fee), Some(priority_fee)) =
-        (tx_req.max_fee_per_gas, tx_req.max_priority_fee_per_gas)
-        && priority_fee > max_fee
-    {
-        return Err(eyre!(
-            "WalletConnect max priority fee per gas cannot exceed max fee per gas"
-        ));
-    }
-    Ok(tx_req)
 }
 
-fn walletconnect_resolved_gas_fee_from_request(
+#[must_use]
+pub fn walletconnect_transaction_payload_fingerprint(
+    chain_id: u64,
+    from: Address,
     tx_req: &TransactionRequest,
-) -> Result<SelfBroadcastResolvedGasFee> {
-    if let Some(gas_price) = tx_req.gas_price {
-        if gas_price == 0 {
-            return Err(eyre!("WalletConnect gasPrice must be greater than zero"));
+) -> FixedBytes<32> {
+    let mut encoded = b"railoxide:walletconnect-transaction:v1".to_vec();
+    encoded.extend_from_slice(&chain_id.to_be_bytes());
+    encoded.extend_from_slice(from.as_slice());
+    match tx_req.to {
+        Some(TxKind::Call(to)) => {
+            encoded.push(1);
+            encoded.extend_from_slice(to.as_slice());
         }
-        return Ok(SelfBroadcastResolvedGasFee {
-            rpc_gas_price: gas_price,
-            max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: tx_req.max_priority_fee_per_gas.unwrap_or(0),
-        });
+        Some(TxKind::Create) | None => encoded.push(0),
     }
-    let max_fee_per_gas = tx_req
-        .max_fee_per_gas
-        .ok_or_else(|| eyre!("WalletConnect maxFeePerGas is required"))?;
-    let max_priority_fee_per_gas = tx_req
-        .max_priority_fee_per_gas
-        .ok_or_else(|| eyre!("WalletConnect maxPriorityFeePerGas is required"))?;
-    if max_fee_per_gas == 0 {
+    encoded.extend_from_slice(&tx_req.value.unwrap_or_default().to_be_bytes::<32>());
+    let input = tx_req.input.input().map_or(&[][..], |input| input.as_ref());
+    encoded.extend_from_slice(&(input.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(input);
+    if let Some(access_list) = tx_req.access_list.as_ref() {
+        encoded.push(1);
+        encoded.extend_from_slice(&serde_json::to_vec(access_list).unwrap_or_default());
+    } else {
+        encoded.push(0);
+    }
+    keccak256(encoded)
+}
+
+pub fn validate_walletconnect_reviewed_transaction(
+    chain_id: u64,
+    from: Address,
+    tx_req: &TransactionRequest,
+    payload_fingerprint: FixedBytes<32>,
+    gas_limit: u64,
+) -> Result<()> {
+    if gas_limit == 0 {
         return Err(eyre!(
-            "WalletConnect maxFeePerGas must be greater than zero"
+            "reviewed WalletConnect gas limit must be greater than zero"
         ));
     }
-    if max_priority_fee_per_gas > max_fee_per_gas {
+    if walletconnect_transaction_payload_fingerprint(chain_id, from, tx_req) != payload_fingerprint
+    {
         return Err(eyre!(
-            "WalletConnect max priority fee per gas cannot exceed max fee per gas"
+            "WalletConnect transaction changed after simulation review"
         ));
     }
-    Ok(SelfBroadcastResolvedGasFee {
-        rpc_gas_price: max_fee_per_gas,
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-    })
+    Ok(())
 }
 
 pub(super) fn public_action_native_exposure(

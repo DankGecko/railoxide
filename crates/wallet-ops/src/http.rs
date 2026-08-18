@@ -831,6 +831,25 @@ impl HttpContext {
             fail_closed: false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_rpc_client_for_tests(
+        rpc_client: reqwest::Client,
+        mode: WalletNetworkMode,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            rpc_client,
+            proxy_url: None,
+            user_proxy_url: None,
+            mode,
+            arti_client: None,
+            arti_state_dir: None,
+            arti_cache_dir: None,
+            socks_bridge: None,
+            fail_closed: mode != WalletNetworkMode::Direct,
+        }
+    }
 }
 
 fn format_tor_runtime_health_detail(cause: &'static str, report: TorRuntimeHealthReport) -> String {

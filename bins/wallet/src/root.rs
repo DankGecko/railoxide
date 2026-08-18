@@ -60,6 +60,7 @@ mod public_action;
 mod public_balances;
 mod public_broadcaster;
 mod public_broadcaster_cost;
+mod retry;
 mod settings;
 mod shell;
 mod sidebar;
@@ -153,11 +154,10 @@ use broadcaster_picker::{
     BroadcasterPickerFeeStatus, BroadcasterPickerGroupKey, BroadcasterPickerRow,
     BroadcasterPickerTier, BroadcasterPickerViewMode,
     broadcaster_candidate_estimated_fee_amount_for_estimate,
-    broadcaster_choice_supported_by_candidates, broadcaster_picker_fee_estimate_retry_delay,
-    broadcaster_picker_fee_status, broadcaster_picker_fee_status_detail,
-    broadcaster_picker_fee_text_colors, broadcaster_picker_scroll_hint_visible,
-    group_minimum_estimated_fee_labels, project_broadcaster_picker_entries,
-    should_preserve_estimate_after_broadcaster_policy_change,
+    broadcaster_choice_supported_by_candidates, broadcaster_picker_fee_status,
+    broadcaster_picker_fee_status_detail, broadcaster_picker_fee_text_colors,
+    broadcaster_picker_scroll_hint_visible, group_minimum_estimated_fee_labels,
+    project_broadcaster_picker_entries, should_preserve_estimate_after_broadcaster_policy_change,
 };
 #[cfg(test)]
 use chain_load::{

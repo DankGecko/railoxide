@@ -43,6 +43,7 @@ use crate::assets::WalletIconSource;
 use super::private_action::UnshieldAssetKey;
 use super::public_action::{PublicSendDraft, PublicShieldDraft};
 use super::vault::hardware_device_label;
+use super::walletconnect::WalletConnectReviewedFeeProjection;
 use super::{
     WalletRoot, dialog_content_max_height, dialog_max_height, new_masked_input,
     scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
@@ -165,6 +166,7 @@ pub(super) enum SpendAuthorizationIntent {
     WalletConnectRequest {
         request_key: String,
         review_token: u64,
+        reviewed_fee: WalletConnectReviewedFeeProjection,
     },
 }
 
@@ -1522,6 +1524,7 @@ impl WalletRoot {
             SpendAuthorizationIntent::WalletConnectRequest {
                 request_key,
                 review_token,
+                reviewed_fee,
             } => {
                 let Ok((password, session)) = authorization.public_signing_parts() else {
                     self.set_vault_error(
@@ -1533,6 +1536,7 @@ impl WalletRoot {
                 self.submit_walletconnect_request_authorized(
                     &request_key,
                     review_token,
+                    reviewed_fee,
                     password,
                     session,
                     window,

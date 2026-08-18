@@ -566,7 +566,7 @@ pub(in crate::root) fn render_self_broadcast_settings(
         })
         .child(render_eip1559_gas_fee_editor(
             gas_fee_root,
-            Eip1559GasFeeTarget::Private { key, kind },
+            &Eip1559GasFeeTarget::Private { key, kind },
             gas_fee,
             generating,
         ))

@@ -35,6 +35,7 @@ use wallet_ops::{
     sort_specific_public_broadcasters,
 };
 
+use super::retry::retry_backoff_delay;
 use super::{
     ChainUtxoState, DeliveryFormKind, DeliveryMode, PRIVATE_ASSET_LIST_WIDTH, UnshieldAssetKey,
     WalletRoot, dialogs::render_broadcaster_picker_dialog_content, effective_fee_handling_mode,
@@ -165,7 +166,7 @@ impl BroadcasterPickerFeeEstimateRetryState {
     }
 
     pub(super) const fn mark_scheduled(&mut self, generation: u64) -> Duration {
-        let delay = broadcaster_picker_fee_estimate_retry_delay(self.attempt);
+        let delay = retry_backoff_delay(self.attempt);
         self.attempt = self.attempt.saturating_add(1);
         self.generation = generation;
         self.scheduled = true;
@@ -195,15 +196,6 @@ impl BroadcasterPickerFeeEstimateRetryState {
     pub(super) const fn is_scheduled(self) -> bool {
         self.scheduled
     }
-}
-
-pub(super) const fn broadcaster_picker_fee_estimate_retry_delay(attempt: u8) -> Duration {
-    Duration::from_secs(match attempt {
-        0 => 1,
-        1 => 2,
-        2 => 4,
-        _ => 5,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

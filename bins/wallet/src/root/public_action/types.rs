@@ -212,18 +212,6 @@ impl PublicActionFeeDisplay {
     }
 }
 
-pub(in crate::root) fn maximum_gas_cost_is_significant(
-    expected_gas_cost: U256,
-    maximum_gas_cost: U256,
-) -> bool {
-    if maximum_gas_cost <= expected_gas_cost {
-        return false;
-    }
-    (maximum_gas_cost - expected_gas_cost)
-        .checked_mul(U256::from(10_u8))
-        .is_none_or(|scaled_difference| scaled_difference >= expected_gas_cost)
-}
-
 pub(in crate::root) fn public_send_authorization_summary(
     draft: &PublicSendDraft,
 ) -> SpendAuthorizationSummary {

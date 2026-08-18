@@ -207,7 +207,7 @@ impl WalletRoot {
                     gas_limit: None,
                     expected_gas_cost: Some(format_gas_cost(gas_cost.expected_cost)),
                     maximum_gas_cost: Some(format_gas_cost(gas_cost.maximum_cost)),
-                    show_maximum_gas_cost: maximum_gas_cost_is_significant(
+                    show_maximum_gas_cost: public_action_maximum_gas_cost_is_significant(
                         gas_cost.expected_cost,
                         gas_cost.maximum_cost,
                     ),

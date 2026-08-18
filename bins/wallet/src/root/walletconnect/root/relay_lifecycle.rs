@@ -638,6 +638,29 @@ impl WalletRoot {
                     self.walletconnect.error = None;
                 }
                 for request in result.pending_requests {
+                    if self
+                        .walletconnect
+                        .pending_requests
+                        .get(&request.key)
+                        .is_some_and(|existing| {
+                            existing.review_token != request.review_token
+                                || existing.item.raw_details != request.item.raw_details
+                        })
+                    {
+                        let request_key = request.key.clone();
+                        self.walletconnect
+                            .pending_requests
+                            .insert(request_key.clone(), request);
+                        self.walletconnect
+                            .request_disclosure_states
+                            .remove(&request_key);
+                        if self.walletconnect.request_dialog_key.as_deref()
+                            == Some(request_key.as_str())
+                        {
+                            self.discard_walletconnect_fee_for_request_replacement();
+                        }
+                        continue;
+                    }
                     if !walletconnect_request_should_queue(
                         &self.walletconnect.pending_requests,
                         &self.walletconnect.handled_request_keys,

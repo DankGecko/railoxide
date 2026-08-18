@@ -52,8 +52,9 @@ use wallet_ops::{
     native_top_up_required_wrapped_native_amount_for_fee_mode, native_top_up_wrapped_native_amount,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
-    quote_desktop_self_broadcast_gas_fee, quote_sponsored_send_authorization_limit,
-    quote_sponsored_unshield_authorization_limit, select_public_broadcaster_with_policy_and_trust,
+    public_action_maximum_gas_cost_is_significant, quote_desktop_self_broadcast_gas_fee,
+    quote_sponsored_send_authorization_limit, quote_sponsored_unshield_authorization_limit,
+    select_public_broadcaster_with_policy_and_trust,
     settings::EffectiveTokenRegistry,
     sponsorship_payment, submit_desktop_send_public_broadcaster,
     submit_desktop_send_self_broadcast, submit_desktop_sponsored_send_self_broadcast,
@@ -85,8 +86,7 @@ use super::private_broadcaster::{
 };
 use super::public_account::public_account_display_label;
 use super::public_action::{
-    PublicActionFeeDisplay, maximum_gas_cost_is_significant, public_action_protocol_fee_label,
-    render_public_action_fee_estimate,
+    PublicActionFeeDisplay, public_action_protocol_fee_label, render_public_action_fee_estimate,
 };
 use super::public_balances::public_balance_entry_for_chain;
 use super::public_broadcaster::resolve_selected_public_broadcaster_fee_token;

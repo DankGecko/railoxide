@@ -961,30 +961,6 @@ fn matching_live_content_clears_an_older_pending_update() {
 }
 
 #[test]
-fn picker_fee_estimate_retry_backoff_caps_at_five_seconds() {
-    assert_eq!(
-        broadcaster_picker_fee_estimate_retry_delay(0),
-        Duration::from_secs(1)
-    );
-    assert_eq!(
-        broadcaster_picker_fee_estimate_retry_delay(1),
-        Duration::from_secs(2)
-    );
-    assert_eq!(
-        broadcaster_picker_fee_estimate_retry_delay(2),
-        Duration::from_secs(4)
-    );
-    assert_eq!(
-        broadcaster_picker_fee_estimate_retry_delay(3),
-        Duration::from_secs(5)
-    );
-    assert_eq!(
-        broadcaster_picker_fee_estimate_retry_delay(u8::MAX),
-        Duration::from_secs(5)
-    );
-}
-
-#[test]
 fn picker_fee_estimate_retry_state_deduplicates_and_rejects_stale_timers() {
     let mut retry = BroadcasterPickerFeeEstimateRetryState::default();
     assert!(retry.should_schedule(false, false, false));

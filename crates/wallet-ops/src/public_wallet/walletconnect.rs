@@ -5,7 +5,8 @@ use super::signer::{VaultedPublicSigner, vaulted_public_signer};
 use super::submission::{
     PublicActionPreflightMode, emit_public_action_event,
     emit_refreshed_public_action_hardware_session, public_action_preflight_from_rpc_pool_with_mode,
-    submit_public_action_attempt,
+    sanitize_walletconnect_transaction_request, submit_public_action_attempt,
+    validate_walletconnect_reviewed_transaction,
 };
 use super::types::{
     PublicActionGasLimitStrategy, PublicActionProgressStep, PublicActionSessionEvent,
@@ -177,20 +178,54 @@ pub async fn submit_walletconnect_send_transaction(
     )?;
     let from_address = signer.address();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let tx_req =
+        sanitize_walletconnect_transaction_request(request.tx_req, request.chain_id, from_address);
+    let operation_gas_limit = request
+        .decoded_transaction
+        .as_ref()
+        .and_then(|transaction| {
+            super::gas::public_walletconnect_operation_gas_limit(
+                &transaction.kind,
+                chain.gas.gas_limit_buffer,
+            )
+        });
+    let gas_fee = request.reviewed_fee.map_or(request.gas_fee, |fee| {
+        super::types::PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: fee.max_fee_per_gas,
+            max_priority_fee_per_gas: fee.max_priority_fee_per_gas,
+        }
+    });
+    let reviewed_gas_limit = if operation_gas_limit.is_none() {
+        match request.reviewed_transaction {
+            Some(reviewed) => {
+                validate_walletconnect_reviewed_transaction(
+                    request.chain_id,
+                    from_address,
+                    &tx_req,
+                    reviewed.payload_fingerprint,
+                    reviewed.gas_limit,
+                )?;
+                Some(reviewed.gas_limit)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let preflight = public_action_preflight_from_rpc_pool_with_mode(
         &query_rpc_pool,
         http.network_mode(),
         request.chain_id,
         from_address,
-        request.tx_req,
-        request.gas_fee,
+        tx_req,
+        gas_fee,
         &chain.gas,
         PublicShieldTransactionProfile::Railoxide,
         PublicActionGasLimitStrategy::ChainBuffer,
+        reviewed_gas_limit,
         None,
-        None,
-        None,
-        PublicActionPreflightMode::PreserveRequestFields,
+        operation_gas_limit,
+        PublicActionPreflightMode::Managed,
         None,
         false,
     )

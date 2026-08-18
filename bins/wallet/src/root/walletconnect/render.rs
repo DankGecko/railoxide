@@ -1,4 +1,6 @@
 use super::{helpers::parse_caip2_chain_id, *};
+use gpui::StatefulInteractiveElement;
+use gpui_component::tooltip::Tooltip;
 
 pub(super) fn walletconnect_title_row(label: impl Into<SharedString>) -> gpui::Div {
     div()
@@ -95,23 +97,17 @@ pub(super) fn walletconnect_subpanel(title: &'static str) -> gpui::Div {
         )
 }
 
-pub(super) fn walletconnect_notice(
-    message: impl Into<SharedString>,
-    border: u32,
-    bg: u32,
-) -> gpui::Div {
+pub(super) fn walletconnect_disclosure_content(content: gpui::Div) -> gpui::Div {
     div()
         .w_full()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(border))
-        .bg(rgb(bg))
-        .px(px(10.0))
-        .py(px(7.0))
-        .text_size(px(12.0))
-        .line_height(px(16.0))
-        .text_color(rgb(theme::TEXT))
-        .child(message.into())
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .pl(px(14.0))
+        .pt(px(8.0))
+        .pb(px(7.0))
+        .child(content)
 }
 
 pub(super) fn render_walletconnect_approval_stepper(
@@ -280,11 +276,10 @@ pub(super) fn walletconnect_privacy_notices() -> gpui::Div {
         .flex()
         .flex_col()
         .gap_2()
-        .child(walletconnect_notice(
+        .child(Alert::warning(
+            "walletconnect-privacy-warning",
             "Connecting exposes this Public account address to the dapp for approved chains. Private Railgun and shielded wallet material is not exposed. In a normal browser, the dapp may still link this Public account to IP, cookies, fingerprint, or site activity.",
-            theme::WARNING,
-            theme::WARNING_BG,
-        ))
+        ).small())
 }
 
 pub(super) fn walletconnect_metadata_block(metadata: &WalletConnectPeerMetadata) -> gpui::Div {
@@ -393,22 +388,6 @@ pub(super) fn walletconnect_completed_tx_hash_row(request_key: &str, tx_hash: &s
         )
 }
 
-pub(super) const fn walletconnect_completed_request_color(
-    status: WalletConnectCompletedRequestStatus,
-) -> u32 {
-    match status {
-        WalletConnectCompletedRequestStatus::Approved
-        | WalletConnectCompletedRequestStatus::TransactionSubmitted => theme::SUCCESS,
-        WalletConnectCompletedRequestStatus::AuthorizationFailed
-        | WalletConnectCompletedRequestStatus::RequestFailed
-        | WalletConnectCompletedRequestStatus::Expired => theme::DANGER,
-        WalletConnectCompletedRequestStatus::RelayResponseFailed
-        | WalletConnectCompletedRequestStatus::TransactionSubmittedRelayResponseFailed => {
-            theme::WARNING
-        }
-    }
-}
-
 pub(super) fn walletconnect_approved_chains_row(session: &WalletConnectSessionRecord) -> gpui::Div {
     let items = approved_chain_display_items(session);
     let mut chains = div()
@@ -444,30 +423,39 @@ pub(super) fn walletconnect_approved_chain_chip(
     chip.child(SharedString::from(item.label.clone()))
 }
 
-pub(super) fn walletconnect_raw_details(value: &Value) -> gpui::Div {
+pub(super) fn walletconnect_raw_details(request_key: &str, value: &Value) -> gpui::Div {
     let raw = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(app_muted_text("Raw details"))
-        .child(
-            div()
-                .w_full()
-                .max_h(px(180.0))
-                .overflow_y_scrollbar()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(theme::BORDER_SUBTLE))
-                .bg(rgb(theme::SURFACE))
-                .p(px(8.0))
-                .font_family(APP_MONO_FONT_FAMILY)
-                .text_size(px(12.0))
-                .line_height(px(16.0))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(raw)),
-        )
+    let copy_action_id = SharedString::from(format!(
+        "walletconnect-request-raw-copy-action-{request_key}"
+    ));
+    let copy_id = SharedString::from(format!("walletconnect-request-raw-copy-{request_key}"));
+    walletconnect_disclosure_content(
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .id(copy_action_id)
+                    .tooltip(|window, cx| Tooltip::new("Copy raw request").build(window, cx))
+                    .child(clipboard_with_toast(copy_id, raw.clone())),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .pr(px(28.0))
+                    .font_family(APP_MONO_FONT_FAMILY)
+                    .text_size(px(12.0))
+                    .line_height(px(16.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .whitespace_normal()
+                    .child(SharedString::from(raw)),
+            ),
+    )
 }
 
 pub(super) fn short_uuid(value: &str) -> String {

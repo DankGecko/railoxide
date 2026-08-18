@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) const WALLETCONNECT_TRANSACTION_DETAILS_LABEL: &str = "Transaction details";
 pub(super) const WALLETCONNECT_RAW_REQUEST_LABEL: &str = "Raw request";
+pub(super) const WALLETCONNECT_NETWORK_FEE_LABEL: &str = "Network fee";
 
 pub(super) fn parse_caip2_chain_id(value: &str) -> Option<u64> {
     value.strip_prefix("eip155:")?.parse().ok()
@@ -9,6 +10,15 @@ pub(super) fn parse_caip2_chain_id(value: &str) -> Option<u64> {
 
 pub(super) fn ethereum_chain_id_hex(chain_id: u64) -> String {
     format!("0x{chain_id:x}")
+}
+
+pub(super) fn walletconnect_transaction_selector(
+    transaction: &WalletConnectEvmTransaction,
+) -> Option<[u8; 4]> {
+    let data = transaction.data.as_deref()?;
+    let data = data.strip_prefix("0x").unwrap_or(data);
+    let bytes = alloy::hex::decode(data).ok()?;
+    bytes.get(..4)?.try_into().ok()
 }
 
 pub(super) fn walletconnect_enabled_chain_ids(

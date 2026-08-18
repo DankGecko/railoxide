@@ -81,6 +81,7 @@ impl WalletRoot {
                 .completed_request_dialogs
                 .remove(current_key);
         }
+        self.discard_walletconnect_fee_state(window, cx);
         self.clear_trezor_app_passphrase_input(window, cx);
         self.stop_walletconnect_request_dialog_refresh();
         self.walletconnect.request_dialog_open = false;
@@ -115,6 +116,7 @@ impl WalletRoot {
         self.walletconnect.request_dialog_open = true;
         self.walletconnect.request_dialog_deferred_logged = false;
         self.walletconnect.request_dialog_key = Some(Arc::clone(&request_key));
+        self.attach_walletconnect_fee_state(request_key.as_ref(), window, cx);
         self.start_walletconnect_request_dialog_refresh(cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
@@ -124,10 +126,18 @@ impl WalletRoot {
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
+            let footer_root = root.clone();
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
                 .title(walletconnect_title_row("WalletConnect request"))
+                // A footer otherwise gives Enter a default confirm-and-close path.
+                .on_ok(|_, _, _| false)
+                .footer(move |_, _, _window, cx| {
+                    footer_root
+                        .read(cx)
+                        .render_walletconnect_request_footer(&footer_root)
+                })
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         root.clear_walletconnect_request_dialog_state(window, cx);
@@ -214,7 +224,7 @@ impl WalletRoot {
             .flex_col()
             .gap_3()
             .track_focus(&focus_handle.tab_stop(true))
-            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+            .on_key_down(move |event: &KeyDownEvent, window, cx| {
                 let target_key = keyboard_root
                     .read(cx)
                     .walletconnect
@@ -235,7 +245,7 @@ impl WalletRoot {
                     return;
                 };
                 keyboard_root.update(cx, |root, cx| {
-                    root.navigate_walletconnect_request_dialog(&target_key, cx);
+                    root.navigate_walletconnect_request_dialog(&target_key, window, cx);
                 });
                 cx.stop_propagation();
             });
@@ -287,12 +297,12 @@ impl WalletRoot {
                     .outline()
                     .small()
                     .disabled(previous_key.is_none())
-                    .on_click(move |_event, _window, cx| {
+                    .on_click(move |_event, window, cx| {
                         let Some(key) = previous_key.clone() else {
                             return;
                         };
                         previous_root.update(cx, |root, cx| {
-                            root.navigate_walletconnect_request_dialog(&key, cx);
+                            root.navigate_walletconnect_request_dialog(&key, window, cx);
                         });
                     }),
             )
@@ -307,12 +317,12 @@ impl WalletRoot {
                     .outline()
                     .small()
                     .disabled(next_key.is_none())
-                    .on_click(move |_event, _window, cx| {
+                    .on_click(move |_event, window, cx| {
                         let Some(key) = next_key.clone() else {
                             return;
                         };
                         next_root.update(cx, |root, cx| {
-                            root.navigate_walletconnect_request_dialog(&key, cx);
+                            root.navigate_walletconnect_request_dialog(&key, window, cx);
                         });
                     }),
             )
@@ -321,6 +331,7 @@ impl WalletRoot {
     pub(in crate::root::walletconnect) fn navigate_walletconnect_request_dialog(
         &mut self,
         request_key: &str,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         if !self
@@ -339,6 +350,7 @@ impl WalletRoot {
         self.walletconnect.request_dialog_key = Some(Arc::from(request_key));
         self.walletconnect.request_dialog_open = true;
         self.walletconnect.request_dialog_deferred_logged = false;
+        self.attach_walletconnect_fee_state(request_key, window, cx);
         cx.notify();
     }
 
@@ -352,7 +364,36 @@ impl WalletRoot {
         let current_key = Arc::<str>::from(completed.request.key.as_str());
         let next_key =
             first_walletconnect_pending_request_key(&self.walletconnect.pending_requests);
-        let status_color = walletconnect_completed_request_color(completed.status);
+        let status_alert = match completed.status {
+            WalletConnectCompletedRequestStatus::Approved
+            | WalletConnectCompletedRequestStatus::TransactionSubmitted => Alert::success(
+                SharedString::from(format!(
+                    "walletconnect-request-completed-{}",
+                    completed.request.key
+                )),
+                completed.message.to_string(),
+            ),
+            WalletConnectCompletedRequestStatus::AuthorizationFailed
+            | WalletConnectCompletedRequestStatus::RequestFailed
+            | WalletConnectCompletedRequestStatus::Expired => Alert::error(
+                SharedString::from(format!(
+                    "walletconnect-request-completed-{}",
+                    completed.request.key
+                )),
+                completed.message.to_string(),
+            ),
+            WalletConnectCompletedRequestStatus::RelayResponseFailed
+            | WalletConnectCompletedRequestStatus::TransactionSubmittedRelayResponseFailed => {
+                Alert::warning(
+                    SharedString::from(format!(
+                        "walletconnect-request-completed-{}",
+                        completed.request.key
+                    )),
+                    completed.message.to_string(),
+                )
+            }
+        }
+        .small();
         let mut card = div()
             .w_full()
             .flex()
@@ -363,11 +404,7 @@ impl WalletRoot {
             .border_color(rgb(theme::BORDER_SUBTLE))
             .bg(rgb(theme::SURFACE_ELEVATED))
             .p(px(10.0))
-            .child(walletconnect_notice(
-                completed.message.clone(),
-                status_color,
-                theme::SURFACE_HOVER_SUBTLE,
-            ))
+            .child(status_alert)
             .child(walletconnect_kv_element_row(
                 "Dapp",
                 app_strong_text(completed.request.item.dapp_name.clone()),
@@ -407,7 +444,7 @@ impl WalletRoot {
                         app_button("walletconnect-request-review-next", "Review next")
                             .outline()
                             .small()
-                            .on_click(move |_event, _window, cx| {
+                            .on_click(move |_event, window, cx| {
                                 let next_key = next_key.clone();
                                 let current_key = Arc::clone(&current_key);
                                 next_root.update(cx, |root, cx| {
@@ -419,6 +456,7 @@ impl WalletRoot {
                                     root.walletconnect.request_dialog_open = true;
                                     root.walletconnect.request_dialog_deferred_logged = false;
                                     root.walletconnect.error = None;
+                                    root.attach_walletconnect_fee_state(&next_key, window, cx);
                                     cx.notify();
                                 });
                             }),

@@ -15,12 +15,13 @@ use crate::root::{
     native_token_display_label, token_display_metadata,
 };
 
-use super::{WalletConnectRequestUi, requests::walletconnect_personal_message_bytes};
+use super::{
+    WalletConnectRequestUi, fee::WalletConnectFeeStatus,
+    helpers::walletconnect_transaction_selector, requests::walletconnect_personal_message_bytes,
+};
 
 const PERSONAL_SIGN_PREVIEW_MAX_CHARS: usize = 160;
 pub(super) const WALLETCONNECT_CRITICAL_PARTY_FULL_ADDRESS_MIN_WIDTH: Pixels = px(500.0);
-const WRAPPED_DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
-const WRAPPED_WITHDRAW_SELECTOR: [u8; 4] = [0x2e, 0x1a, 0x7d, 0x4d];
 
 #[derive(Clone, Copy)]
 pub(super) struct WalletConnectIntentContext<'a> {
@@ -223,6 +224,108 @@ pub(super) enum WalletConnectRisk {
     ForeignTransferSource { source: Address },
     AttachedNativeValue(WalletConnectNativeAmount),
     UndecodedContractCall { selector: Option<[u8; 4]> },
+    WouldRevert { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WalletConnectFeeSignificance {
+    Normal,
+    High,
+    ExceedsAmount,
+}
+
+impl WalletConnectFeeSignificance {
+    pub(super) const fn warning_message(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::High => Some("The network fee is high relative to the amount being sent."),
+            Self::ExceedsAmount => Some("The network fee is larger than the amount being sent."),
+        }
+    }
+}
+
+pub(super) fn classify_walletconnect_fee_significance(
+    expected_fee_usd: Option<U256>,
+    moving_value_usd: Option<U256>,
+) -> WalletConnectFeeSignificance {
+    let (Some(expected_fee_usd), Some(moving_value_usd)) = (expected_fee_usd, moving_value_usd)
+    else {
+        return WalletConnectFeeSignificance::Normal;
+    };
+    if moving_value_usd.is_zero() {
+        return WalletConnectFeeSignificance::Normal;
+    }
+    if expected_fee_usd >= moving_value_usd {
+        return WalletConnectFeeSignificance::ExceedsAmount;
+    }
+
+    let quarter = moving_value_usd / U256::from(4_u8);
+    let quarter = if moving_value_usd % U256::from(4_u8) == U256::ZERO {
+        quarter
+    } else {
+        quarter + U256::from(1_u8)
+    };
+    if expected_fee_usd >= quarter {
+        WalletConnectFeeSignificance::High
+    } else {
+        WalletConnectFeeSignificance::Normal
+    }
+}
+
+fn walletconnect_amount_usd_micro_value(
+    chain_id: u64,
+    amount: &WalletConnectAmount,
+    anchor_rates: &TokenAnchorRateCache,
+) -> Option<U256> {
+    match amount {
+        WalletConnectAmount::KnownToken { token, raw, .. } => (!raw.is_zero())
+            .then_some(())
+            .and_then(|()| anchor_rates.cached_token_usd_micro_value(chain_id, *token, *raw)),
+        WalletConnectAmount::Native { raw, .. } => (!raw.is_zero())
+            .then_some(())
+            .and_then(|()| anchor_rates.cached_native_usd_micro_value(chain_id, *raw)),
+        WalletConnectAmount::Unlimited { .. }
+        | WalletConnectAmount::RawToken { .. }
+        | WalletConnectAmount::None => None,
+    }
+}
+
+pub(super) fn walletconnect_moving_usd_micro_value(
+    chain_id: u64,
+    action: WalletConnectIntentAction,
+    amount: &WalletConnectAmount,
+    attached_native: Option<&WalletConnectNativeAmount>,
+    anchor_rates: &TokenAnchorRateCache,
+) -> Option<U256> {
+    let attached_value = |native: &WalletConnectNativeAmount| {
+        (!native.raw.is_zero())
+            .then_some(())
+            .and_then(|()| anchor_rates.cached_native_usd_micro_value(chain_id, native.raw))
+            .filter(|value| !value.is_zero())
+    };
+    match action {
+        WalletConnectIntentAction::ContractCall | WalletConnectIntentAction::ContractCreation => {
+            attached_native.and_then(attached_value)
+        }
+        WalletConnectIntentAction::NativeTransfer | WalletConnectIntentAction::Wrap => {
+            walletconnect_amount_usd_micro_value(chain_id, amount, anchor_rates)
+        }
+        WalletConnectIntentAction::TokenTransfer
+        | WalletConnectIntentAction::TransferFrom
+        | WalletConnectIntentAction::Unwrap => {
+            let amount_value =
+                walletconnect_amount_usd_micro_value(chain_id, amount, anchor_rates)?;
+            let Some(native) = attached_native.filter(|native| !native.raw.is_zero()) else {
+                return Some(amount_value);
+            };
+            amount_value.checked_add(attached_value(native)?)
+        }
+        WalletConnectIntentAction::Approve
+        | WalletConnectIntentAction::PersonalSign
+        | WalletConnectIntentAction::TypedDataSign
+        | WalletConnectIntentAction::AccountRequest
+        | WalletConnectIntentAction::ChainSwitch => None,
+    }
 }
 
 impl WalletConnectRisk {
@@ -244,8 +347,18 @@ impl WalletConnectRisk {
                 selector_label(*selector)
                     .map_or_else(String::new, |selector| format!(" ({selector})"))
             ),
+            Self::WouldRevert { reason } => format!("Simulation would revert: {reason}"),
         }
     }
+}
+
+pub(super) fn walletconnect_simulation_risk(
+    status: &WalletConnectFeeStatus,
+    reason: Option<&str>,
+) -> Option<WalletConnectRisk> {
+    matches!(status, WalletConnectFeeStatus::WouldRevert).then(|| WalletConnectRisk::WouldRevert {
+        reason: reason.unwrap_or("the transaction may fail").to_owned(),
+    })
 }
 
 #[derive(Debug)]
@@ -452,8 +565,10 @@ pub(super) fn walletconnect_party_badge_label(
     role: WalletConnectPartyRole,
     badge: &WalletConnectPartyBadge,
 ) -> Option<String> {
-    if matches!(role, WalletConnectPartyRole::Spender)
-        && matches!(badge, WalletConnectPartyBadge::NotInAddressBook)
+    if matches!(
+        role,
+        WalletConnectPartyRole::Spender | WalletConnectPartyRole::Contract
+    ) && matches!(badge, WalletConnectPartyBadge::NotInAddressBook)
     {
         return None;
     }
@@ -549,13 +664,8 @@ fn resolve_transaction(
         |decoded| decoded.native_value,
     );
     let selector = decoded
-        .and_then(|decoded| match &decoded.kind {
-            WalletConnectDecodedCallKind::ContractCall { selector } => *selector,
-            WalletConnectDecodedCallKind::WrappedDeposit => Some(WRAPPED_DEPOSIT_SELECTOR),
-            WalletConnectDecodedCallKind::WrappedWithdraw { .. } => Some(WRAPPED_WITHDRAW_SELECTOR),
-            _ => None,
-        })
-        .or_else(|| transaction_selector(tx));
+        .and_then(|decoded| decoded.kind.selector())
+        .or_else(|| walletconnect_transaction_selector(tx));
     let attached_native = (!native_value.is_zero()).then(|| native_amount(context, native_value));
     let mut resolved = ResolvedTransaction {
         action: WalletConnectIntentAction::ContractCall,
@@ -569,6 +679,10 @@ fn resolve_transaction(
     let selected_account = request.item.account;
 
     let Some(kind) = decoded.map(|decoded| &decoded.kind) else {
+        if resolved.attached_native.is_some() {
+            resolved.icon =
+                chain_icon_asset_path(context.chain.chain_id).map(WalletIconSource::embedded);
+        }
         if let Some(target) = target {
             resolved.parties.push(party_for(
                 WalletConnectPartyRole::Caller,
@@ -827,6 +941,10 @@ fn add_undecoded_call(
     selector: Option<[u8; 4]>,
 ) {
     resolved.action = WalletConnectIntentAction::ContractCall;
+    if resolved.attached_native.is_some() {
+        resolved.icon =
+            chain_icon_asset_path(context.chain.chain_id).map(WalletIconSource::embedded);
+    }
     resolved.hero_summary = WalletConnectHeroSummary::UndecodedCall { selector };
     resolved.parties.push(party_for(
         WalletConnectPartyRole::Caller,
@@ -1073,16 +1191,6 @@ fn typed_data_summary(value: &Value) -> WalletConnectTypedDataSummary {
     }
 }
 
-fn transaction_selector(transaction: &WalletConnectEvmTransaction) -> Option<[u8; 4]> {
-    let data = transaction
-        .data
-        .as_deref()?
-        .strip_prefix("0x")
-        .unwrap_or(transaction.data.as_deref()?);
-    let bytes = alloy::hex::decode(data).ok()?;
-    bytes.get(..4)?.try_into().ok()
-}
-
 fn selector_label(selector: Option<[u8; 4]>) -> Option<String> {
     selector.map(|selector| format!("0x{}", alloy::hex::encode(selector)))
 }
@@ -1127,6 +1235,10 @@ fn authorization_projection(
         WalletConnectHeroSummary::Amount | WalletConnectHeroSummary::None => {}
     }
     if let Some(attached_native) = attached_native
+        && !matches!(
+            &hero.summary,
+            WalletConnectHeroSummary::UndecodedCall { .. }
+        )
         && !risks
             .iter()
             .any(|risk| matches!(risk, WalletConnectRisk::AttachedNativeValue(_)))
@@ -1153,6 +1265,25 @@ mod tests {
         PublicAccountScope, PublicAccountSource, PublicAccountStatus, WalletConnectPeerMetadata,
         WalletConnectSessionKeys, WalletConnectSessionLifecycleState, WalletConnectSessionRecord,
     };
+
+    #[test]
+    fn simulation_revert_becomes_distinct_risk_but_unavailable_does_not() {
+        let risk = walletconnect_simulation_risk(
+            &WalletConnectFeeStatus::WouldRevert,
+            Some("execution reverted"),
+        );
+        assert!(matches!(
+            risk,
+            Some(WalletConnectRisk::WouldRevert { ref reason }) if reason == "execution reverted"
+        ));
+        assert!(
+            walletconnect_simulation_risk(
+                &WalletConnectFeeStatus::UnavailableFailed,
+                Some("provider unavailable"),
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn approval_uses_spender_only_and_keeps_token_contract_out_of_primary_parties() {
@@ -1281,6 +1412,41 @@ mod tests {
         let rows = summary.rows_for_test();
         assert!(rows.contains(&("Site".to_owned(), "app.aave.com".to_owned())));
         assert!(rows.contains(&("Dapp".to_owned(), "Aave".to_owned())));
+    }
+
+    #[test]
+    fn walletconnect_authorization_summary_includes_reviewed_maximum_cost() {
+        let account = Address::from([0x11; 20]);
+        let chain = chain(None);
+        let registry = EffectiveTokenRegistry {
+            tokens: BTreeMap::new(),
+        };
+        let rates = TokenAnchorRateCache::new();
+        let request = request_with(
+            WalletConnectParsedRequest::EthSendTransaction {
+                transaction: transaction(account, Some(Address::from([0x22; 20])), U256::from(1)),
+            },
+            Some(WalletConnectDecodedTransaction {
+                target: Some(Address::from([0x22; 20])),
+                native_value: U256::from(1),
+                kind: WalletConnectDecodedCallKind::NativeTransfer,
+            }),
+        );
+        let intent =
+            build_walletconnect_intent(&request, context(&chain, &registry, &rates, &[], &[]));
+        let mut reviewed = super::super::fee::WalletConnectReviewedFeeProjection::unresolved(
+            request.key.as_str(),
+            request.review_token,
+        );
+        reviewed.maximum_gas_cost = Some(U256::from(123_456_u64));
+        let rows = super::super::requests::walletconnect_request_authorization_summary_with_fee(
+            &request, &intent, &reviewed,
+        )
+        .rows_for_test();
+        assert!(
+            rows.iter()
+                .any(|(label, value)| label == "Maximum network cost" && !value.is_empty())
+        );
     }
 
     #[test]
@@ -1649,6 +1815,20 @@ mod tests {
             )
             .is_none()
         );
+        assert!(
+            walletconnect_party_badge_label(
+                WalletConnectPartyRole::Contract,
+                &party_for(
+                    WalletConnectPartyRole::Contract,
+                    unknown,
+                    selected,
+                    &accounts,
+                    &address_book,
+                )
+                .badge,
+            )
+            .is_none()
+        );
         assert!(matches!(
             party_for(
                 WalletConnectPartyRole::Spender,
@@ -1671,6 +1851,36 @@ mod tests {
             .badge,
             WalletConnectPartyBadge::AddressBook { label } if label == "Saved contact"
         ));
+    }
+
+    #[test]
+    fn undecoded_attached_native_value_uses_chain_hero_model() {
+        let account = Address::from([0x11; 20]);
+        let target = Address::from([0x22; 20]);
+        let chain = chain(None);
+        let registry = registry(target);
+        let rates = TokenAnchorRateCache::new();
+        let request = request_with(
+            WalletConnectParsedRequest::EthSendTransaction {
+                transaction: transaction(account, Some(target), U256::from(1)),
+            },
+            Some(WalletConnectDecodedTransaction {
+                target: Some(target),
+                native_value: U256::from(1),
+                kind: WalletConnectDecodedCallKind::ContractCall {
+                    selector: Some([0xaa, 0xbb, 0xcc, 0xdd]),
+                },
+            }),
+        );
+        let intent =
+            build_walletconnect_intent(&request, context(&chain, &registry, &rates, &[], &[]));
+
+        assert!(matches!(
+            intent.hero.summary,
+            WalletConnectHeroSummary::UndecodedCall { .. }
+        ));
+        assert!(intent.attached_native.is_some());
+        assert!(intent.icon.is_some());
     }
 
     #[test]
@@ -1757,6 +1967,141 @@ mod tests {
         );
         assert!(
             matches!(foreign_source.as_slice(), [WalletConnectRisk::ForeignTransferSource { source }] if *source == foreign)
+        );
+    }
+
+    #[test]
+    fn fee_significance_omits_missing_or_zero_values() {
+        for (expected, moving) in [
+            (None, Some(U256::from(100))),
+            (Some(U256::from(25)), None),
+            (Some(U256::from(25)), Some(U256::ZERO)),
+        ] {
+            assert_eq!(
+                classify_walletconnect_fee_significance(expected, moving),
+                WalletConnectFeeSignificance::Normal
+            );
+        }
+    }
+
+    #[test]
+    fn moving_value_requires_finite_known_amount_and_cached_price() {
+        let token = Address::from([0x55; 20]);
+        let rates = TokenAnchorRateCache::new();
+        rates.store_native_usd_rate(1, U256::from(1_000_000_u64));
+        rates.store_rate(1, token, U256::from(1_000_000_000_000_000_000_u64));
+        let known_token = WalletConnectAmount::KnownToken {
+            token,
+            raw: U256::from(1_000_000_000_000_000_000_u128),
+            decimals: 18,
+            symbol: "TOK".to_owned(),
+            display: "1 TOK".to_owned(),
+            usd: None,
+        };
+        assert!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::TokenTransfer,
+                &known_token,
+                None,
+                &rates,
+            )
+            .is_some()
+        );
+        let native = WalletConnectAmount::Native {
+            raw: U256::from(1_000_000_000_000_000_000_u128),
+            symbol: "ETH".to_owned(),
+            display: "1 ETH".to_owned(),
+            usd: None,
+        };
+        let attached_native = WalletConnectNativeAmount {
+            raw: U256::from(1_000_000_000_000_000_000_u128),
+            symbol: "ETH".to_owned(),
+            display: "1 ETH".to_owned(),
+            usd: None,
+        };
+        assert_eq!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::NativeTransfer,
+                &native,
+                Some(&attached_native),
+                &rates,
+            ),
+            Some(U256::from(1_000_000_u64))
+        );
+        assert_eq!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::Wrap,
+                &native,
+                Some(&attached_native),
+                &rates,
+            ),
+            Some(U256::from(1_000_000_u64))
+        );
+        assert_eq!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::TokenTransfer,
+                &known_token,
+                Some(&attached_native),
+                &rates,
+            ),
+            Some(U256::from(2_000_000_u64))
+        );
+        let attached_without_cached_value = WalletConnectNativeAmount {
+            raw: U256::MAX,
+            symbol: "ETH".to_owned(),
+            display: "unavailable".to_owned(),
+            usd: None,
+        };
+        assert!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::TokenTransfer,
+                &known_token,
+                Some(&attached_without_cached_value),
+                &rates,
+            )
+            .is_none()
+        );
+        assert!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::NativeTransfer,
+                &native,
+                None,
+                &rates,
+            )
+            .is_some()
+        );
+        let raw = WalletConnectAmount::RawToken {
+            token,
+            raw: U256::from(1),
+            display: "1 raw token unit".to_owned(),
+            unrecognised_contract: true,
+            decimals_unknown: true,
+        };
+        assert!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::TokenTransfer,
+                &raw,
+                None,
+                &rates,
+            )
+            .is_none()
+        );
+        assert!(
+            walletconnect_moving_usd_micro_value(
+                1,
+                WalletConnectIntentAction::Approve,
+                &known_token,
+                None,
+                &rates,
+            )
+            .is_none()
         );
     }
 }

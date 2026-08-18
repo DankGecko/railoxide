@@ -149,14 +149,29 @@ fn request_disclosures_are_isolated_and_pruned_when_requests_disappear() {
         WalletConnectRequestDisclosure::TransactionDetails,
     );
     toggle_request_disclosure_state(
+        states.get_mut("session-topic:1").expect("first state"),
+        WalletConnectRequestDisclosure::NetworkFee,
+    );
+    toggle_request_disclosure_state(
         states.get_mut("session-topic:2").expect("second state"),
         WalletConnectRequestDisclosure::RawRequest,
     );
 
     assert!(states["session-topic:1"].transaction_details_open);
+    assert!(states["session-topic:1"].network_fee_open);
     assert!(!states["session-topic:1"].raw_request_open);
     assert!(!states["session-topic:2"].transaction_details_open);
+    assert!(!states["session-topic:2"].network_fee_open);
     assert!(states["session-topic:2"].raw_request_open);
+
+    let replacement = states.insert(
+        "session-topic:1".to_owned(),
+        WalletConnectRequestDisclosureState::default(),
+    );
+    assert!(replacement.is_some());
+    assert!(!states["session-topic:1"].network_fee_open);
+    assert!(!states["session-topic:1"].transaction_details_open);
+    assert!(!states["session-topic:1"].raw_request_open);
 
     let mut pending = BTreeMap::new();
     pending.insert(

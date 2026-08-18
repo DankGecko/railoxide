@@ -44,6 +44,7 @@ pub use prover_cache::*;
 pub use public_broadcaster::*;
 pub(crate) use public_broadcaster_submit::*;
 pub use requests::*;
+pub use self_broadcast::SelfBroadcastResolvedGasFee;
 pub(crate) use self_broadcast::*;
 pub use self_broadcast::{
     SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastCommandSender,

@@ -1,17 +1,61 @@
+use super::super::account_select::public_account_walletconnect_label;
+use super::super::fee::{
+    WalletConnectFeeStatus, WalletConnectReviewedFeeProjection,
+    walletconnect_fee_retry_action_enabled, walletconnect_fee_retrying,
+    walletconnect_fee_state_projection, walletconnect_request_can_simulate,
+    walletconnect_request_raw_gas,
+};
 use super::super::helpers::{
-    WALLETCONNECT_RAW_REQUEST_LABEL, WALLETCONNECT_TRANSACTION_DETAILS_LABEL,
-    WalletConnectRequestExpiryStatus,
+    WALLETCONNECT_NETWORK_FEE_LABEL, WALLETCONNECT_RAW_REQUEST_LABEL,
+    WALLETCONNECT_TRANSACTION_DETAILS_LABEL, WalletConnectRequestExpiryStatus,
+    parse_caip2_chain_id, walletconnect_transaction_selector,
 };
 use super::super::intent::{
     WalletConnectAmount, WalletConnectHeroSummary, WalletConnectIntentContext,
     WalletConnectIntentView, WalletConnectParty, WalletConnectPartyRole, WalletConnectRisk,
-    build_walletconnect_intent, walletconnect_approximate_usd_label,
+    build_walletconnect_intent, classify_walletconnect_fee_significance,
+    walletconnect_approximate_usd_label, walletconnect_moving_usd_micro_value,
     walletconnect_party_address_label, walletconnect_party_badge_label,
     walletconnect_selected_account_provenance_visible, walletconnect_should_render_token_contract,
-    walletconnect_token_contract_recognition,
+    walletconnect_simulation_risk, walletconnect_token_contract_recognition,
 };
+use super::super::render::walletconnect_disclosure_content;
 use super::*;
+use crate::root::gas_fee::{
+    Eip1559GasFeeEditorState, Eip1559GasFeeTarget, format_gwei, render_eip1559_gas_fee_editor,
+};
+use crate::root::public_action::format_gas_limit;
+use crate::root::tokens::format_native_token_amount_for_display;
 use alloy::primitives::Address;
+use gpui::relative;
+use gpui_component::collapsible::Collapsible;
+use railgun_ui::format_usd_micro_value;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WalletConnectRequestFooterActionState {
+    reject_enabled: bool,
+    approve_enabled: bool,
+    approve_danger: bool,
+}
+
+const fn walletconnect_request_footer_action_state(
+    in_flight: bool,
+    locally_expired: bool,
+    intent_context_available: bool,
+    unlimited_allowance: bool,
+    hardware_request: bool,
+    hardware_typed_data_hash_fallback: bool,
+) -> WalletConnectRequestFooterActionState {
+    WalletConnectRequestFooterActionState {
+        reject_enabled: !in_flight,
+        approve_enabled: intent_context_available && !in_flight && !locally_expired,
+        approve_danger: intent_context_available
+            && unlimited_allowance
+            && !in_flight
+            && !hardware_request
+            && !hardware_typed_data_hash_fallback,
+    }
+}
 
 impl WalletRoot {
     pub(in crate::root::walletconnect) fn render_walletconnect_request(
@@ -20,43 +64,71 @@ impl WalletRoot {
         request: &WalletConnectRequestUi,
         content_width: Pixels,
     ) -> gpui::Div {
-        let approve_root = root.clone();
-        let reject_root = root.clone();
-        let request_key = Arc::<str>::from(request.key.as_str());
-        let reject_key = Arc::clone(&request_key);
         let intent_context = match self.walletconnect_intent_context(request) {
             Ok(context) => context,
             Err(message) => {
-                return walletconnect_notice(message, theme::DANGER, theme::DANGER_BG);
+                return div().w_full().child(
+                    Alert::error(
+                        SharedString::from(format!(
+                            "walletconnect-request-intent-context-error-{}",
+                            request.key
+                        )),
+                        message,
+                    )
+                    .small(),
+                );
             }
         };
-        let intent = build_walletconnect_intent(request, intent_context);
+        let public_accounts = intent_context.public_accounts;
+        let mut intent = build_walletconnect_intent(request, intent_context);
+        if let Some(state) = self
+            .walletconnect
+            .walletconnect_fee_state
+            .as_ref()
+            .filter(|state| state.request_key.as_ref() == request.key)
+            && let Some(risk) = walletconnect_simulation_risk(&state.status, state.error.as_deref())
+        {
+            intent.risks.push(risk);
+        }
+        let fee_state = self
+            .walletconnect
+            .walletconnect_fee_state
+            .as_ref()
+            .filter(|state| state.request_key.as_ref() == request.key);
+        let fee_significance = fee_state
+            .and_then(|state| {
+                walletconnect_fee_state_projection(
+                    state,
+                    self.walletconnect.walletconnect_gas_fee.refreshing,
+                )
+            })
+            .map(|projection| {
+                classify_walletconnect_fee_significance(
+                    projection.expected_native_usd_micro_value,
+                    walletconnect_moving_usd_micro_value(
+                        parse_display_chain_id(&request.item.chain_id),
+                        intent.action,
+                        &intent.amount,
+                        intent.attached_native.as_ref(),
+                        intent_context.anchor_rates,
+                    ),
+                )
+            });
         let disclosure_state = self
             .walletconnect
             .request_disclosure_state(request.key.as_str());
-        let hardware_request = request.account_source == PublicAccountSource::HardwareDerived;
-        let in_flight = self
-            .walletconnect
-            .request_actions
-            .contains(request.key.as_str());
         let hardware_typed_data_hash_fallback =
             walletconnect_request_uses_hardware_typed_data_hash_fallback(
                 request,
                 self.walletconnect_request_hardware_typed_data_mode(request),
             );
-        let unlimited_allowance = intent
-            .risks
-            .iter()
-            .any(|risk| matches!(risk, &WalletConnectRisk::UnlimitedAllowance { .. }));
-        let approve_label = walletconnect_request_approve_label(
-            in_flight,
-            hardware_request,
-            hardware_typed_data_hash_fallback,
-            unlimited_allowance,
-        );
         let mut content = div().w_full().min_w(px(0.0)).flex().flex_col().gap_2();
-        for risk in &intent.risks {
-            content = content.child(render_walletconnect_intent_risk(risk));
+        for (risk_index, risk) in intent.risks.iter().enumerate() {
+            content = content.child(render_walletconnect_intent_risk(
+                &request.key,
+                risk_index,
+                risk,
+            ));
         }
         content = content
             .child(render_walletconnect_intent_card(
@@ -65,7 +137,20 @@ impl WalletRoot {
                 &request.item.chain_id,
                 content_width,
             ))
-            .child(render_walletconnect_request_provenance(request, &intent))
+            .child(render_walletconnect_request_provenance(
+                request,
+                &intent,
+                public_accounts,
+            ))
+            .child(render_walletconnect_network_fee(
+                root,
+                request,
+                fee_state,
+                self.walletconnect.walletconnect_gas_fee.refreshing,
+                disclosure_state.network_fee_open,
+                &self.walletconnect.walletconnect_gas_fee,
+                fee_significance,
+            ))
             .when_some(intent.transaction.as_ref(), |this, transaction| {
                 this.child(render_walletconnect_request_disclosure(
                     root,
@@ -86,27 +171,39 @@ impl WalletRoot {
                 WalletConnectRequestDisclosure::RawRequest,
                 WALLETCONNECT_RAW_REQUEST_LABEL,
                 disclosure_state.raw_request_open,
-                walletconnect_raw_details(intent.raw_request),
+                walletconnect_raw_details(&request.key, intent.raw_request),
             ));
         if hardware_typed_data_hash_fallback {
-            content = content.child(walletconnect_notice(
-                "This hardware session will use the device's EIP-712 hash-signing fallback. RailOxide computed the typed-data hashes from the validated request and will verify the signature before responding, but the device may show hashes instead of structured fields. Continue only if you accept this reduced device visibility.",
-                theme::WARNING,
-                theme::WARNING_BG,
-            ));
+            content = content.child(
+                Alert::warning(
+                    SharedString::from(format!(
+                        "walletconnect-hardware-typed-data-fallback-{}",
+                        request.key
+                    )),
+                    "This hardware session will use the device's EIP-712 hash-signing fallback. RailOxide computed the typed-data hashes from the validated request and will verify the signature before responding, but the device may show hashes instead of structured fields. Continue only if you accept this reduced device visibility.",
+                )
+                .small(),
+            );
         }
         if matches!(request.account_source, PublicAccountSource::HardwareDerived) {
-            content = content.child(walletconnect_notice(
-                hardware_walletconnect_notice(request.item.method),
-                theme::WARNING,
-                theme::WARNING_BG,
-            ));
+            content = content.child(
+                Alert::warning(
+                    SharedString::from(format!(
+                        "walletconnect-hardware-request-warning-{}",
+                        request.key
+                    )),
+                    hardware_walletconnect_notice(request.item.method),
+                )
+                .small(),
+            );
             #[cfg(feature = "hardware")]
             {
                 if self.current_session_needs_trezor_app_passphrase() {
                     content = content.child(walletconnect_trezor_app_passphrase_input(
                         &self.trezor_app_passphrase_input,
-                        in_flight,
+                        self.walletconnect
+                            .request_actions
+                            .contains(request.key.as_str()),
                     ));
                 }
             }
@@ -123,62 +220,103 @@ impl WalletRoot {
                 Alert::error("walletconnect-request-dialog-error", error.to_string()).small(),
             );
         }
+        content
+    }
+
+    pub(in crate::root::walletconnect) fn render_walletconnect_request_footer(
+        &self,
+        root: &Entity<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let Some(request_key) = self.walletconnect.request_dialog_key.as_deref() else {
+            return Vec::new();
+        };
+        if self
+            .walletconnect
+            .completed_request_dialogs
+            .contains_key(request_key)
+        {
+            return Vec::new();
+        }
+        let Some(request) = self.walletconnect.pending_requests.get(request_key) else {
+            return Vec::new();
+        };
+        let in_flight = self.walletconnect.request_actions.contains(request_key);
         let locally_expired = !walletconnect_request_approval_admitted(
             request.item.expiry_timestamp,
             current_unix_seconds(),
         );
-        content.child(
-            div()
-                .w_full()
-                .min_w(px(0.0))
-                .flex()
-                .flex_wrap()
-                .justify_end()
-                .gap_2()
-                .child(
-                    app_button(
-                        SharedString::from(format!("walletconnect-request-reject-{}", request.key)),
-                        "Reject",
+        let (intent_context_available, unlimited_allowance) =
+            match self.walletconnect_intent_context(request) {
+                Ok(context) => {
+                    let intent = build_walletconnect_intent(request, context);
+                    (
+                        true,
+                        intent.risks.iter().any(|risk| {
+                            matches!(risk, &WalletConnectRisk::UnlimitedAllowance { .. })
+                        }),
                     )
-                    .outline()
-                    .small()
-                    .disabled(in_flight)
-                    .on_click(move |_event, window, cx| {
-                        let key = Arc::clone(&reject_key);
-                        reject_root.update(cx, |root, cx| {
-                            root.reject_walletconnect_request(key.as_ref(), window, cx);
-                        });
-                    }),
-                )
-                .child({
-                    let approve_button = app_button(
-                        SharedString::from(format!(
-                            "walletconnect-request-approve-{}",
-                            request.key
-                        )),
-                        approve_label,
-                    )
-                    .primary()
-                    .small()
-                    .loading(in_flight)
-                    .disabled(in_flight || locally_expired);
-                    let approve_button = if unlimited_allowance
-                        && !in_flight
-                        && !hardware_request
-                        && !hardware_typed_data_hash_fallback
-                    {
-                        approve_button.danger()
-                    } else {
-                        approve_button
-                    };
-                    approve_button.on_click(move |_event, window, cx| {
-                        let key = Arc::clone(&request_key);
-                        approve_root.update(cx, |root, cx| {
-                            root.approve_walletconnect_request(key.as_ref(), window, cx);
-                        });
-                    })
-                }),
+                }
+                Err(_) => (false, false),
+            };
+        let hardware_request = request.account_source == PublicAccountSource::HardwareDerived;
+        let hardware_typed_data_hash_fallback =
+            walletconnect_request_uses_hardware_typed_data_hash_fallback(
+                request,
+                self.walletconnect_request_hardware_typed_data_mode(request),
+            );
+        let action_state = walletconnect_request_footer_action_state(
+            in_flight,
+            locally_expired,
+            intent_context_available,
+            unlimited_allowance,
+            hardware_request,
+            hardware_typed_data_hash_fallback,
+        );
+        let approve_label = walletconnect_request_approve_label(
+            in_flight,
+            hardware_request,
+            hardware_typed_data_hash_fallback,
+            unlimited_allowance,
+        );
+        let reject_root = root.clone();
+        let reject_key = Arc::<str>::from(request_key);
+        let approve_root = root.clone();
+        let approve_key = Arc::clone(&reject_key);
+        let reject = app_button(
+            SharedString::from(format!("walletconnect-request-reject-{request_key}")),
+            "Reject",
         )
+        .outline()
+        .small()
+        .disabled(!action_state.reject_enabled)
+        .on_click(move |_event, window, cx| {
+            let key = Arc::clone(&reject_key);
+            reject_root.update(cx, |root, cx| {
+                root.reject_walletconnect_request(key.as_ref(), window, cx);
+            });
+        })
+        .into_any_element();
+        let approve = app_button(
+            SharedString::from(format!("walletconnect-request-approve-{request_key}")),
+            approve_label,
+        )
+        .primary()
+        .small()
+        .loading(in_flight)
+        .disabled(!action_state.approve_enabled);
+        let approve = if action_state.approve_danger {
+            approve.danger()
+        } else {
+            approve
+        }
+        .on_click(move |_event, window, cx| {
+            let key = Arc::clone(&approve_key);
+            approve_root.update(cx, |root, cx| {
+                root.approve_walletconnect_request(key.as_ref(), window, cx);
+            });
+        })
+        .into_any_element();
+        vec![reject, approve]
     }
 
     fn walletconnect_request_hardware_typed_data_mode(
@@ -238,6 +376,14 @@ impl WalletRoot {
             cx.notify();
             return;
         }
+        let reviewed_fee = match self.capture_walletconnect_reviewed_fee(&request, cx) {
+            Ok(reviewed_fee) => reviewed_fee,
+            Err(error) => {
+                self.walletconnect.error = Some(Arc::from(error));
+                cx.notify();
+                return;
+            }
+        };
         tracing::info!(
             target: "wallet::root::walletconnect",
             request_key = %walletconnect_request_key_log_label(request_key),
@@ -251,6 +397,7 @@ impl WalletRoot {
             self.submit_walletconnect_request_authorized(
                 request_key,
                 request.review_token,
+                reviewed_fee,
                 Zeroizing::new(String::new()),
                 None,
                 window,
@@ -260,6 +407,7 @@ impl WalletRoot {
             let intent = SpendAuthorizationIntent::WalletConnectRequest {
                 request_key: request_key.to_owned(),
                 review_token: request.review_token,
+                reviewed_fee: reviewed_fee.clone(),
             };
             let summary = {
                 let context = match self.walletconnect_intent_context(&request) {
@@ -271,7 +419,11 @@ impl WalletRoot {
                     }
                 };
                 let intent = build_walletconnect_intent(&request, context);
-                walletconnect_request_authorization_summary(&request, &intent)
+                walletconnect_request_authorization_summary_with_fee(
+                    &request,
+                    &intent,
+                    &reviewed_fee,
+                )
             };
             self.request_spend_authorization(intent, summary, window, cx);
         }
@@ -282,6 +434,7 @@ impl WalletRoot {
         &mut self,
         request_key: &str,
         review_token: u64,
+        reviewed_fee: WalletConnectReviewedFeeProjection,
         vault_password: Zeroizing<String>,
         protected_software_seed_session: Option<
             Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
@@ -304,6 +457,12 @@ impl WalletRoot {
             self.walletconnect.error = Some(Arc::from(
                 "WalletConnect request changed while authorization was open; review the current request before approving.",
             ));
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.validate_walletconnect_reviewed_fee(&request, &reviewed_fee, cx) {
+            self.walletconnect.error = Some(Arc::from(error));
+            self.clear_spend_authorization(cx);
             cx.notify();
             return;
         }
@@ -406,7 +565,7 @@ impl WalletRoot {
         );
         let request_key = request_key.to_owned();
         let join = self.runtime.spawn(async move {
-            approve_walletconnect_request_task(
+            Box::pin(approve_walletconnect_request_task(
                 request,
                 vault_store,
                 view_session,
@@ -418,8 +577,9 @@ impl WalletRoot {
                 context,
                 http,
                 hash_fallback_confirmed,
+                reviewed_fee,
                 approval_event_tx,
-            )
+            ))
             .await
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -896,44 +1056,43 @@ impl WalletRoot {
     }
 }
 
-fn render_walletconnect_intent_risk(risk: &WalletConnectRisk) -> gpui::Div {
-    let (message, border, background) = match risk {
-        WalletConnectRisk::UnlimitedAllowance { spender } => (
-            format!(
-                "Unlimited allowance: {} can keep spending this token until the allowance is revoked.",
-                spender.to_checksum(None)
-            ),
-            theme::DANGER,
-            theme::DANGER_BG,
+fn render_walletconnect_intent_risk(
+    request_key: &str,
+    risk_index: usize,
+    risk: &WalletConnectRisk,
+) -> impl IntoElement {
+    let message = match risk {
+        WalletConnectRisk::UnlimitedAllowance { spender } => format!(
+            "Unlimited allowance: {} can keep spending this token until the allowance is revoked.",
+            spender.to_checksum(None)
         ),
-        WalletConnectRisk::ForeignTransferSource { source } => (
-            format!(
-                "This transferFrom call attempts to move funds from {}.",
-                source.to_checksum(None)
-            ),
-            theme::WARNING,
-            theme::WARNING_BG,
+        WalletConnectRisk::ForeignTransferSource { source } => format!(
+            "This transferFrom call attempts to move funds from {}.",
+            source.to_checksum(None)
         ),
-        WalletConnectRisk::AttachedNativeValue(amount) => (
-            format!(
-                "This token operation also sends {} to the contract.",
-                amount.display
-            ),
-            theme::WARNING,
-            theme::WARNING_BG,
+        WalletConnectRisk::AttachedNativeValue(amount) => format!(
+            "This token operation also sends {} to the contract.",
+            amount.display
         ),
-        WalletConnectRisk::UndecodedContractCall { selector } => (
-            format!(
-                "This contract call could not be decoded{}. Inspect the raw request before approving.",
-                selector.map_or_else(String::new, |selector| {
-                    format!(" (selector 0x{})", alloy::hex::encode(selector))
-                })
-            ),
-            theme::WARNING,
-            theme::WARNING_BG,
+        WalletConnectRisk::UndecodedContractCall { selector } => format!(
+            "This contract call could not be decoded{}. Inspect the raw request before approving.",
+            selector.map_or_else(String::new, |selector| {
+                format!(" (selector 0x{})", alloy::hex::encode(selector))
+            })
         ),
+        WalletConnectRisk::WouldRevert { reason } => format!("Would revert: {reason}"),
     };
-    walletconnect_notice(message, border, background)
+    let id = SharedString::from(format!(
+        "walletconnect-request-risk-{request_key}-{risk_index}"
+    ));
+    match risk {
+        WalletConnectRisk::UnlimitedAllowance { .. } | WalletConnectRisk::WouldRevert { .. } => {
+            Alert::error(id, message).small()
+        }
+        WalletConnectRisk::ForeignTransferSource { .. }
+        | WalletConnectRisk::AttachedNativeValue(..)
+        | WalletConnectRisk::UndecodedContractCall { .. } => Alert::warning(id, message).small(),
+    }
 }
 
 fn render_walletconnect_intent_card(
@@ -971,7 +1130,9 @@ fn render_walletconnect_intent_card(
                     &approved_chain_display_item(chain_id),
                 )),
         )
-        .child(render_walletconnect_intent_hero(intent));
+        .when_some(render_walletconnect_intent_hero(intent), |this, hero| {
+            this.child(hero)
+        });
 
     if walletconnect_should_render_token_contract(intent.action)
         && let Some(token) = walletconnect_intent_token_contract(&intent.amount)
@@ -1012,7 +1173,12 @@ fn render_walletconnect_intent_card(
     if party_count > 0 {
         card = card.child(party_flow);
     }
-    if let Some(attached_native) = intent.attached_native.as_ref() {
+    if let Some(attached_native) = intent.attached_native.as_ref()
+        && !matches!(
+            &intent.hero.summary,
+            WalletConnectHeroSummary::UndecodedCall { .. }
+        )
+    {
         card = card.child(
             app_muted_text(format!(
                 "Attached native value: {}",
@@ -1021,11 +1187,22 @@ fn render_walletconnect_intent_card(
             .whitespace_normal(),
         );
     }
+    if let Some(effect) = intent.hero.approval_effect.as_deref() {
+        card = card.child(
+            Alert::new(
+                SharedString::from(format!("walletconnect-approval-effect-{request_key}")),
+                effect.to_owned(),
+            )
+            .small()
+            .text_size(APP_TEXT_SIZE)
+            .text_color(rgb(theme::TEXT_MUTED)),
+        );
+    }
     card
 }
 
-fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> gpui::Div {
-    let mut hero = div().w_full().min_w(px(0.0)).flex().items_start().gap_3();
+fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> Option<gpui::Div> {
+    let mut hero = div().w_full().min_w(px(0.0)).flex().items_center().gap_3();
     if let Some(path) = intent.icon.clone() {
         hero = hero.child(img(path).size(px(34.0)).rounded_full().flex_none());
     }
@@ -1041,9 +1218,6 @@ fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> gpu
             );
             if let Some(context) = intent.usd_context.as_deref() {
                 body = body.child(app_muted_text(walletconnect_approximate_usd_label(context)));
-            }
-            if let Some(effect) = intent.hero.approval_effect.as_deref() {
-                body = body.child(app_muted_text(effect.to_owned()).whitespace_normal());
             }
         }
         WalletConnectHeroSummary::PersonalMessage(summary) => {
@@ -1066,21 +1240,22 @@ fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> gpu
                 summary.primary_type
             )));
         }
-        WalletConnectHeroSummary::UndecodedCall { selector } => {
-            body = body.child(app_strong_text("Could not decode contract call"));
-            body = body.child(app_muted_text(format!(
-                "{}; inspect raw request",
-                selector.map_or_else(
-                    || "No calldata selector supplied".to_owned(),
-                    |selector| format!("Selector 0x{}", alloy::hex::encode(selector)),
-                )
-            )));
+        WalletConnectHeroSummary::UndecodedCall { .. } => {
+            let attached_native = intent.attached_native.as_ref()?;
+            body = body.child(
+                app_strong_text(attached_native.display.clone())
+                    .text_size(px(22.0))
+                    .whitespace_normal(),
+            );
+            if let Some(usd) = attached_native.usd.as_deref() {
+                body = body.child(app_muted_text(walletconnect_approximate_usd_label(usd)));
+            }
         }
         WalletConnectHeroSummary::None => {
             body = body.child(app_strong_text("Review request details"));
         }
     }
-    hero.child(body)
+    Some(hero.child(body))
 }
 
 fn walletconnect_intent_amount_label(amount: &WalletConnectAmount) -> (String, bool) {
@@ -1204,16 +1379,26 @@ fn walletconnect_party_badge_chip(label: &str) -> gpui::Div {
 fn render_walletconnect_request_provenance(
     request: &WalletConnectRequestUi,
     intent: &WalletConnectIntentView<'_>,
+    public_accounts: &[PublicAccountMetadata],
 ) -> gpui::Div {
-    let expiry = match walletconnect_request_expiry_status(
+    let (expiry, expiry_color) = match walletconnect_request_expiry_status(
         request.item.expiry_timestamp,
         current_unix_seconds(),
     ) {
-        WalletConnectRequestExpiryStatus::Missing => "No request expiry supplied".to_owned(),
-        WalletConnectRequestExpiryStatus::Remaining(seconds) => {
-            format!("Expires in {}", walletconnect_duration_label(seconds))
+        WalletConnectRequestExpiryStatus::Missing => {
+            ("No request expiry supplied".to_owned(), theme::TEXT)
         }
-        WalletConnectRequestExpiryStatus::Expired => "Expired at deadline".to_owned(),
+        WalletConnectRequestExpiryStatus::Remaining(seconds) => (
+            format!("Expires in {}", walletconnect_duration_label(seconds)),
+            if seconds < 30 {
+                theme::WARNING
+            } else {
+                theme::TEXT
+            },
+        ),
+        WalletConnectRequestExpiryStatus::Expired => {
+            ("Expired at deadline".to_owned(), theme::TEXT)
+        }
     };
     div()
         .w_full()
@@ -1234,11 +1419,39 @@ fn render_walletconnect_request_provenance(
             |this| {
                 this.child(walletconnect_kv_row(
                     "Public account",
-                    short_address(&request.item.account),
+                    walletconnect_public_account_provenance_label(
+                        request.item.account,
+                        public_accounts,
+                    ),
                 ))
             },
         )
-        .child(walletconnect_kv_row("Request expiry", expiry))
+        .child(walletconnect_kv_element_row(
+            "Request expiry",
+            div()
+                .min_w(px(0.0))
+                .text_align(gpui::TextAlign::Right)
+                .text_color(rgb(expiry_color))
+                .whitespace_normal()
+                .child(SharedString::from(expiry)),
+        ))
+}
+
+fn walletconnect_public_account_provenance_label(
+    selected_account: Address,
+    public_accounts: &[PublicAccountMetadata],
+) -> String {
+    public_accounts
+        .iter()
+        .find(|account| account.address == selected_account)
+        .and_then(|account| {
+            account
+                .label
+                .as_deref()
+                .filter(|label| !label.trim().is_empty())
+                .map(|_| public_account_walletconnect_label(account))
+        })
+        .unwrap_or_else(|| short_address(&selected_account))
 }
 
 fn walletconnect_provenance_dapp_row(name: &str) -> gpui::Div {
@@ -1283,40 +1496,43 @@ fn render_walletconnect_request_disclosure(
     label: &'static str,
     open: bool,
     content: gpui::Div,
-) -> gpui::Div {
+) -> Collapsible {
     let toggle_root = root.clone();
     let toggle_key = request_key.to_owned();
     let id = format!("walletconnect-request-{request_key}-{label}-disclosure");
-    let mut disclosure_row = div()
+    let toggle = app_button_base(SharedString::from(id))
+        .text()
+        .small()
+        .compact()
+        .icon(if open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        })
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(app_muted_text(label))
+        .on_click(move |_event, _window, cx| {
+            cx.stop_propagation();
+            toggle_root.update(cx, |root, cx| {
+                root.walletconnect
+                    .toggle_request_disclosure(&toggle_key, disclosure);
+                cx.notify();
+            });
+        });
+    Collapsible::new()
+        .open(open)
         .w_full()
-        .min_w(px(0.0))
-        .flex()
-        .flex_col()
-        .gap_1()
         .child(
-            app_button_base(SharedString::from(id))
-                .ghost()
+            div()
                 .w_full()
-                .small()
-                .justify_between()
-                .child(app_muted_text(label))
-                .child(gpui_component::Icon::new(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                }))
-                .on_click(move |_event, _window, cx| {
-                    toggle_root.update(cx, |root, cx| {
-                        root.walletconnect
-                            .toggle_request_disclosure(&toggle_key, disclosure);
-                        cx.notify();
-                    });
-                }),
-        );
-    if open {
-        disclosure_row = disclosure_row.child(content);
-    }
-    disclosure_row
+                .min_w(px(0.0))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(toggle),
+        )
+        .content(content)
 }
 
 fn render_walletconnect_transaction_details(
@@ -1325,21 +1541,7 @@ fn render_walletconnect_transaction_details(
     content_width: Pixels,
 ) -> gpui::Div {
     let transaction = details.transaction;
-    let mut content = div()
-        .w_full()
-        .min_w(px(0.0))
-        .flex()
-        .flex_col()
-        .gap_1()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER_SUBTLE))
-        .bg(rgb(theme::SURFACE))
-        .p(px(8.0))
-        .child(walletconnect_kv_row(
-            "Chain ID",
-            details.chain_id.to_string(),
-        ));
+    let mut content = div().w_full().min_w(px(0.0)).flex().flex_col().gap_1();
     if let Some(target) = transaction.to {
         content = content.child(render_walletconnect_address_row(
             "Target",
@@ -1355,7 +1557,11 @@ fn render_walletconnect_transaction_details(
             "Contract creation".to_owned(),
         ));
     }
-    content
+    content = content
+        .child(walletconnect_kv_row(
+            "Chain ID",
+            details.chain_id.to_string(),
+        ))
         .child(walletconnect_kv_row(
             "Native value",
             transaction
@@ -1363,63 +1569,456 @@ fn render_walletconnect_transaction_details(
                 .map_or_else(|| "0".to_owned(), |value| value.to_string()),
         ))
         .child(walletconnect_kv_row(
-            "Gas",
-            transaction
-                .gas
-                .map_or_else(|| "Not supplied".to_owned(), |value| value.to_string()),
-        ))
-        .child(walletconnect_kv_row(
-            "Gas price",
-            transaction
-                .gas_price
-                .map_or_else(|| "Not supplied".to_owned(), |value| value.to_string()),
-        ))
-        .child(walletconnect_kv_row(
-            "Max fee per gas",
-            transaction
-                .max_fee_per_gas
-                .map_or_else(|| "Not supplied".to_owned(), |value| value.to_string()),
-        ))
-        .child(walletconnect_kv_row(
-            "Max priority fee",
-            transaction
-                .max_priority_fee_per_gas
-                .map_or_else(|| "Not supplied".to_owned(), |value| value.to_string()),
-        ))
-        .child(walletconnect_kv_row(
-            "Nonce",
-            transaction
-                .nonce
-                .map_or_else(|| "Not supplied".to_owned(), |value| value.to_string()),
-        ))
-        .child(walletconnect_kv_row(
-            "Transaction type",
-            transaction
-                .transaction_type
-                .map_or_else(|| "Not supplied".to_owned(), |value| value.to_string()),
-        ))
-        .child(walletconnect_kv_row(
-            "Access list",
-            if transaction.access_list.is_some() {
-                "Present".to_owned()
-            } else {
-                "None supplied".to_owned()
-            },
-        ))
-        .child(walletconnect_kv_row(
             "Calldata selector",
             walletconnect_transaction_selector(transaction).map_or_else(
                 || "None".to_owned(),
                 |selector| format!("0x{}", alloy::hex::encode(selector)),
             ),
-        ))
+        ));
+    content = content.child(walletconnect_kv_row(
+        "Calldata",
+        walletconnect_calldata_context(transaction),
+    ));
+    if let Some(value) = transaction.gas {
+        content = content.child(walletconnect_kv_row(
+            "Dapp gas (not used)",
+            value.to_string(),
+        ));
+    }
+    if let Some(value) = transaction.gas_price {
+        content = content.child(walletconnect_kv_row(
+            "Dapp gas price (not used)",
+            walletconnect_dapp_gas_price(value),
+        ));
+    }
+    if let Some(value) = transaction.max_fee_per_gas {
+        content = content.child(walletconnect_kv_row(
+            "Dapp max fee (not used)",
+            walletconnect_dapp_gas_price(value),
+        ));
+    }
+    if let Some(value) = transaction.max_priority_fee_per_gas {
+        content = content.child(walletconnect_kv_row(
+            "Dapp max tip (not used)",
+            walletconnect_dapp_gas_price(value),
+        ));
+    }
+    if let Some(value) = transaction.nonce {
+        content = content.child(walletconnect_kv_row(
+            "Dapp nonce (not used)",
+            value.to_string(),
+        ));
+    }
+    if let Some(value) = transaction.transaction_type {
+        content = content.child(walletconnect_kv_row(
+            "Dapp transaction type (not used)",
+            value.to_string(),
+        ));
+    }
+    walletconnect_disclosure_content(content)
 }
 
-fn walletconnect_transaction_selector(
-    transaction: &WalletConnectEvmTransaction,
-) -> Option<[u8; 4]> {
-    let data = transaction.data.as_deref()?;
+fn render_walletconnect_network_fee(
+    root: &Entity<WalletRoot>,
+    request: &WalletConnectRequestUi,
+    fee_state: Option<&super::super::fee::WalletConnectFeeState>,
+    refreshing: bool,
+    open: bool,
+    fee_editor: &Eip1559GasFeeEditorState,
+    significance: Option<super::super::intent::WalletConnectFeeSignificance>,
+) -> gpui::Div {
+    let request_key = request.key.clone();
+    let status = fee_state.map(|state| state.status);
+    let error = fee_state
+        .and_then(|state| state.error.as_ref())
+        .map(ToString::to_string);
+    let mut row = div().w_full().min_w(px(0.0)).flex().flex_col().gap_1();
+    let mut value = div()
+        .min_w(px(0.0))
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .text_align(gpui::TextAlign::Right)
+        .text_size(APP_TEXT_SIZE)
+        .line_height(relative(1.0));
+    let simulation_disclosure = status == Some(WalletConnectFeeStatus::AwaitingSimulation);
+    let simulation_in_flight = fee_state.is_some_and(|state| state.simulation_requested);
+    if let Some(projection) =
+        fee_state.and_then(|state| walletconnect_fee_state_projection(state, refreshing))
+    {
+        value = value.child(walletconnect_fee_cost_value(
+            parse_display_chain_id(&request.item.chain_id),
+            projection.expected_gas_cost,
+            projection.expected_native_usd_micro_value,
+            significance,
+            false,
+        ));
+    } else {
+        match status {
+            Some(WalletConnectFeeStatus::WouldRevert) => {
+                value = value.child(
+                    div()
+                        .text_size(APP_TEXT_SIZE)
+                        .line_height(relative(1.0))
+                        .text_color(rgb(theme::DANGER))
+                        .child("Would revert"),
+                );
+            }
+            Some(WalletConnectFeeStatus::AwaitingSimulation) => {}
+            Some(WalletConnectFeeStatus::UnavailableFailed) => {
+                value = value.child(app_muted_text("Unavailable"));
+            }
+            Some(WalletConnectFeeStatus::Fetching) | None => {
+                value = value.child(app_muted_text("Fetching fee data..."));
+            }
+            Some(
+                WalletConnectFeeStatus::EstimatedFromOperation(_)
+                | WalletConnectFeeStatus::Simulated(_),
+            ) => unreachable!("typed fee projections are handled above"),
+        }
+    }
+    let can_simulate = walletconnect_request_can_simulate(request)
+        && !matches!(
+            status,
+            Some(WalletConnectFeeStatus::Simulated(_) | WalletConnectFeeStatus::WouldRevert)
+        );
+    let toggle_root = root.clone();
+    let toggle_key = request_key.clone();
+    let toggle = app_button_base(SharedString::from(format!(
+        "walletconnect-network-fee-toggle-{request_key}"
+    )))
+    .text()
+    .small()
+    .compact()
+    .icon(if open {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    })
+    .text_color(rgb(theme::TEXT_MUTED))
+    .child(app_muted_text(WALLETCONNECT_NETWORK_FEE_LABEL))
+    .on_click(move |_event, _window, cx| {
+        cx.stop_propagation();
+        toggle_root.update(cx, |root, cx| {
+            root.walletconnect
+                .toggle_request_disclosure(&toggle_key, WalletConnectRequestDisclosure::NetworkFee);
+            cx.notify();
+        });
+    });
+    let mut right_group = div()
+        .min_w(px(0.0))
+        .flex_1()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .child(value);
+    let simulation_action_visible = can_simulate
+        && (simulation_disclosure || fee_state.is_none_or(|state| !state.simulation_retryable));
+    if simulation_action_visible {
+        let simulate_root = root.clone();
+        let key = request_key.clone();
+        right_group = right_group.child(
+            app_button(
+                SharedString::from(format!("walletconnect-simulate-{request_key}")),
+                "Simulate on network",
+            )
+            .outline()
+            .small()
+            .loading(simulation_in_flight)
+            .child(gpui_component::Icon::new(IconName::Info).with_size(px(14.0)))
+            .tooltip("Simulation sends transaction details to the configured RPC.")
+            .disabled(simulation_in_flight)
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                simulate_root.update(cx, |root, cx| {
+                    root.simulate_current_walletconnect_transaction(&key, cx);
+                });
+            }),
+        );
+    }
+    if matches!(status, Some(WalletConnectFeeStatus::UnavailableFailed)) {
+        let retry_root = root.clone();
+        let key = Arc::<str>::from(request_key.as_str());
+        let retrying = fee_state.is_some_and(|state| {
+            walletconnect_fee_retrying(state.retry_attempt, refreshing, state.simulation_requested)
+        });
+        let retry_blocked = !fee_state.is_some_and(|state| {
+            walletconnect_fee_retry_action_enabled(
+                state.status,
+                refreshing,
+                state.simulation_requested,
+            )
+        });
+        right_group = right_group.child(
+            app_button(
+                SharedString::from(format!("walletconnect-retry-fee-{request_key}")),
+                "Retry",
+            )
+            .outline()
+            .small()
+            .loading(retrying)
+            .disabled(retry_blocked)
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                let key = Arc::clone(&key);
+                retry_root.update(cx, |root, cx| {
+                    root.retry_walletconnect_fee(key.as_ref(), cx);
+                });
+            }),
+        );
+    }
+    let simulation_failed = fee_state.is_some_and(|state| {
+        matches!(state.status, WalletConnectFeeStatus::UnavailableFailed)
+            && state.simulation_retryable
+    });
+    row = row.child(
+        Collapsible::new()
+            .open(open)
+            .w_full()
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(toggle)
+                    .child(right_group),
+            )
+            .content(render_walletconnect_fee_details(
+                root.clone(),
+                request,
+                fee_state,
+                refreshing,
+                fee_editor,
+                significance,
+            )),
+    );
+    if simulation_failed && let Some(error) = error.filter(|error| !error.is_empty()) {
+        row = row.child(
+            Alert::error(
+                SharedString::from(format!("walletconnect-simulation-error-{request_key}")),
+                error,
+            )
+            .small(),
+        );
+    }
+    if let Some(message) =
+        significance.and_then(super::super::intent::WalletConnectFeeSignificance::warning_message)
+    {
+        row = row.child(
+            Alert::warning(
+                SharedString::from(format!("walletconnect-fee-significance-{request_key}")),
+                message,
+            )
+            .small(),
+        );
+    }
+    row
+}
+
+fn render_walletconnect_fee_details(
+    root: Entity<WalletRoot>,
+    request: &WalletConnectRequestUi,
+    fee_state: Option<&super::super::fee::WalletConnectFeeState>,
+    refreshing: bool,
+    fee_editor: &Eip1559GasFeeEditorState,
+    significance: Option<super::super::intent::WalletConnectFeeSignificance>,
+) -> gpui::Div {
+    let chain_id = parse_display_chain_id(&request.item.chain_id);
+    let raw_gas_limit = walletconnect_request_raw_gas(request);
+    let mut details = div().w_full().min_w(px(0.0)).flex().flex_col().gap_1();
+    if let Some(projection) =
+        fee_state.and_then(|state| walletconnect_fee_state_projection(state, refreshing))
+    {
+        details = details
+            .child(walletconnect_kv_element_row(
+                "Gas usage",
+                app_muted_text(format_gas_limit(projection.raw_gas_limit)),
+            ))
+            .child(walletconnect_kv_element_row(
+                "Expected cost",
+                walletconnect_fee_cost_value(
+                    chain_id,
+                    projection.expected_gas_cost,
+                    projection.expected_native_usd_micro_value,
+                    significance,
+                    false,
+                ),
+            ))
+            .when(
+                wallet_ops::public_action_maximum_gas_cost_is_significant(
+                    projection.expected_gas_cost,
+                    projection.maximum_gas_cost,
+                ),
+                |this| {
+                    this.child(walletconnect_kv_element_row(
+                        "Maximum cost",
+                        walletconnect_fee_cost_value(
+                            chain_id,
+                            projection.maximum_gas_cost,
+                            projection.maximum_native_usd_micro_value,
+                            None,
+                            true,
+                        ),
+                    ))
+                },
+            );
+    } else {
+        details = details
+            .child(walletconnect_kv_element_row(
+                "Gas usage",
+                app_muted_text(
+                    raw_gas_limit
+                        .map_or_else(|| "Requires simulation".to_owned(), format_gas_limit),
+                ),
+            ))
+            .child(walletconnect_kv_element_row(
+                "Expected cost",
+                app_muted_text("Needs gas usage"),
+            ));
+    }
+    details = details.child(div().pt(px(6.0)).child(render_eip1559_gas_fee_editor(
+        root,
+        &Eip1559GasFeeTarget::WalletConnect {
+            request_key: Arc::from(request.key.as_str()),
+        },
+        fee_editor,
+        false,
+    )));
+    walletconnect_disclosure_content(details)
+}
+
+fn walletconnect_dapp_gas_price(value: U256) -> String {
+    if value <= U256::from(u128::MAX) {
+        format!("{} gwei (not used)", format_gwei(value.to::<u128>()))
+    } else {
+        format!("{value} wei (not used)")
+    }
+}
+
+fn walletconnect_fee_cost_value(
+    chain_id: u64,
+    cost: alloy::primitives::U256,
+    usd: Option<alloy::primitives::U256>,
+    significance: Option<super::super::intent::WalletConnectFeeSignificance>,
+    muted_all: bool,
+) -> gpui::Div {
+    let native = format_native_token_amount_for_display(chain_id, cost);
+    let warning = significance.is_some_and(|significance| {
+        matches!(
+            significance,
+            super::super::intent::WalletConnectFeeSignificance::High
+                | super::super::intent::WalletConnectFeeSignificance::ExceedsAmount
+        )
+    });
+    let usd_color = if muted_all {
+        theme::TEXT_MUTED
+    } else if warning {
+        theme::WARNING
+    } else {
+        theme::TEXT
+    };
+    let native_color = if muted_all || warning {
+        if warning {
+            theme::WARNING
+        } else {
+            theme::TEXT_MUTED
+        }
+    } else {
+        theme::TEXT_MUTED
+    };
+    let mut value = div()
+        .min_w(px(0.0))
+        .flex()
+        .flex_wrap()
+        .justify_end()
+        .text_align(gpui::TextAlign::Right)
+        .text_size(APP_TEXT_SIZE)
+        .line_height(relative(1.0))
+        .whitespace_normal();
+    if let Some(usd) = usd {
+        value = value
+            .child(
+                div()
+                    .text_color(rgb(usd_color))
+                    .child(SharedString::from(format!(
+                        "≈ {}",
+                        format_usd_micro_value(usd)
+                    ))),
+            )
+            .child(
+                div()
+                    .text_color(rgb(native_color))
+                    .child(SharedString::from(format!(" · {native}"))),
+            );
+    } else {
+        value = value.child(
+            div()
+                .text_color(rgb(usd_color))
+                .child(SharedString::from(native)),
+        );
+    }
+    value
+}
+
+fn parse_display_chain_id(value: &str) -> u64 {
+    parse_caip2_chain_id(value).unwrap_or_default()
+}
+
+fn walletconnect_calldata_context(transaction: &WalletConnectEvmTransaction) -> String {
+    let Some(data) = transaction.data.as_deref() else {
+        return "None supplied".to_owned();
+    };
     let data = data.strip_prefix("0x").unwrap_or(data);
-    let bytes = alloy::hex::decode(data).ok()?;
-    bytes.get(..4)?.try_into().ok()
+    alloy::hex::decode(data).map_or_else(
+        |_| "Supplied (invalid encoding)".to_owned(),
+        |bytes| format!("{} bytes supplied", bytes.len()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dapp_gas_price_formats_safe_values_as_gwei_without_truncating_large_values() {
+        assert_eq!(
+            walletconnect_dapp_gas_price(U256::from(1_500_000_000_u64)),
+            "1.5 gwei (not used)"
+        );
+        let oversized = U256::from(u128::MAX) + U256::from(1_u8);
+        assert_eq!(
+            walletconnect_dapp_gas_price(oversized),
+            format!("{oversized} wei (not used)")
+        );
+    }
+
+    #[test]
+    fn footer_disables_approve_for_expiry_or_missing_intent_context() {
+        let expired =
+            walletconnect_request_footer_action_state(false, true, true, false, false, false);
+        assert!(expired.reject_enabled);
+        assert!(!expired.approve_enabled);
+
+        let missing_context =
+            walletconnect_request_footer_action_state(false, false, false, false, false, false);
+        assert!(missing_context.reject_enabled);
+        assert!(!missing_context.approve_enabled);
+    }
+
+    #[test]
+    fn footer_disables_both_actions_while_request_is_in_flight() {
+        let state =
+            walletconnect_request_footer_action_state(true, false, true, true, false, false);
+
+        assert!(!state.reject_enabled);
+        assert!(!state.approve_enabled);
+        assert!(!state.approve_danger);
+    }
 }

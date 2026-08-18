@@ -514,10 +514,10 @@ pub(super) fn self_broadcast_gas_payer(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SelfBroadcastResolvedGasFee {
-    pub(crate) rpc_gas_price: u128,
-    pub(crate) max_fee_per_gas: u128,
-    pub(crate) max_priority_fee_per_gas: u128,
+pub struct SelfBroadcastResolvedGasFee {
+    pub rpc_gas_price: u128,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
