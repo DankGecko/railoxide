@@ -294,7 +294,8 @@ pub(in crate::root) fn private_send_authorization_summary(
             private_amount_label(draft.amount, &draft.asset, true),
         )
         .with_icon(draft.asset.icon_path.clone()),
-        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone())
+            .with_shortened_copyable(),
         SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
     ];
     append_sponsorship_authorization_rows(
@@ -325,7 +326,8 @@ pub(in crate::root) fn private_send_gas_payer_authorization_summary(
             private_amount_label(draft.amount, &draft.asset, true),
         )
         .with_icon(draft.asset.icon_path.clone()),
-        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone())
+            .with_shortened_copyable(),
         SpendAuthorizationSummaryRow::new(
             if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {
                 "Transaction signer"
@@ -367,7 +369,8 @@ pub(in crate::root) fn private_unshield_authorization_summary(
             private_unshield_recipient_amount_label(draft),
         )
         .with_icon(draft.asset.icon_path.clone()),
-        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None))
+            .with_shortened_copyable(),
     ];
     rows.push(SpendAuthorizationSummaryRow::new(
         "Delivery",
@@ -458,7 +461,8 @@ pub(in crate::root) fn private_unshield_gas_payer_authorization_summary(
             private_unshield_recipient_amount_label(draft),
         )
         .with_icon(draft.asset.icon_path.clone()),
-        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None))
+            .with_shortened_copyable(),
     ];
     rows.push(SpendAuthorizationSummaryRow::new(
         if draft.self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship {

@@ -41,6 +41,8 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
 pub use local_cache::*;
 pub use private_tx::*;
 pub use prover_cache::*;
+#[cfg(test)]
+pub(crate) use public_broadcaster::random_eligible_public_broadcasters;
 pub use public_broadcaster::*;
 pub(crate) use public_broadcaster_submit::*;
 pub use requests::*;

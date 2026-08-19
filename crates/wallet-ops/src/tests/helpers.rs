@@ -32,6 +32,7 @@ pub(super) use railgun_wallet::{
 pub(super) use serde_json::json;
 pub(super) use sync_service::ChainConfigDefaults;
 
+pub(super) use crate::desktop::random_eligible_public_broadcasters;
 pub(super) use crate::hardware::{
     HardwareDerivationDescriptor, HardwareWalletSyncIntent, parse_bip32_path,
 };

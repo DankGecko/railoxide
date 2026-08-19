@@ -1,7 +1,7 @@
 use super::helpers::*;
 
 #[test]
-fn public_broadcaster_candidates_filter_unsupported_rows_but_allow_poi_required_temporarily() {
+fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_required() {
     let token = address(0x21);
     let relay_adapt = address(0x44);
     let mut rows = vec![fee_row(1, token, 10, 0.9, "ok")];
@@ -22,8 +22,8 @@ fn public_broadcaster_candidates_filter_unsupported_rows_but_allow_poi_required_
     unsupported_version.version = Arc::from("9.0.0");
     rows.push(unsupported_version);
 
-    let mut poi_required = fee_row(1, token, 10, 0.9, "poi");
-    poi_required.required_poi_list_keys = vec![Arc::from("poi-list")];
+    let mut poi_required = fee_row_with_broadcaster_seed(1, token, 10, 0.9, "poi", 8);
+    poi_required.required_poi_list_keys = vec![Arc::from("00".repeat(32))];
     rows.push(poi_required);
 
     rows.push(fee_row(2, token, 10, 0.9, "chain"));
@@ -189,26 +189,99 @@ fn public_broadcaster_seeded_tie_breaker_replaces_lexical_address_order() {
 }
 
 #[test]
-fn random_public_broadcaster_selection_prefers_non_poi_required_candidate() {
+fn random_public_broadcaster_pool_includes_valid_poi_candidates_only_after_filters() {
     let token = address(0x27);
     let mut poi_required = fee_row_with_broadcaster_seed(1, token, 10, 0.9, "poi", 31);
-    poi_required.required_poi_list_keys = vec![Arc::from("poi-list")];
-    let candidates = eligible_public_broadcasters(
+    poi_required.required_poi_list_keys = vec![Arc::from("11".repeat(32))];
+    let mut malformed = fee_row_with_broadcaster_seed(1, token, 10, 0.9, "malformed", 33);
+    malformed.required_poi_list_keys = vec![Arc::from("not-a-list-key")];
+    let out_of_policy = fee_row_with_broadcaster_seed(1, token, 20, 0.9, "out-of-policy", 34);
+    let banned = fee_row_with_broadcaster_seed(1, token, 10, 0.9, "banned", 35);
+    let mut candidates = public_broadcaster_candidates(
         &[
             poi_required,
-            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "supported", 32),
+            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "no-poi", 32),
+            malformed,
+            out_of_policy,
+            banned,
         ],
         1,
         token,
         None,
         SystemTime::now(),
+        BroadcasterFeePolicy::default(),
+        Some(U256::from(10)),
+    );
+    let malformed_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.fees_id == "no-poi")
+        .cloned()
+        .expect("no-POI candidate");
+    let mut malformed_candidate = malformed_candidate;
+    malformed_candidate.required_poi_list_keys = vec!["malformed".to_string()];
+    candidates.push(malformed_candidate);
+
+    let trust_filter = PublicBroadcasterTrustFilter {
+        preferences: vault::BroadcasterPreferences {
+            favorites: Vec::new(),
+            banned: vec![broadcaster_preference_entry(35)],
+        },
+        favorites_only: false,
+    };
+    let pool = random_eligible_public_broadcasters(
+        &candidates,
+        BroadcasterFeePolicy::default(),
+        &trust_filter,
     );
 
-    let selected = select_public_broadcaster(&candidates, &PublicBroadcasterSelection::Random)
-        .expect("random supported candidate");
+    assert_eq!(
+        pool.iter()
+            .map(|candidate| candidate.fees_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["poi", "no-poi"]
+    );
+}
 
-    assert_eq!(selected.fees_id, "supported");
-    assert!(selected.required_poi_list_keys.is_empty());
+#[test]
+fn public_broadcaster_deduplication_keeps_freshest_parsed_identity() {
+    let token = address(0x28);
+    let now = SystemTime::now();
+    let mut older = fee_row_with_broadcaster_seed(1, token, 10, 0.9, "older-fees", 36);
+    older.identifier = Some(Arc::from("older-identifier"));
+    older.fee_expiration = now + Duration::from_secs(10);
+    let mut fresher = older.clone();
+    fresher.fees_id = Arc::from("fresh-fees");
+    fresher.identifier = Some(Arc::from("fresh-identifier"));
+    fresher.fee_expiration = now + Duration::from_secs(20);
+
+    let candidates = eligible_public_broadcasters(&[older, fresher], 1, token, None, now);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].fees_id, "fresh-fees");
+    assert_eq!(
+        candidates[0].identifier.as_deref(),
+        Some("fresh-identifier")
+    );
+
+    let mut older_candidate = candidates[0].clone();
+    older_candidate.fees_id = "older-direct-fees".to_string();
+    older_candidate.identifier = Some("older-direct-identifier".to_string());
+    older_candidate.fee_expiration = now + Duration::from_secs(30);
+    let mut fresher_candidate = older_candidate.clone();
+    fresher_candidate.fees_id = "fresh-direct-fees".to_string();
+    fresher_candidate.identifier = Some("fresh-direct-identifier".to_string());
+    fresher_candidate.fee_expiration = now + Duration::from_secs(40);
+
+    let pool = random_eligible_public_broadcasters(
+        &[older_candidate, fresher_candidate],
+        BroadcasterFeePolicy::default(),
+        &PublicBroadcasterTrustFilter::default(),
+    );
+    assert_eq!(pool.len(), 1);
+    assert_eq!(pool[0].fees_id, "fresh-direct-fees");
+    assert_eq!(
+        pool[0].identifier.as_deref(),
+        Some("fresh-direct-identifier")
+    );
 }
 
 #[test]
@@ -356,10 +429,10 @@ fn public_broadcaster_fee_policy_classifies_anchor_bounds() {
     let policy = BroadcasterFeePolicy::default();
     let candidates = public_broadcaster_candidates(
         &[
-            fee_row(1, token, 89, 0.9, "below"),
-            fee_row(1, token, 90, 0.9, "lower-bound"),
-            fee_row(1, token, 150, 0.9, "upper-bound"),
-            fee_row(1, token, 151, 0.9, "above"),
+            fee_row_with_broadcaster_seed(1, token, 89, 0.9, "below", 1),
+            fee_row_with_broadcaster_seed(1, token, 90, 0.9, "lower-bound", 2),
+            fee_row_with_broadcaster_seed(1, token, 150, 0.9, "upper-bound", 3),
+            fee_row_with_broadcaster_seed(1, token, 151, 0.9, "above", 4),
         ],
         1,
         token,

@@ -278,7 +278,8 @@ pub(in crate::root) fn public_send_authorization_summary(
         SpendAuthorizationSummaryRow::new("Amount", public_action_amount_label(draft))
             .with_icon(draft.asset_icon_path.clone()),
         SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
-        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None))
+            .with_shortened_copyable(),
     ];
     rows.extend(public_action_authorization_fee_rows(&draft.fee_display));
     SpendAuthorizationSummary::new(

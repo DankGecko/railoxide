@@ -64,7 +64,7 @@ impl PublicBroadcasterCandidate {
     ) -> Option<Self> {
         let railgun_address = RailgunAddress::from(row.railgun_address.as_ref());
         let address_data = AddressData::try_from(&railgun_address).ok()?;
-        Some(Self {
+        let candidate = Self {
             chain_id: row.chain_id,
             railgun_address: row.railgun_address.to_string(),
             identifier: row.identifier.as_ref().map(ToString::to_string),
@@ -85,7 +85,9 @@ impl PublicBroadcasterCandidate {
             viewing_public_key: address_data.viewing_public_key,
             address_data,
             fee_policy_status,
-        })
+        };
+        candidate.parsed_required_poi_list_keys().ok()?;
+        Some(candidate)
     }
 }
 
@@ -982,18 +984,18 @@ pub fn eligible_public_broadcasters(
     required_relay_adapt: Option<Address>,
     now: SystemTime,
 ) -> Vec<PublicBroadcasterCandidate> {
-    rows.iter()
+    let candidates = rows
+        .iter()
         .filter(|row| row.chain_id == chain_id)
         .filter(|row| row.token_address == token)
         .filter(|row| row.signature_valid)
         .filter(|row| row.fee_expiration > now)
         .filter(|row| row.available_wallets > 0)
         .filter(|row| supported_broadcaster_version(&row.version))
-        // Temporarily include POI-required broadcasters so the desktop picker can
-        // be assessed against long live broadcaster lists.
         .filter(|row| required_relay_adapt.is_none_or(|relay| row.relay_adapt == relay))
         .filter_map(PublicBroadcasterCandidate::from_fee_row)
-        .collect()
+        .collect::<Vec<_>>();
+    deduplicate_public_broadcasters(candidates)
 }
 
 #[must_use]
@@ -1006,7 +1008,8 @@ pub fn public_broadcaster_candidates(
     policy: BroadcasterFeePolicy,
     anchor_rate: Option<U256>,
 ) -> Vec<PublicBroadcasterCandidate> {
-    rows.iter()
+    let candidates = rows
+        .iter()
         .filter(|row| row.chain_id == chain_id)
         .filter(|row| row.token_address == token)
         .filter(|row| row.signature_valid)
@@ -1020,7 +1023,71 @@ pub fn public_broadcaster_candidates(
                 policy.classify_fee(row.fee, anchor_rate),
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    deduplicate_public_broadcasters(candidates)
+}
+
+fn deduplicate_public_broadcasters(
+    candidates: Vec<PublicBroadcasterCandidate>,
+) -> Vec<PublicBroadcasterCandidate> {
+    let mut unique: Vec<PublicBroadcasterCandidate> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(existing) = unique.iter_mut().find(|existing| {
+            existing.chain_id == candidate.chain_id
+                && existing.token == candidate.token
+                && existing.address_data.master_public_key
+                    == candidate.address_data.master_public_key
+                && existing.address_data.viewing_public_key
+                    == candidate.address_data.viewing_public_key
+        }) {
+            if public_broadcaster_is_preferred(&candidate, existing) {
+                *existing = candidate;
+            }
+        } else {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn public_broadcaster_is_preferred(
+    candidate: &PublicBroadcasterCandidate,
+    existing: &PublicBroadcasterCandidate,
+) -> bool {
+    candidate
+        .fee_expiration
+        .cmp(&existing.fee_expiration)
+        .then_with(|| candidate.fees_id.cmp(&existing.fees_id))
+        .then_with(|| candidate.railgun_address.cmp(&existing.railgun_address))
+        .then_with(|| candidate.identifier.cmp(&existing.identifier))
+        .then_with(|| candidate.fee.cmp(&existing.fee))
+        .then_with(|| {
+            candidate
+                .required_poi_list_keys
+                .cmp(&existing.required_poi_list_keys)
+        })
+        .then_with(|| candidate.version.cmp(&existing.version))
+        .then_with(|| candidate.reliability.total_cmp(&existing.reliability))
+        .then_with(|| candidate.available_wallets.cmp(&existing.available_wallets))
+        .then_with(|| candidate.relay_adapt.cmp(&existing.relay_adapt))
+        .then_with(|| candidate.relay_adapt_7702.cmp(&existing.relay_adapt_7702))
+        .is_gt()
+}
+
+#[must_use]
+pub(crate) fn random_eligible_public_broadcasters(
+    candidates: &[PublicBroadcasterCandidate],
+    policy: BroadcasterFeePolicy,
+    trust_filter: &PublicBroadcasterTrustFilter,
+) -> Vec<PublicBroadcasterCandidate> {
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| trust_filter.allows(candidate))
+        .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
+        .filter(|candidate| candidate.parsed_required_poi_list_keys().is_ok())
+        .cloned()
+        .collect();
+    deduplicate_public_broadcasters(eligible)
 }
 
 #[must_use]
@@ -1091,28 +1158,9 @@ pub fn select_public_broadcaster_with_policy_and_trust(
 ) -> Result<PublicBroadcasterCandidate> {
     match selection {
         PublicBroadcasterSelection::Random => {
-            let supported_candidates = candidates
-                .iter()
-                .filter(|candidate| trust_filter.allows(candidate))
-                .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
-                .filter(|candidate| candidate.required_poi_list_keys.is_empty())
-                .collect::<Vec<_>>();
-            let eligible_candidates = candidates
-                .iter()
-                .filter(|candidate| trust_filter.allows(candidate))
-                .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
-                .collect::<Vec<_>>();
-            let selected = if supported_candidates.is_empty() {
-                eligible_candidates
-                    .choose(&mut rand::rng())
-                    .copied()
-                    .cloned()
-            } else {
-                supported_candidates
-                    .choose(&mut rand::rng())
-                    .copied()
-                    .cloned()
-            };
+            let eligible_candidates =
+                random_eligible_public_broadcasters(candidates, policy, trust_filter);
+            let selected = eligible_candidates.choose(&mut rand::rng()).cloned();
             selected.ok_or_else(|| eyre!("no eligible public broadcaster for selected token"))
         }
         PublicBroadcasterSelection::Specific { railgun_address } => {

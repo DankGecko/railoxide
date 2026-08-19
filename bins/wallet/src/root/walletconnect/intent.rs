@@ -4,7 +4,7 @@ use railgun_ui::{chain_icon_asset_path, format_usd_micro_value};
 use serde_json::Value;
 use wallet_ops::{
     TokenAnchorRateCache, WalletConnectDecodedCallKind, WalletConnectDecodedTransaction,
-    WalletConnectEvmTransaction, WalletConnectParsedRequest, WalletConnectSupportedMethod,
+    WalletConnectEvmTransaction, WalletConnectParsedRequest,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry},
     vault::{PublicAccountMetadata, PublicAddressBookEntry},
 };
@@ -183,6 +183,13 @@ pub(super) struct WalletConnectTypedDataSummary {
     pub(super) primary_type: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WalletConnectEip2612Permit {
+    token: Address,
+    spender: Address,
+    value: U256,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WalletConnectHero {
     pub(super) verb: &'static str,
@@ -330,7 +337,7 @@ pub(super) fn walletconnect_moving_usd_micro_value(
 
 impl WalletConnectRisk {
     #[must_use]
-    fn authorization_label(&self) -> String {
+    pub(super) fn authorization_label(&self) -> String {
         match self {
             Self::UnlimitedAllowance { spender } => format!(
                 "Unlimited allowance: spender {} keeps continuing token authority",
@@ -393,7 +400,6 @@ pub(super) fn build_walletconnect_intent<'a>(
     request: &'a WalletConnectRequestUi,
     context: WalletConnectIntentContext<'_>,
 ) -> WalletConnectIntentView<'a> {
-    let method = request.parsed.method();
     let selected_account = request.item.account;
     let mut amount = WalletConnectAmount::None;
     let mut icon = None;
@@ -419,16 +425,36 @@ pub(super) fn build_walletconnect_intent<'a>(
             ));
         }
         WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
-            action = WalletConnectIntentAction::TypedDataSign;
             let summary = typed_data_summary(typed_data);
             hero_summary = WalletConnectHeroSummary::TypedData(summary);
-            parties.push(party_for(
-                WalletConnectPartyRole::Signer,
-                selected_account,
-                selected_account,
-                context.public_accounts,
-                context.public_address_book,
-            ));
+            if let Some(permit) = parse_eip2612_permit(typed_data, selected_account) {
+                action = WalletConnectIntentAction::Approve;
+                let (resolved_amount, resolved_icon) =
+                    resolve_token_amount(context, Some(permit.token), permit.value, true);
+                amount = resolved_amount;
+                icon = resolved_icon;
+                parties.push(party_for(
+                    WalletConnectPartyRole::Spender,
+                    permit.spender,
+                    selected_account,
+                    context.public_accounts,
+                    context.public_address_book,
+                ));
+                if permit.value == U256::MAX {
+                    risks.push(WalletConnectRisk::UnlimitedAllowance {
+                        spender: permit.spender,
+                    });
+                }
+            } else {
+                action = WalletConnectIntentAction::TypedDataSign;
+                parties.push(party_for(
+                    WalletConnectPartyRole::Signer,
+                    selected_account,
+                    selected_account,
+                    context.public_accounts,
+                    context.public_address_book,
+                ));
+            }
         }
         WalletConnectParsedRequest::EthSendTransaction { transaction: tx } => {
             let decoded = request.item.decoded_transaction.as_ref();
@@ -462,14 +488,7 @@ pub(super) fn build_walletconnect_intent<'a>(
         approval_effect: walletconnect_approval_effect(action, &amount),
     };
     let usd_context = amount.usd().map(ToOwned::to_owned);
-    let authorization = authorization_projection(
-        method,
-        action,
-        &hero,
-        &amount,
-        attached_native.as_ref(),
-        &risks,
-    );
+    let authorization = authorization_projection(action, &hero, &amount);
     WalletConnectIntentView {
         action,
         hero,
@@ -1191,25 +1210,110 @@ fn typed_data_summary(value: &Value) -> WalletConnectTypedDataSummary {
     }
 }
 
+fn parse_eip2612_permit(
+    value: &Value,
+    selected_account: Address,
+) -> Option<WalletConnectEip2612Permit> {
+    if value.get("primaryType")?.as_str()? != "Permit" {
+        return None;
+    }
+    let fields = value.get("types")?.get("Permit")?.as_array()?;
+    let expected_fields = [
+        ("owner", "address"),
+        ("spender", "address"),
+        ("value", "uint256"),
+        ("nonce", "uint256"),
+        ("deadline", "uint256"),
+    ];
+    if fields.len() != expected_fields.len()
+        || !fields.iter().zip(expected_fields).all(|(field, expected)| {
+            let Some(field) = field.as_object() else {
+                return false;
+            };
+            field.len() == 2
+                && field.get("name").and_then(Value::as_str) == Some(expected.0)
+                && field.get("type").and_then(Value::as_str) == Some(expected.1)
+        })
+    {
+        return None;
+    }
+
+    let domain = value.get("domain")?.as_object()?;
+    let token = domain
+        .get("verifyingContract")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Address>().ok())?;
+    let message = value.get("message")?.as_object()?;
+    if message.len() != expected_fields.len() {
+        return None;
+    }
+    let owner = message
+        .get("owner")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Address>().ok())?;
+    if owner != selected_account {
+        return None;
+    }
+    let spender = message
+        .get("spender")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Address>().ok())?;
+    let value = parse_permit_u256(message.get("value")?)?;
+    parse_permit_u256(message.get("nonce")?)?;
+    parse_permit_u256(message.get("deadline")?)?;
+    Some(WalletConnectEip2612Permit {
+        token,
+        spender,
+        value,
+    })
+}
+
+fn parse_permit_u256(value: &Value) -> Option<U256> {
+    if let Some(value) = value.as_u64() {
+        return Some(U256::from(value));
+    }
+    let value = value.as_str()?;
+    if let Some(value) = value.strip_prefix("0x") {
+        U256::from_str_radix(value, 16).ok()
+    } else {
+        U256::from_str_radix(value, 10).ok()
+    }
+}
+
 fn selector_label(selector: Option<[u8; 4]>) -> Option<String> {
     selector.map(|selector| format!("0x{}", alloy::hex::encode(selector)))
 }
 
+pub(super) const fn walletconnect_party_role_label(role: WalletConnectPartyRole) -> &'static str {
+    match role {
+        WalletConnectPartyRole::Sender => "From",
+        WalletConnectPartyRole::Recipient => "To",
+        WalletConnectPartyRole::Spender => "Spender",
+        WalletConnectPartyRole::Source => "Source",
+        WalletConnectPartyRole::Caller => "Caller",
+        WalletConnectPartyRole::Contract => "Contract",
+        WalletConnectPartyRole::Creator => "Creator",
+        WalletConnectPartyRole::Signer => "Signer",
+        WalletConnectPartyRole::WrappedNativeContract => "Wrapped-native contract",
+    }
+}
+
 fn authorization_projection(
-    method: WalletConnectSupportedMethod,
     action: WalletConnectIntentAction,
     hero: &WalletConnectHero,
     amount: &WalletConnectAmount,
-    attached_native: Option<&WalletConnectNativeAmount>,
-    risks: &[WalletConnectRisk],
 ) -> String {
-    let mut parts = vec![format!("{} ({})", action.verb(), method.as_str())];
-    if let Some(amount) = amount.authorization_label() {
-        parts.push(amount);
+    let mut projection = action.verb().to_owned();
+    if let Some(amount_label) = amount.authorization_label() {
+        if action == WalletConnectIntentAction::Approve
+            && !matches!(amount, WalletConnectAmount::Unlimited { .. })
+        {
+            projection.push_str(" up to");
+        }
+        projection.push(' ');
+        projection.push_str(&amount_label);
     }
-    if let Some(approval_effect) = hero.approval_effect.as_deref() {
-        parts.push(approval_effect.to_owned());
-    }
+    let mut parts = vec![projection];
     match &hero.summary {
         WalletConnectHeroSummary::PersonalMessage(summary) => {
             parts.push(summary.preview.as_ref().map_or_else(
@@ -1217,38 +1321,11 @@ fn authorization_projection(
                 |preview| format!("Personal message: {preview:?}"),
             ));
         }
-        WalletConnectHeroSummary::TypedData(summary) => parts.push(format!(
-            "Typed data: {} / {}",
-            summary
-                .domain_name
-                .as_deref()
-                .unwrap_or("No domain name supplied"),
-            summary.primary_type
-        )),
-        WalletConnectHeroSummary::UndecodedCall { selector } => {
-            parts.push(format!(
-                "Undecoded contract call{}",
-                selector_label(*selector)
-                    .map_or_else(String::new, |selector| format!(" ({selector})"))
-            ));
-        }
-        WalletConnectHeroSummary::Amount | WalletConnectHeroSummary::None => {}
+        WalletConnectHeroSummary::TypedData(_)
+        | WalletConnectHeroSummary::Amount
+        | WalletConnectHeroSummary::UndecodedCall { .. }
+        | WalletConnectHeroSummary::None => {}
     }
-    if let Some(attached_native) = attached_native
-        && !matches!(
-            &hero.summary,
-            WalletConnectHeroSummary::UndecodedCall { .. }
-        )
-        && !risks
-            .iter()
-            .any(|risk| matches!(risk, WalletConnectRisk::AttachedNativeValue(_)))
-    {
-        parts.push(format!(
-            "Attached native value: {}",
-            attached_native.display
-        ));
-    }
-    parts.extend(risks.iter().map(WalletConnectRisk::authorization_label));
     parts.join("; ")
 }
 
@@ -1312,12 +1389,6 @@ mod tests {
         assert_eq!(intent.parties.len(), 1);
         assert_eq!(intent.parties[0].role, WalletConnectPartyRole::Spender);
         assert!(!walletconnect_should_render_token_contract(intent.action));
-        let effect = intent
-            .hero
-            .approval_effect
-            .as_ref()
-            .expect("approval effect");
-        assert!(effect.contains("across one or more transactions"));
         let summary =
             super::super::requests::walletconnect_request_authorization_summary(&request, &intent);
         let authorization = summary
@@ -1326,7 +1397,51 @@ mod tests {
             .find(|(label, _)| label == "Intent")
             .expect("intent authorization row")
             .1;
-        assert!(authorization.contains(effect));
+        assert!(authorization.starts_with("Allow spending up to "));
+        assert!(authorization.contains("USDC"));
+        assert!(
+            summary
+                .rows_for_test()
+                .contains(&("Spender".to_owned(), spender.to_checksum(None),))
+        );
+        assert!(
+            !authorization.contains("Spender can withdraw up to"),
+            "approval effect should remain on the review card, not the final summary"
+        );
+    }
+
+    #[test]
+    fn authorization_summary_promotes_walletconnect_risks_to_warnings() {
+        let account = Address::from([0x11; 20]);
+        let token = Address::from([0x22; 20]);
+        let spender = Address::from([0x33; 20]);
+        let chain = chain(None);
+        let registry = registry(token);
+        let rates = TokenAnchorRateCache::new();
+        let request = request_with(
+            WalletConnectParsedRequest::EthSendTransaction {
+                transaction: transaction(account, Some(token), U256::ZERO),
+            },
+            Some(WalletConnectDecodedTransaction {
+                target: Some(token),
+                native_value: U256::ZERO,
+                kind: WalletConnectDecodedCallKind::Erc20Approve {
+                    spender,
+                    amount: U256::MAX,
+                },
+            }),
+        );
+        let intent =
+            build_walletconnect_intent(&request, context(&chain, &registry, &rates, &[], &[]));
+        let summary =
+            super::super::requests::walletconnect_request_authorization_summary(&request, &intent);
+
+        assert!(
+            summary
+                .warnings_for_test()
+                .iter()
+                .any(|warning| warning.starts_with("Unlimited allowance:"))
+        );
     }
 
     #[test]
@@ -1391,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn authorization_summary_reuses_projected_site_and_dapp_name() {
+    fn authorization_summary_merges_projected_site_and_dapp_name() {
         let account = Address::from([0x11; 20]);
         let chain = chain(None);
         let registry = EffectiveTokenRegistry {
@@ -1399,9 +1514,10 @@ mod tests {
         };
         let rates = TokenAnchorRateCache::new();
         let request = request_with(
-            WalletConnectParsedRequest::PersonalSign {
-                message: "hello".to_owned(),
+            WalletConnectParsedRequest::EthSignTypedDataV4 {
                 account,
+                typed_data: serde_json::json!({}),
+                domain_chain_id: Some(U256::from(1)),
             },
             None,
         );
@@ -1410,13 +1526,20 @@ mod tests {
         let summary =
             super::super::requests::walletconnect_request_authorization_summary(&request, &intent);
         let rows = summary.rows_for_test();
-        assert!(rows.contains(&("Site".to_owned(), "app.aave.com".to_owned())));
-        assert!(rows.contains(&("Dapp".to_owned(), "Aave".to_owned())));
+        assert!(rows.contains(&("Requested by".to_owned(), "app.aave.com (Aave)".to_owned())));
+        assert!(!rows.iter().any(|(label, _)| label == "Site"));
+        assert!(!rows.iter().any(|(label, _)| label == "Dapp"));
+        assert!(
+            !rows
+                .iter()
+                .any(|(label, _)| label == "Maximum network cost")
+        );
     }
 
     #[test]
     fn walletconnect_authorization_summary_includes_reviewed_maximum_cost() {
         let account = Address::from([0x11; 20]);
+        let target = Address::from([0x22; 20]);
         let chain = chain(None);
         let registry = EffectiveTokenRegistry {
             tokens: BTreeMap::new(),
@@ -1424,10 +1547,10 @@ mod tests {
         let rates = TokenAnchorRateCache::new();
         let request = request_with(
             WalletConnectParsedRequest::EthSendTransaction {
-                transaction: transaction(account, Some(Address::from([0x22; 20])), U256::from(1)),
+                transaction: transaction(account, Some(target), U256::from(1)),
             },
             Some(WalletConnectDecodedTransaction {
-                target: Some(Address::from([0x22; 20])),
+                target: Some(target),
                 native_value: U256::from(1),
                 kind: WalletConnectDecodedCallKind::NativeTransfer,
             }),
@@ -1440,13 +1563,16 @@ mod tests {
         );
         reviewed.maximum_gas_cost = Some(U256::from(123_456_u64));
         let rows = super::super::requests::walletconnect_request_authorization_summary_with_fee(
-            &request, &intent, &reviewed,
+            &request,
+            &intent,
+            Some(&reviewed),
         )
         .rows_for_test();
         assert!(
             rows.iter()
                 .any(|(label, value)| label == "Maximum network cost" && !value.is_empty())
         );
+        assert!(rows.contains(&("To".to_owned(), target.to_checksum(None))));
     }
 
     #[test]
@@ -1879,8 +2005,16 @@ mod tests {
             intent.hero.summary,
             WalletConnectHeroSummary::UndecodedCall { .. }
         ));
+        assert_eq!(intent.authorization, "Contract call");
         assert!(intent.attached_native.is_some());
         assert!(intent.icon.is_some());
+        let summary =
+            super::super::requests::walletconnect_request_authorization_summary(&request, &intent);
+        let rows = summary.rows_for_test();
+        assert!(rows.contains(&("Contract".to_owned(), target.to_checksum(None))));
+        assert!(summary.warnings_for_test().iter().any(|warning| {
+            warning.contains("Undecoded contract call") && warning.contains("0xaabbccdd")
+        }));
     }
 
     #[test]
@@ -1918,6 +2052,135 @@ mod tests {
         let missing = typed_data_summary(&json!({"domain": {}, "primaryType": "Message"}));
         assert_eq!(missing.domain_name, None);
         assert_eq!(missing.primary_type, "Message");
+    }
+
+    fn permit_typed_data(token: Address, owner: Address, spender: Address, value: Value) -> Value {
+        json!({
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"}
+                ],
+                "Permit": [
+                    {"name": "owner", "type": "address"},
+                    {"name": "spender", "type": "address"},
+                    {"name": "value", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"}
+                ]
+            },
+            "primaryType": "Permit",
+            "domain": {
+                "name": "USD Coin",
+                "version": "2",
+                "chainId": 1,
+                "verifyingContract": token.to_string()
+            },
+            "message": {
+                "owner": owner.to_string(),
+                "spender": spender.to_string(),
+                "value": value,
+                "nonce": 0,
+                "deadline": "0x64"
+            }
+        })
+    }
+
+    #[test]
+    fn canonical_eip2612_permit_projects_as_a_typed_approval() {
+        let account = Address::from([0x11; 20]);
+        let token = Address::from([0x22; 20]);
+        let spender = Address::from([0x33; 20]);
+        let chain = chain(None);
+        let registry = registry(token);
+        let rates = TokenAnchorRateCache::new();
+        let request = request_with(
+            WalletConnectParsedRequest::EthSignTypedDataV4 {
+                account,
+                typed_data: permit_typed_data(token, account, spender, json!("1000000")),
+                domain_chain_id: Some(U256::from(1)),
+            },
+            None,
+        );
+        let intent =
+            build_walletconnect_intent(&request, context(&chain, &registry, &rates, &[], &[]));
+
+        assert_eq!(intent.action, WalletConnectIntentAction::Approve);
+        assert!(matches!(
+            &intent.amount,
+            WalletConnectAmount::KnownToken {
+                raw,
+                decimals: 6,
+                symbol,
+                ..
+            } if *raw == U256::from(1_000_000_u64) && symbol == "USDC"
+        ));
+        assert!(matches!(
+            &intent.hero.summary,
+            WalletConnectHeroSummary::TypedData(summary)
+                if summary.domain_name.as_deref() == Some("USD Coin")
+                    && summary.primary_type == "Permit"
+        ));
+        assert!(matches!(
+            intent.parties.as_slice(),
+            [WalletConnectParty {
+                role: WalletConnectPartyRole::Spender,
+                address,
+                ..
+            }] if *address == spender
+        ));
+        assert!(intent.authorization.contains("1 USDC"));
+        assert!(!intent.authorization.contains("Spender can withdraw up to"));
+        let summary =
+            super::super::requests::walletconnect_request_authorization_summary(&request, &intent);
+        assert!(
+            summary
+                .rows_for_test()
+                .contains(&("Typed data".to_owned(), "USD Coin / Permit".to_owned()))
+        );
+    }
+
+    #[test]
+    fn noncanonical_or_foreign_permit_keeps_generic_typed_data_behavior() {
+        let account = Address::from([0x11; 20]);
+        let token = Address::from([0x22; 20]);
+        let spender = Address::from([0x33; 20]);
+        let foreign_owner = Address::from([0x44; 20]);
+        let chain = chain(None);
+        let registry = registry(token);
+        let rates = TokenAnchorRateCache::new();
+        let request = request_with(
+            WalletConnectParsedRequest::EthSignTypedDataV4 {
+                account,
+                typed_data: permit_typed_data(
+                    token,
+                    foreign_owner,
+                    spender,
+                    json!(U256::MAX.to_string()),
+                ),
+                domain_chain_id: Some(U256::from(1)),
+            },
+            None,
+        );
+        let intent =
+            build_walletconnect_intent(&request, context(&chain, &registry, &rates, &[], &[]));
+
+        assert_eq!(intent.action, WalletConnectIntentAction::TypedDataSign);
+        assert!(matches!(
+            intent.hero.summary,
+            WalletConnectHeroSummary::TypedData(_)
+        ));
+        assert!(matches!(
+            intent.parties.as_slice(),
+            [WalletConnectParty {
+                role: WalletConnectPartyRole::Signer,
+                address,
+                ..
+            }] if *address == account
+        ));
+        assert!(intent.risks.is_empty());
     }
 
     #[test]

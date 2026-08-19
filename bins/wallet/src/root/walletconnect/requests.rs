@@ -4,7 +4,11 @@ use super::{
         current_unix_seconds, parse_caip2_chain_id, walletconnect_await_before_request_expiry,
         walletconnect_pending_request_expired,
     },
-    intent::{WalletConnectIntentView, walletconnect_selected_account_provenance_visible},
+    intent::{
+        WalletConnectHeroSummary, WalletConnectIntentAction, WalletConnectIntentView,
+        WalletConnectPartyRole, WalletConnectRisk, walletconnect_party_role_label,
+        walletconnect_selected_account_provenance_visible,
+    },
     relay::{publish_walletconnect_session_response, publish_walletconnect_session_response_ref},
     render::chain_label_for_caip2,
     *,
@@ -23,7 +27,7 @@ pub(super) async fn approve_walletconnect_request_task(
     context: WalletConnectClientContext,
     http: HttpContext,
     hash_fallback_confirmed: bool,
-    reviewed_fee: super::fee::WalletConnectReviewedFeeProjection,
+    reviewed_fee: Option<super::fee::WalletConnectReviewedFeeProjection>,
     event_tx: Option<PublicActionSessionEventSender>,
 ) -> Result<WalletConnectRequestApprovalOutcome, String> {
     let expiry_timestamp = request.item.expiry_timestamp;
@@ -64,6 +68,14 @@ pub(super) async fn approve_walletconnect_request_task(
                 .map(Value::String)
             }
             WalletConnectParsedRequest::EthSendTransaction { transaction } => {
+                let Some(reviewed_fee) = reviewed_fee.as_ref() else {
+                    return (
+                        Err(eyre::eyre!(
+                            "WalletConnect transaction approval is missing current fee review."
+                        )),
+                        submitted_tx_hash,
+                    );
+                };
                 let Some(chain_id) = parse_caip2_chain_id(&request.item.chain_id) else {
                     return (
                         Err(eyre::eyre!("WalletConnect request chain is not EIP-155")),
@@ -443,23 +455,19 @@ pub(super) fn walletconnect_request_authorization_summary(
     request: &WalletConnectRequestUi,
     intent: &WalletConnectIntentView<'_>,
 ) -> SpendAuthorizationSummary {
-    let reviewed_fee =
-        WalletConnectReviewedFeeProjection::unresolved(request.key.as_str(), request.review_token);
-    walletconnect_request_authorization_summary_with_fee(request, intent, &reviewed_fee)
+    walletconnect_request_authorization_summary_with_fee(request, intent, None)
 }
 
 pub(super) fn walletconnect_request_authorization_summary_with_fee(
     request: &WalletConnectRequestUi,
     intent: &WalletConnectIntentView<'_>,
-    reviewed_fee: &WalletConnectReviewedFeeProjection,
+    reviewed_fee: Option<&WalletConnectReviewedFeeProjection>,
 ) -> SpendAuthorizationSummary {
-    let mut rows = vec![SpendAuthorizationSummaryRow::new(
-        "Site",
-        intent.provenance.site.clone(),
-    )];
-    if let Some(name) = intent.provenance.dapp_name.as_ref() {
-        rows.push(SpendAuthorizationSummaryRow::new("Dapp", name.clone()));
-    }
+    let requester = intent.provenance.dapp_name.as_ref().map_or_else(
+        || intent.provenance.site.clone(),
+        |name| format!("{} ({name})", intent.provenance.site),
+    );
+    let mut rows = vec![SpendAuthorizationSummaryRow::new("Requested by", requester)];
     rows.push(SpendAuthorizationSummaryRow::new(
         "Method",
         request.item.method.as_str().to_owned(),
@@ -469,37 +477,78 @@ pub(super) fn walletconnect_request_authorization_summary_with_fee(
         chain_label_for_caip2(&request.item.chain_id),
     ));
     if walletconnect_selected_account_provenance_visible(request.item.account, &intent.parties) {
-        rows.push(SpendAuthorizationSummaryRow::new(
-            "Public account",
-            request.item.account.to_string(),
-        ));
+        rows.push(
+            SpendAuthorizationSummaryRow::new("Account", request.item.account.to_string())
+                .with_shortened_copyable(),
+        );
     }
     rows.push(
         SpendAuthorizationSummaryRow::new("Intent", intent.authorization.clone())
             .with_icon(intent.icon.clone()),
     );
+    if let WalletConnectHeroSummary::TypedData(summary) = &intent.hero.summary {
+        rows.push(SpendAuthorizationSummaryRow::new(
+            "Typed data",
+            format!(
+                "{} / {}",
+                summary
+                    .domain_name
+                    .as_deref()
+                    .unwrap_or("No domain name supplied"),
+                summary.primary_type
+            ),
+        ));
+    }
+    for party in intent.parties.iter().filter(|party| {
+        matches!(
+            party.role,
+            WalletConnectPartyRole::Contract
+                | WalletConnectPartyRole::Recipient
+                | WalletConnectPartyRole::Spender
+        )
+    }) {
+        rows.push(
+            SpendAuthorizationSummaryRow::new(
+                walletconnect_party_role_label(party.role),
+                party.address.to_checksum(None),
+            )
+            .with_shortened_copyable(),
+        );
+    }
     if let (Some(chain_id), Some(maximum)) = (
         parse_caip2_chain_id(&request.item.chain_id),
-        reviewed_fee.maximum_gas_cost,
+        reviewed_fee.and_then(|reviewed_fee| reviewed_fee.maximum_gas_cost),
     ) {
         rows.push(SpendAuthorizationSummaryRow::new(
             "Maximum network cost",
             format_native_token_amount_for_display(chain_id, maximum),
         ));
     }
-    let requester = intent.provenance.dapp_name.as_ref().map_or_else(
-        || intent.provenance.site.clone(),
-        |name| format!("{} ({name})", intent.provenance.site),
-    );
+    let mut warnings: Vec<Arc<str>> = intent
+        .risks
+        .iter()
+        .map(|risk| Arc::from(risk.authorization_label()))
+        .collect();
+    if let Some(attached_native) = intent.attached_native.as_ref()
+        && !intent
+            .risks
+            .iter()
+            .any(|risk| matches!(risk, WalletConnectRisk::AttachedNativeValue(_)))
+        && !matches!(
+            intent.action,
+            WalletConnectIntentAction::NativeTransfer | WalletConnectIntentAction::Wrap
+        )
+    {
+        warnings.push(Arc::from(
+            WalletConnectRisk::AttachedNativeValue(attached_native.clone()).authorization_label(),
+        ));
+    }
     SpendAuthorizationSummary::new(
         "Authorize WalletConnect request",
-        format!(
-            "Authorize this one {} request from {}. The dapp will not receive a signature or transaction response until you continue.",
-            request.item.method.as_str(),
-            requester,
-        ),
+        "Enter your vault password to authorize this request.",
         rows,
     )
+    .with_warnings(warnings)
     .requiring_explicit_review()
 }
 

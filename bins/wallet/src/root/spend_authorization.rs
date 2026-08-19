@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, AppContext, Axis, ClickEvent, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
@@ -46,7 +46,7 @@ use super::vault::hardware_device_label;
 use super::walletconnect::WalletConnectReviewedFeeProjection;
 use super::{
     WalletRoot, dialog_content_max_height, dialog_max_height, new_masked_input,
-    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+    scrollable_dialog_content, secondary_dialog_content_width,
 };
 
 const SPEND_AUTHORIZATION_DIALOG_WIDTH: gpui::Pixels = px(560.0);
@@ -166,7 +166,7 @@ pub(super) enum SpendAuthorizationIntent {
     WalletConnectRequest {
         request_key: String,
         review_token: u64,
-        reviewed_fee: WalletConnectReviewedFeeProjection,
+        reviewed_fee: Option<WalletConnectReviewedFeeProjection>,
     },
 }
 
@@ -332,6 +332,7 @@ pub(super) struct SpendAuthorizationSummaryRow {
     label: Arc<str>,
     value: Arc<str>,
     icon_path: Option<WalletIconSource>,
+    shortened_copyable: bool,
 }
 
 impl SpendAuthorizationSummaryRow {
@@ -340,11 +341,17 @@ impl SpendAuthorizationSummaryRow {
             label: label.into(),
             value: value.into(),
             icon_path: None,
+            shortened_copyable: false,
         }
     }
 
     pub(super) fn with_icon(mut self, icon_path: Option<WalletIconSource>) -> Self {
         self.icon_path = icon_path;
+        self
+    }
+
+    pub(super) const fn with_shortened_copyable(mut self) -> Self {
+        self.shortened_copyable = true;
         self
     }
 
@@ -543,7 +550,7 @@ impl SpendAuthorizationDialogContent {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let password_input = new_masked_input(window, cx, "vault password");
+        let password_input = new_masked_input(window, cx, "Vault password");
         cx.subscribe_in(
             &password_input,
             window,
@@ -619,7 +626,6 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             .flex()
             .flex_col()
             .gap_3()
-            .child(app_strong_text(self.summary.title.to_string()))
             .child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
             .child(render_spend_authorization_summary(&self.summary))
             .children(
@@ -820,7 +826,13 @@ fn render_spend_authorization_summary(summary: &SpendAuthorizationSummary) -> De
         .large()
         .bordered(false)
         .columns(1)
-        .children(summary.rows.iter().map(spend_authorization_summary_item))
+        .children(
+            summary
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(row_index, row)| spend_authorization_summary_item(row_index, row)),
+        )
 }
 
 fn render_spend_authorization_payload(
@@ -880,31 +892,40 @@ fn render_spend_authorization_payload(
         )
 }
 
-fn spend_authorization_summary_item(row: &SpendAuthorizationSummaryRow) -> DescriptionItem {
-    DescriptionItem::new(row.label.to_string()).value(spend_authorization_summary_value(row))
+fn spend_authorization_summary_item(
+    row_index: usize,
+    row: &SpendAuthorizationSummaryRow,
+) -> DescriptionItem {
+    DescriptionItem::new(row.label.to_string())
+        .value(spend_authorization_summary_value(row_index, row))
 }
 
-fn spend_authorization_summary_value(row: &SpendAuthorizationSummaryRow) -> AnyElement {
+fn spend_authorization_summary_value(
+    row_index: usize,
+    row: &SpendAuthorizationSummaryRow,
+) -> AnyElement {
     if let Some(icon_path) = row.icon_path.clone() {
-        return token_label_row(
-            SharedString::from(row.value.to_string()),
-            Some(icon_path),
-            px(20.0),
-        )
-        .w_full()
-        .min_w(px(0.0))
-        .py(px(2.0))
-        .text_color(rgb(theme::TEXT))
-        .into_any_element();
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .gap_1()
+            .py(px(2.0))
+            .text_color(rgb(theme::TEXT))
+            .child(img(icon_path).size(px(20.0)).rounded_full().flex_none())
+            .child(
+                app_text(row.value.to_string())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .whitespace_normal(),
+            )
+            .into_any_element();
     }
 
-    if row.label.as_ref() == "Recipient" {
-        let copyable = row.value.as_ref() != "Selected private wallet";
-        let display_value = if copyable {
-            spend_authorization_recipient_display(row.value.as_ref())
-        } else {
-            row.value.to_string()
-        };
+    if row.shortened_copyable {
+        let display_value = spend_authorization_recipient_display(row.value.as_ref());
+        let copy_tooltip = format!("Copy {}", row.label.to_ascii_lowercase());
         return div()
             .w_full()
             .flex()
@@ -913,25 +934,22 @@ fn spend_authorization_summary_value(row: &SpendAuthorizationSummaryRow) -> AnyE
             .py(px(2.0))
             .child(
                 app_text(display_value)
-                    .flex_1()
                     .min_w(px(0.0))
                     .line_height(px(17.0))
                     .text_color(rgb(theme::TEXT))
                     .font_family(APP_MONO_FONT_FAMILY)
                     .whitespace_normal(),
             )
-            .when(copyable, |this| {
-                this.child(
-                    div()
-                        .id("wallet-spend-auth-recipient-copy-action")
-                        .flex_none()
-                        .tooltip(|window, cx| Tooltip::new("Copy recipient").build(window, cx))
-                        .child(clipboard_with_toast(
-                            "wallet-spend-auth-recipient-copy",
-                            row.value.to_string(),
-                        )),
-                )
-            })
+            .child(
+                div()
+                    .id(("wallet-spend-auth-copy-action", row_index))
+                    .flex_none()
+                    .tooltip(move |window, cx| Tooltip::new(copy_tooltip.clone()).build(window, cx))
+                    .child(clipboard_with_toast(
+                        ("wallet-spend-auth-copy", row_index),
+                        row.value.to_string(),
+                    )),
+            )
             .into_any_element();
     }
 
@@ -1055,6 +1073,7 @@ impl WalletRoot {
     ) {
         let root = cx.entity();
         let initial_lifetime = self.spend_authorization_lifetime;
+        let dialog_title = summary.title.to_string();
         let content = cx.new(|cx| {
             SpendAuthorizationDialogContent::new(
                 root,
@@ -1075,7 +1094,7 @@ impl WalletRoot {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .title(app_strong_text("Authorize spend"))
+                .title(app_strong_text(dialog_title.clone()))
                 .child(scrollable_dialog_content(
                     content_max_height,
                     div().w(content_width).child(content.clone()),

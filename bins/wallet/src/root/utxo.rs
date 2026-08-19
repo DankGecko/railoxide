@@ -1786,7 +1786,8 @@ fn blocked_shield_refund_authorization_summary(
         vec![
             SpendAuthorizationSummaryRow::new("Amount", format!("{} {}", row.amount, row.token))
                 .with_icon(row.token_icon_path.clone()),
-            SpendAuthorizationSummaryRow::new("Recipient", origin_address.to_string()),
+            SpendAuthorizationSummaryRow::new("Recipient", origin_address.to_string())
+                .with_shortened_copyable(),
             SpendAuthorizationSummaryRow::new("Delivery", "Self-broadcast"),
             SpendAuthorizationSummaryRow::new("Source transaction", row.source_tx_hash.clone()),
             SpendAuthorizationSummaryRow::new("Origin gas payer", gas_payer),

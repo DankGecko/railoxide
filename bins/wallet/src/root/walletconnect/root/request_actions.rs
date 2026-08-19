@@ -1,8 +1,9 @@
 use super::super::account_select::public_account_walletconnect_label;
 use super::super::fee::{
-    WalletConnectFeeStatus, WalletConnectReviewedFeeProjection,
-    walletconnect_fee_retry_action_enabled, walletconnect_fee_retrying,
-    walletconnect_fee_state_projection, walletconnect_request_can_simulate,
+    WalletConnectFeeState, WalletConnectFeeStatus, WalletConnectReviewedFeeProjection,
+    validate_walletconnect_reviewed_fee_pairing, walletconnect_fee_retry_action_enabled,
+    walletconnect_fee_retrying, walletconnect_fee_state_projection,
+    walletconnect_request_can_simulate, walletconnect_request_fee_eligible,
     walletconnect_request_raw_gas,
 };
 use super::super::helpers::{
@@ -11,11 +12,12 @@ use super::super::helpers::{
     parse_caip2_chain_id, walletconnect_transaction_selector,
 };
 use super::super::intent::{
-    WalletConnectAmount, WalletConnectHeroSummary, WalletConnectIntentContext,
-    WalletConnectIntentView, WalletConnectParty, WalletConnectPartyRole, WalletConnectRisk,
-    build_walletconnect_intent, classify_walletconnect_fee_significance,
-    walletconnect_approximate_usd_label, walletconnect_moving_usd_micro_value,
-    walletconnect_party_address_label, walletconnect_party_badge_label,
+    WalletConnectAmount, WalletConnectHeroSummary, WalletConnectIntentAction,
+    WalletConnectIntentContext, WalletConnectIntentView, WalletConnectParty,
+    WalletConnectPartyRole, WalletConnectRisk, build_walletconnect_intent,
+    classify_walletconnect_fee_significance, walletconnect_approximate_usd_label,
+    walletconnect_moving_usd_micro_value, walletconnect_party_address_label,
+    walletconnect_party_badge_label, walletconnect_party_role_label,
     walletconnect_selected_account_provenance_visible, walletconnect_should_render_token_contract,
     walletconnect_simulation_risk, walletconnect_token_contract_recognition,
 };
@@ -80,21 +82,13 @@ impl WalletRoot {
             }
         };
         let public_accounts = intent_context.public_accounts;
-        let mut intent = build_walletconnect_intent(request, intent_context);
-        if let Some(state) = self
-            .walletconnect
-            .walletconnect_fee_state
-            .as_ref()
-            .filter(|state| state.request_key.as_ref() == request.key)
-            && let Some(risk) = walletconnect_simulation_risk(&state.status, state.error.as_deref())
-        {
-            intent.risks.push(risk);
-        }
         let fee_state = self
             .walletconnect
             .walletconnect_fee_state
             .as_ref()
             .filter(|state| state.request_key.as_ref() == request.key);
+        let mut intent = build_walletconnect_intent(request, intent_context);
+        append_walletconnect_simulation_risk(request.key.as_ref(), fee_state, &mut intent.risks);
         let fee_significance = fee_state
             .and_then(|state| {
                 walletconnect_fee_state_projection(
@@ -142,15 +136,20 @@ impl WalletRoot {
                 &intent,
                 public_accounts,
             ))
-            .child(render_walletconnect_network_fee(
-                root,
-                request,
-                fee_state,
-                self.walletconnect.walletconnect_gas_fee.refreshing,
-                disclosure_state.network_fee_open,
-                &self.walletconnect.walletconnect_gas_fee,
-                fee_significance,
-            ))
+            .when(
+                walletconnect_request_fee_eligible(&request.parsed),
+                |this| {
+                    this.child(render_walletconnect_network_fee(
+                        root,
+                        request,
+                        fee_state,
+                        self.walletconnect.walletconnect_gas_fee.refreshing,
+                        disclosure_state.network_fee_open,
+                        &self.walletconnect.walletconnect_gas_fee,
+                        fee_significance,
+                    ))
+                },
+            )
             .when_some(intent.transaction.as_ref(), |this, transaction| {
                 this.child(render_walletconnect_request_disclosure(
                     root,
@@ -376,13 +375,17 @@ impl WalletRoot {
             cx.notify();
             return;
         }
-        let reviewed_fee = match self.capture_walletconnect_reviewed_fee(&request, cx) {
-            Ok(reviewed_fee) => reviewed_fee,
-            Err(error) => {
-                self.walletconnect.error = Some(Arc::from(error));
-                cx.notify();
-                return;
+        let reviewed_fee = if walletconnect_request_fee_eligible(&request.parsed) {
+            match self.capture_walletconnect_reviewed_fee(&request, cx) {
+                Ok(reviewed_fee) => Some(reviewed_fee),
+                Err(error) => {
+                    self.walletconnect.error = Some(Arc::from(error));
+                    cx.notify();
+                    return;
+                }
             }
+        } else {
+            None
         };
         tracing::info!(
             target: "wallet::root::walletconnect",
@@ -418,11 +421,16 @@ impl WalletRoot {
                         return;
                     }
                 };
-                let intent = build_walletconnect_intent(&request, context);
+                let mut intent = build_walletconnect_intent(&request, context);
+                append_walletconnect_simulation_risk(
+                    request.key.as_ref(),
+                    self.walletconnect.walletconnect_fee_state.as_ref(),
+                    &mut intent.risks,
+                );
                 walletconnect_request_authorization_summary_with_fee(
                     &request,
                     &intent,
-                    &reviewed_fee,
+                    reviewed_fee.as_ref(),
                 )
             };
             self.request_spend_authorization(intent, summary, window, cx);
@@ -434,7 +442,7 @@ impl WalletRoot {
         &mut self,
         request_key: &str,
         review_token: u64,
-        reviewed_fee: WalletConnectReviewedFeeProjection,
+        reviewed_fee: Option<WalletConnectReviewedFeeProjection>,
         vault_password: Zeroizing<String>,
         protected_software_seed_session: Option<
             Arc<wallet_ops::vault::ProtectedSoftwareSeedSession>,
@@ -460,7 +468,18 @@ impl WalletRoot {
             cx.notify();
             return;
         }
-        if let Err(error) = self.validate_walletconnect_reviewed_fee(&request, &reviewed_fee, cx) {
+        if let Err(error) =
+            validate_walletconnect_reviewed_fee_pairing(&request.parsed, reviewed_fee.as_ref())
+        {
+            self.walletconnect.error = Some(Arc::from(error));
+            self.clear_spend_authorization(cx);
+            cx.notify();
+            return;
+        }
+        if walletconnect_request_fee_eligible(&request.parsed)
+            && let Some(reviewed_fee) = reviewed_fee.as_ref()
+            && let Err(error) = self.validate_walletconnect_reviewed_fee(&request, reviewed_fee, cx)
+        {
             self.walletconnect.error = Some(Arc::from(error));
             self.clear_spend_authorization(cx);
             cx.notify();
@@ -1056,6 +1075,18 @@ impl WalletRoot {
     }
 }
 
+fn append_walletconnect_simulation_risk(
+    request_key: &str,
+    fee_state: Option<&WalletConnectFeeState>,
+    risks: &mut Vec<WalletConnectRisk>,
+) {
+    if let Some(state) = fee_state.filter(|state| state.request_key.as_ref() == request_key)
+        && let Some(risk) = walletconnect_simulation_risk(&state.status, state.error.as_deref())
+    {
+        risks.push(risk);
+    }
+}
+
 fn render_walletconnect_intent_risk(
     request_key: &str,
     risk_index: usize,
@@ -1228,6 +1259,18 @@ fn render_walletconnect_intent_hero(intent: &WalletConnectIntentView<'_>) -> Opt
             )));
         }
         WalletConnectHeroSummary::TypedData(summary) => {
+            if matches!(intent.action, WalletConnectIntentAction::Approve) {
+                let (label, danger) = walletconnect_intent_amount_label(&intent.amount);
+                body = body.child(
+                    app_strong_text(label)
+                        .text_size(px(22.0))
+                        .text_color(rgb(if danger { theme::DANGER } else { theme::TEXT }))
+                        .whitespace_normal(),
+                );
+                if let Some(context) = intent.usd_context.as_deref() {
+                    body = body.child(app_muted_text(walletconnect_approximate_usd_label(context)));
+                }
+            }
             body = body.child(app_strong_text(
                 summary
                     .domain_name
@@ -1346,20 +1389,6 @@ fn render_walletconnect_address_row(
         .items_start()
         .gap_2()
         .child(body)
-}
-
-const fn walletconnect_party_role_label(role: WalletConnectPartyRole) -> &'static str {
-    match role {
-        WalletConnectPartyRole::Sender => "From",
-        WalletConnectPartyRole::Recipient => "To",
-        WalletConnectPartyRole::Spender => "Spender",
-        WalletConnectPartyRole::Source => "Source",
-        WalletConnectPartyRole::Caller => "Caller",
-        WalletConnectPartyRole::Contract => "Contract",
-        WalletConnectPartyRole::Creator => "Creator",
-        WalletConnectPartyRole::Signer => "Signer",
-        WalletConnectPartyRole::WrappedNativeContract => "Wrapped-native contract",
-    }
 }
 
 fn walletconnect_party_badge_chip(label: &str) -> gpui::Div {
@@ -1985,6 +2014,31 @@ fn walletconnect_calldata_context(transaction: &WalletConnectEvmTransaction) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::B256;
+    use std::sync::Arc;
+
+    fn fee_state(
+        request_key: &str,
+        status: WalletConnectFeeStatus,
+        error: Option<&str>,
+    ) -> WalletConnectFeeState {
+        WalletConnectFeeState {
+            request_key: Arc::from(request_key),
+            review_token: 0,
+            payload_fingerprint: B256::ZERO,
+            request_generation: 0,
+            dialog_generation: 0,
+            editor_generation: 0,
+            expiry_timestamp: None,
+            status,
+            error: error.map(Arc::from),
+            retry_attempt: 0,
+            generation: 0,
+            simulation_requested: false,
+            simulation_retryable: false,
+            last_successful_display_projection: None,
+        }
+    }
 
     #[test]
     fn dapp_gas_price_formats_safe_values_as_gwei_without_truncating_large_values() {
@@ -2020,5 +2074,40 @@ mod tests {
         assert!(!state.reject_enabled);
         assert!(!state.approve_enabled);
         assert!(!state.approve_danger);
+    }
+
+    #[test]
+    fn request_scoped_fee_risk_enrichment_adds_revert_but_not_unavailable() {
+        let revert = fee_state(
+            "request-key",
+            WalletConnectFeeStatus::WouldRevert,
+            Some("execution reverted"),
+        );
+        let mut risks = Vec::new();
+        append_walletconnect_simulation_risk("request-key", Some(&revert), &mut risks);
+        assert_eq!(
+            risks,
+            vec![WalletConnectRisk::WouldRevert {
+                reason: "execution reverted".to_owned(),
+            }]
+        );
+
+        let other_request = fee_state(
+            "other-request-key",
+            WalletConnectFeeStatus::WouldRevert,
+            Some("execution reverted"),
+        );
+        risks.clear();
+        append_walletconnect_simulation_risk("request-key", Some(&other_request), &mut risks);
+        assert!(risks.is_empty());
+
+        let unavailable = fee_state(
+            "request-key",
+            WalletConnectFeeStatus::UnavailableFailed,
+            Some("provider unavailable"),
+        );
+        risks.clear();
+        append_walletconnect_simulation_risk("request-key", Some(&unavailable), &mut risks);
+        assert!(risks.is_empty());
     }
 }

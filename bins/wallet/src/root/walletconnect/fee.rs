@@ -49,6 +49,29 @@ pub(super) const fn walletconnect_fee_retry_action_enabled(
         && !simulation_requested
 }
 
+pub(super) const fn walletconnect_request_fee_eligible(
+    request: &WalletConnectParsedRequest,
+) -> bool {
+    matches!(
+        request,
+        WalletConnectParsedRequest::EthSendTransaction { .. }
+    )
+}
+
+pub(super) fn validate_walletconnect_reviewed_fee_pairing(
+    request: &WalletConnectParsedRequest,
+    reviewed_fee: Option<&WalletConnectReviewedFeeProjection>,
+) -> Result<(), &'static str> {
+    match (
+        walletconnect_request_fee_eligible(request),
+        reviewed_fee.is_some(),
+    ) {
+        (true, true) | (false, false) => Ok(()),
+        (true, false) => Err("WalletConnect transaction approval is missing current fee review."),
+        (false, true) => Err("WalletConnect non-transaction approval has unexpected fee review."),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WalletConnectFeeState {
     pub(super) request_key: Arc<str>,
@@ -745,10 +768,7 @@ impl WalletRoot {
             self.discard_walletconnect_fee_state(window, cx);
             return;
         };
-        if !matches!(
-            request.parsed,
-            WalletConnectParsedRequest::EthSendTransaction { .. }
-        ) {
+        if !walletconnect_request_fee_eligible(&request.parsed) {
             self.discard_walletconnect_fee_state(window, cx);
             return;
         }
@@ -1330,6 +1350,8 @@ fn parse_chain_id(value: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::Address;
+    use wallet_ops::WalletConnectEvmTransaction;
 
     fn test_fee_state() -> WalletConnectFeeState {
         WalletConnectFeeState {
@@ -1366,6 +1388,50 @@ mod tests {
             expected_native_usd_micro_value: None,
             maximum_native_usd_micro_value: None,
         }
+    }
+
+    #[test]
+    fn transaction_fee_review_pairing_matches_request_kind() {
+        let transaction = WalletConnectParsedRequest::EthSendTransaction {
+            transaction: WalletConnectEvmTransaction {
+                from: Address::ZERO,
+                to: None,
+                value: None,
+                data: None,
+                access_list: None,
+                gas: None,
+                gas_price: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                chain_id: None,
+                nonce: None,
+                transaction_type: None,
+                raw: serde_json::Value::Null,
+            },
+        };
+        let personal = WalletConnectParsedRequest::PersonalSign {
+            message: "hello".to_owned(),
+            account: Address::ZERO,
+        };
+        let typed_data = WalletConnectParsedRequest::EthSignTypedDataV4 {
+            account: Address::ZERO,
+            typed_data: serde_json::Value::Null,
+            domain_chain_id: None,
+        };
+
+        assert!(walletconnect_request_fee_eligible(&transaction));
+        assert!(!walletconnect_request_fee_eligible(&personal));
+        assert!(!walletconnect_request_fee_eligible(&typed_data));
+
+        let reviewed_fee = WalletConnectReviewedFeeProjection::unresolved("topic:7", 1);
+        assert!(
+            validate_walletconnect_reviewed_fee_pairing(&transaction, Some(&reviewed_fee),).is_ok()
+        );
+        assert!(validate_walletconnect_reviewed_fee_pairing(&typed_data, None).is_ok());
+        assert!(validate_walletconnect_reviewed_fee_pairing(&transaction, None).is_err());
+        assert!(
+            validate_walletconnect_reviewed_fee_pairing(&typed_data, Some(&reviewed_fee),).is_err()
+        );
     }
 
     #[test]
